@@ -343,6 +343,7 @@ async function main(): Promise<number> {
 				final_response: finalResponse ?? null,
 			},
 		});
+		return failure === null ? 0 : 4;
 	} catch (error) {
 		await writeFrame({
 			frame: "error",

@@ -306,3 +306,13 @@ def test_retrieve_refuses_report_bytes_not_bound_to_envelope(monkeypatch) -> Non
     )
     with pytest.raises(cli.OffloadError, match="does not match"):
         cli.retrieve("wj1")
+
+
+def test_doctor_parser_keeps_json_flag() -> None:
+    """Regression: relay subcommand wiring must not drop durable-lane flags."""
+    parser = cli.build_parser()
+    args = parser.parse_args(["doctor", "--json", "--host", "agent@studio"])
+    assert args.json is True
+    assert args.host == "agent@studio"
+    bare = parser.parse_args(["doctor"])
+    assert bare.json is False

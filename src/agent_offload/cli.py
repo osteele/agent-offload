@@ -446,7 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = subparsers.add_parser("doctor", help="check remote agent readiness")
     doctor_parser.add_argument("--host", default="studio")
-    doctor_parser.add_argument("--provider", default=SUPPORTED_PROVIDER)
+    doctor_parser.add_argument("--json", action="store_true")
     doctor_parser.set_defaults(handler=cmd_doctor)
 
     build_relay_parser(subparsers)
