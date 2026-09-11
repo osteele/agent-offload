@@ -12,7 +12,7 @@ from agent_offload.protocol import WORKER_PROTOCOL_VERSION, worker_identity
 def completed_harness(task_id: str, prompt_sha256: str, report: str) -> dict[str, object]:
     return {
         "schema_version": "agent-review.worker-result/v2",
-        "worker_protocol_version": 5,
+        "worker_protocol_version": 6,
         "status": "completed",
         "model_call_id": task_id,
         "provider": "codex",
@@ -20,7 +20,7 @@ def completed_harness(task_id: str, prompt_sha256: str, report: str) -> dict[str
         "session_id": "thread-123",
         "worker_identity": {
             "schema_version": "agent-review.worker-identity/v1",
-            "protocol_version": 5,
+            "protocol_version": 6,
             "source_sha256": "a" * 64,
         },
         "harness": {

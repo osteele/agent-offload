@@ -22,7 +22,7 @@ from .protocol import (
 )
 
 REVIEW_RESULT_SCHEMA = "agent-review.worker-result/v2"
-REVIEW_PROTOCOL_VERSION = 5
+REVIEW_PROTOCOL_VERSION = 6
 SOURCE_EXCLUDES = {
     ".git",
     ".jj",
