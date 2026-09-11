@@ -1,0 +1,25 @@
+[project]
+name = "agent-offload"
+version = "0.1.0"
+description = "Durable report-only coding-agent work on remote Weft hosts"
+requires-python = ">=3.10"
+
+[project.scripts]
+agent-offload = "agent_offload.cli:main"
+agent-offload-worker = "agent_offload.worker_cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+addopts = "-q"
