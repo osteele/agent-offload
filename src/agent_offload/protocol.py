@@ -23,6 +23,10 @@ RETRIEVAL_SCHEMA = "agent-offload.retrieval/v1"
 SUPPORTED_PROVIDER = "codex"
 SUPPORTED_MODE = "report"
 SUPPORTED_SELECTOR = "gpt-5.5"
+NATIVE_DISPATCH_RETIRED = (
+    "native Codex execution is retired; use the grounded OMP Anthropic route "
+    "or an OpenAI packet-only route"
+)
 RESULT_STATUSES = {"completed", "preflight_failed", "harness_failed", "evidence_failed"}
 
 

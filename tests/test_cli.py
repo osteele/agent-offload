@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -95,70 +96,40 @@ def test_remote_command_uses_report_only_worker_protocol() -> None:
     assert "--model" not in command
 
 
-def test_doctor_requires_declared_tool_and_observed_authentication(monkeypatch) -> None:
-    responses = iter(
-        [
-            {
-                "kind": "host_list",
-                "version": 1,
-                "hosts": [
-                    {
-                        "name": "studio",
-                        "capabilities": [
-                            "agent:codex",
-                            "tool:agent-offload",
-                            "tool:agent-execution",
-                        ],
-                    }
-                ],
-            },
-            {
-                "observations": [
-                    {
-                        "label": "agent:codex",
-                        "state": "locally_authenticated",
-                        "detail": "Codex login exists",
-                    }
-                ]
-            },
-        ]
-    )
-    monkeypatch.setattr(cli, "command_json", lambda *_args, **_kwargs: next(responses))
+def test_doctor_refuses_retired_native_codex_without_probe(monkeypatch) -> None:
+    def unexpected_probe(*_args, **_kwargs):
+        raise AssertionError("retired provider must not be probed")
+
+    monkeypatch.setattr(cli, "command_json", unexpected_probe)
     result = cli.doctor(host="studio", provider="codex")
-    assert result["available"] is True
-    assert [check["name"] for check in result["checks"]] == ["inventory", "authentication"]
+    assert result["available"] is False
+    assert result["checks"] == [
+        {
+            "name": "provider",
+            "ok": False,
+            "detail": cli.NATIVE_DISPATCH_RETIRED,
+        }
+    ]
 
 
-def test_doctor_refuses_declared_but_unauthenticated_provider(monkeypatch) -> None:
-    responses = iter(
-        [
-            {
-                "kind": "host_list",
-                "version": 1,
-                "hosts": [
-                    {
-                        "name": "studio",
-                        "capabilities": [
-                            "agent:codex",
-                            "tool:agent-offload",
-                            "tool:agent-execution",
-                        ],
-                    }
-                ],
-            },
-            {
-                "observations": [
-                    {
-                        "label": "agent:codex",
-                        "state": "declared_but_not_observed",
-                        "detail": "no authentication evidence",
-                    }
-                ]
-            },
-        ]
-    )
-    monkeypatch.setattr(cli, "command_json", lambda *_args, **_kwargs: next(responses))
-    assert cli.doctor(host="studio", provider="codex")["available"] is False
+def test_submit_refuses_retired_native_codex_before_weft(monkeypatch, tmp_path: Path) -> None:
+    brief = tmp_path / "brief.txt"
+    brief.write_text("Inspect the project.\n")
+
+    def unexpected_submission(*_args, **_kwargs):
+        raise AssertionError("retired provider must not reach Weft")
+
+    monkeypatch.setattr(cli, "run_process", unexpected_submission)
+    with pytest.raises(cli.OffloadError, match="native Codex execution is retired"):
+        cli.submit(
+            project=tmp_path,
+            brief_path=brief,
+            host="studio",
+            selector="gpt-5.5",
+            effort="medium",
+            harness_timeout=10,
+            ctx_timeout=5,
+        )
 
 
 def test_build_prompt_enforces_report_only_behavior() -> None:

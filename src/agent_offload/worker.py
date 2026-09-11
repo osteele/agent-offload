@@ -17,6 +17,7 @@ from agent_execution.worker import (
 )
 
 from .protocol import (
+    NATIVE_DISPATCH_RETIRED,
     RESULT_SCHEMA,
     SUPPORTED_MODE,
     SUPPORTED_PROVIDER,
@@ -325,6 +326,7 @@ def execute(
                 "worker source mismatch: "
                 f"expected {expect_source_sha256}, installed {identity['source_sha256']}"
             )
+        raise WorkerError(NATIVE_DISPATCH_RETIRED)
         read_prompt_payload(prompt_payload, prompt_sha256)
         nested_worker_source_sha256 = execution_source_sha256()
         result["source_sha256_before"] = source_tree_sha256(Path.cwd())

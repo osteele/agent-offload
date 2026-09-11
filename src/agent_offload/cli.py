@@ -7,8 +7,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
-import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +14,7 @@ from typing import Any
 
 from .protocol import (
     DOCTOR_SCHEMA,
+    NATIVE_DISPATCH_RETIRED,
     RETRIEVAL_SCHEMA,
     SUPPORTED_MODE,
     SUPPORTED_PROVIDER,
@@ -23,9 +22,7 @@ from .protocol import (
     WORKER_PROTOCOL_VERSION,
     ProtocolError,
     load_json_object,
-    sha256_text,
     validate_result,
-    worker_identity,
 )
 from .worker import failure_report
 
@@ -145,80 +142,18 @@ def command_json(arguments: Sequence[str], *, timeout: float = 60) -> dict[str, 
 
 
 def doctor(*, host: str, provider: str) -> dict[str, Any]:
-    checks: list[dict[str, Any]] = []
-    if provider != SUPPORTED_PROVIDER:
-        checks.append(
-            {
-                "name": "provider",
-                "ok": False,
-                "detail": f"only {SUPPORTED_PROVIDER} is supported",
-            }
-        )
-        return {
-            "schema_version": DOCTOR_SCHEMA,
-            "host": host,
-            "provider": provider,
-            "available": False,
-            "checks": checks,
-        }
-
-    try:
-        listing = command_json(["weft", "host", "list", "--json"])
-        hosts = listing.get("hosts") if listing.get("kind") == "host_list" else None
-        row = next(
-            (item for item in hosts or [] if isinstance(item, dict) and item.get("name") == host),
-            None,
-        )
-        capabilities = row.get("capabilities", []) if isinstance(row, dict) else []
-        required = {f"agent:{provider}", "tool:agent-offload", "tool:agent-execution"}
-        missing = sorted(required - set(capabilities if isinstance(capabilities, list) else []))
-        checks.append(
-            {
-                "name": "inventory",
-                "ok": not missing and row is not None,
-                "detail": "required capabilities declared"
-                if not missing and row is not None
-                else f"missing capabilities: {', '.join(missing) or 'host not found'}",
-            }
-        )
-    except OffloadError as exc:
-        checks.append({"name": "inventory", "ok": False, "detail": str(exc)})
-
-    try:
-        probe = command_json(
-            ["agent-review", "capability", "probe", host, "--json"],
-            timeout=45,
-        )
-        observations = probe.get("observations")
-        observation = next(
-            (
-                item
-                for item in observations or []
-                if isinstance(item, dict) and item.get("label") == f"agent:{provider}"
-            ),
-            None,
-        )
-        state = observation.get("state") if isinstance(observation, dict) else None
-        authenticated = state in {"locally_authenticated", "verified_live"}
-        detail = observation.get("detail") if isinstance(observation, dict) else None
-        checks.append(
-            {
-                "name": "authentication",
-                "ok": authenticated,
-                "state": state,
-                "detail": detail
-                or (f"provider state: {state}" if state else "authentication not observed"),
-            }
-        )
-    except OffloadError as exc:
-        checks.append({"name": "authentication", "ok": False, "detail": str(exc)})
-
     return {
         "schema_version": DOCTOR_SCHEMA,
         "host": host,
         "provider": provider,
-        "available": all(bool(check["ok"]) for check in checks),
-        "checks": checks,
+        "available": False,
+        "checks": [
+            {
+                "name": "provider",
+                "ok": False,
+                "detail": NATIVE_DISPATCH_RETIRED,
+            }
+        ],
     }
 
 
@@ -336,80 +271,7 @@ def submit(
     harness_timeout: float,
     ctx_timeout: float,
 ) -> tuple[WeftReceipt, str, str]:
-    try:
-        brief = brief_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise OffloadError(f"cannot read brief {brief_path}: {exc}") from exc
-    if not brief.strip():
-        raise OffloadError("brief is empty")
-    prompt = build_prompt(brief)
-    task_id = str(uuid.uuid4())
-    prompt_sha256 = sha256_text(prompt)
-    source_sha256 = str(worker_identity()["source_sha256"])
-    command = remote_command(
-        task_id=task_id,
-        selector=selector,
-        effort=effort,
-        prompt_sha256=prompt_sha256,
-        source_sha256=source_sha256,
-        harness_timeout=harness_timeout,
-        ctx_timeout=ctx_timeout,
-    )
-    result_artifact = f"outputs/agent-offload-result-{task_id}.json"
-    report_artifact = f"outputs/agent-offload-report-{task_id}.md"
-    with tempfile.TemporaryDirectory(prefix="agent-offload-") as directory:
-        payload = Path(directory) / "agent-brief"
-        payload.write_text(prompt, encoding="utf-8")
-        arguments = [
-            "weft",
-            "run",
-            "--host",
-            host,
-            "--agent",
-            SUPPORTED_PROVIDER,
-            "--require-capability",
-            "tool:agent-offload",
-            "--require-capability",
-            "tool:agent-execution",
-            "--tag",
-            "inventory",
-            "--tag",
-            "agentic",
-            "--project",
-            "agent-offload",
-            "--submitter-session",
-            submitter_session(task_id),
-            "--produces",
-            result_artifact,
-            "--produces",
-            report_artifact,
-            "--payload",
-            f"agent-brief={payload}",
-            "--idempotency-key",
-            task_id,
-            "--json",
-            "-m",
-            f"agent-offload report task {task_id}",
-            command,
-        ]
-        completed = run_process(arguments, cwd=project, timeout=90)
-    if completed.returncode == 0:
-        try:
-            receipt = WeftReceipt.parse(completed.stdout.strip(), idempotency_key=task_id)
-        except ProtocolError as exc:
-            recovered = recover_submission(task_id)
-            if recovered is None:
-                raise OffloadError(f"ambiguous Weft submission: {exc}") from exc
-            receipt = recovered
-    else:
-        recovered = recover_submission(task_id)
-        if recovered is None:
-            detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic output"
-            raise OffloadError(f"Weft submission failed: {detail}")
-        receipt = recovered
-    if receipt.placement_decision == "not_accepted":
-        raise OffloadError("Weft did not accept the task as a durable job")
-    return receipt, task_id, prompt_sha256
+    raise OffloadError(NATIVE_DISPATCH_RETIRED)
 
 
 def inspect_job(job_id: str) -> dict[str, Any]:
@@ -599,61 +461,7 @@ def warn_if_unprocessed(retrieval: dict[str, Any]) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    project = args.project.expanduser().resolve()
-    brief = args.brief.expanduser().resolve()
-    if not project.is_dir():
-        raise OffloadError(f"project is not a directory: {project}")
-    if args.mode != SUPPORTED_MODE:
-        raise OffloadError("agent-offload currently supports report mode only")
-    if not args.detach and args.wait_timeout <= 0:
-        raise OffloadError("--wait-timeout must be positive")
-    readiness = doctor(host=args.host, provider=args.provider)
-    if not readiness["available"]:
-        details = "; ".join(
-            f"{check['name']}: {check['detail']}"
-            for check in readiness["checks"]
-            if not check["ok"]
-        )
-        raise OffloadError(f"remote agent is not ready: {details}")
-    receipt, task_id, prompt_sha256 = submit(
-        project=project,
-        brief_path=brief,
-        host=args.host,
-        selector=args.selector,
-        effort=args.effort,
-        harness_timeout=args.harness_timeout,
-        ctx_timeout=args.ctx_timeout,
-    )
-    if args.detach:
-        output = {
-            "schema_version": "agent-offload.submission/v1",
-            "task_id": task_id,
-            "prompt_sha256": prompt_sha256,
-            "receipt": receipt.to_dict(),
-        }
-        print(json.dumps(output, sort_keys=True) if args.json else receipt.job_id)
-        return 0
-    retrieval = wait_for_result(
-        receipt,
-        task_id=task_id,
-        prompt_sha256=prompt_sha256,
-        source_sha256=str(worker_identity()["source_sha256"]),
-        timeout=args.wait_timeout,
-        mark_processed=not args.no_mark_processed,
-    )
-    warn_if_unprocessed(retrieval)
-    envelope = {
-        "schema_version": "agent-offload.run-result/v1",
-        "receipt": receipt.to_dict(),
-        "retrieval": retrieval,
-    }
-    if args.json:
-        print(json.dumps(envelope, sort_keys=True))
-    elif retrieval["result"]["status"] == "completed":
-        print(retrieval["report"])
-    else:
-        raise OffloadError(str(retrieval["result"]["failure"]))
-    return 0
+    raise OffloadError(NATIVE_DISPATCH_RETIRED)
 
 
 def cmd_retrieve(args: argparse.Namespace) -> int:
