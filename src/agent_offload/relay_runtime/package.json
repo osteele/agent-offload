@@ -1,0 +1,9 @@
+{
+  "name": "agent-offload-relay-runtime",
+  "private": true,
+  "description": "Bun bridge: maintained omp RpcClient over SSH with locally confined host tools",
+  "type": "module",
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.1.17"
+  }
+}

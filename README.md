@@ -43,6 +43,51 @@ The conductor continues to validate both returned artifacts. A malformed or
 ambiguous transport response is not treated as permission to submit a duplicate
 task.
 
+## Attached relay (`relay`)
+
+`agent-offload relay` is a second, deliberately different lane: the agent
+runtime runs on a remote SSH host (default `agent@studio`) through OMP's
+maintained RPC client, while its three tools — `review_read`, `review_glob`,
+`review_grep` — execute **on this machine, against the live project root**.
+The purpose is moving agent-process memory off the laptop without giving up
+grounded access to the working tree.
+
+```sh
+agent-offload relay /path/to/project --prompt "Map the auth flow" --timeout 600
+agent-offload relay . --prompt-file brief.txt --model provider/model --json
+```
+
+Trust boundary, by contrast with `run`:
+
+- **Attached.** The command stays in the foreground; the remote process tree
+  dies with it. `--detach` is refused, there is no job id and no resume.
+- **Not durable, not snapshot-backed.** No source snapshot leaves the laptop.
+  The remote side sees project instructions and the prompt only, both sent
+  explicitly with digests recorded. Because the tree is live, two reads can
+  observe different revisions; the result records a per-call provenance entry
+  (real path, SHA-256, byte count, truncation) for every served read instead
+  of claiming snapshot equivalence.
+- **Confined.** Tool paths are canonicalized and must resolve inside the
+  project root; URL/device schemes, parent traversal, symlink escapes,
+  binary and oversized inputs are refused. Reads, matches, files, tool-call
+  argument size, and wall time are bounded.
+- **Remote side is a blank room.** Built-in tools, LSP, extensions, skills,
+  rules, sessions, pty, workspace-tree scanning, goals, xdev, and secrets
+  are disabled twice (omp flags and a config overlay written to a scratch
+  directory). The remote files and config cannot contaminate the session.
+- **Fail-closed.** The relay refuses to proceed unless the server confirms
+  exactly the three host tools are registered, and the conductor refuses any
+  result whose tool lifecycle is incomplete or whose served paths fall
+  outside the root. A remote failure never falls back to enabling remote
+  tools.
+
+Results are written under `outputs/relay-result-*.json` with schema
+`agent-offload.relay-result/v1`: harness and SDK identity, host identity,
+exact remote argv, provider/model, prompt digest, full RPC event stream,
+per-call tool evidence, final response, timestamps, and failure or
+cancellation status. The record states `durability:
+none-attached-live-local-tools` and `snapshot_equivalent: false`.
+
 ## Operations
 
 Native readiness probing is disabled with submission.

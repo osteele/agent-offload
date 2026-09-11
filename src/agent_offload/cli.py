@@ -24,6 +24,7 @@ from .protocol import (
     load_json_object,
     validate_result,
 )
+from .relay import build_relay_parser
 from .worker import failure_report
 
 WEFT_RECEIPT_SCHEMA = "weft.run.receipt.v1"
@@ -446,8 +447,9 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser("doctor", help="check remote agent readiness")
     doctor_parser.add_argument("--host", default="studio")
     doctor_parser.add_argument("--provider", default=SUPPORTED_PROVIDER)
-    doctor_parser.add_argument("--json", action="store_true")
     doctor_parser.set_defaults(handler=cmd_doctor)
+
+    build_relay_parser(subparsers)
     return parser
 
 
