@@ -11,18 +11,23 @@ import time
 from pathlib import Path
 from typing import Any
 
+from agent_execution.identity import source_sha256 as execution_source_sha256
+from agent_execution.worker import (
+    WORKER_PROTOCOL_VERSION as EXECUTION_WORKER_PROTOCOL_VERSION,
+)
+
 from .protocol import (
     RESULT_SCHEMA,
     SUPPORTED_MODE,
     SUPPORTED_PROVIDER,
     SUPPORTED_SELECTOR,
     WORKER_PROTOCOL_VERSION,
+    ProtocolError,
     sha256_text,
+    validate_execution_result,
     worker_identity,
 )
 
-REVIEW_RESULT_SCHEMA = "agent-review.worker-result/v2"
-REVIEW_PROTOCOL_VERSION = 6
 SOURCE_EXCLUDES = {
     ".git",
     ".jj",
@@ -173,25 +178,17 @@ def validate_harness_result(
     *,
     task_id: str,
     prompt_sha256: str,
+    source_sha256: str,
 ) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise WorkerError("agent-review worker result must be a JSON object")
-    if value.get("schema_version") != REVIEW_RESULT_SCHEMA:
-        raise WorkerError(f"unexpected agent-review result schema: {value.get('schema_version')!r}")
-    if value.get("worker_protocol_version") != REVIEW_PROTOCOL_VERSION:
-        raise WorkerError(
-            f"unexpected agent-review worker protocol: {value.get('worker_protocol_version')!r}"
+    try:
+        return validate_execution_result(
+            value,
+            task_id=task_id,
+            prompt_sha256=prompt_sha256,
+            source_sha256=source_sha256,
         )
-    if value.get("model_call_id") != task_id:
-        raise WorkerError("agent-review result task identifier does not match")
-    if value.get("provider") != SUPPORTED_PROVIDER:
-        raise WorkerError("agent-review result provider does not match")
-    if value.get("prompt_sha256") != prompt_sha256:
-        raise WorkerError("agent-review result prompt digest does not match")
-    harness = value.get("harness")
-    if not isinstance(harness, dict):
-        raise WorkerError("agent-review result has no harness evidence")
-    return value
+    except ProtocolError as exc:
+        raise WorkerError(str(exc)) from exc
 
 
 def resolve_codex() -> str | None:
@@ -213,23 +210,24 @@ def nested_command(
     harness_result_path: Path,
     harness_timeout: float,
     ctx_timeout: float,
+    worker_source_sha256: str,
 ) -> list[str]:
-    review_worker = shutil.which("agent-review-worker")
+    execution_worker = shutil.which("agent-execution-worker")
     codex = resolve_codex()
     missing = [
         name
         for name, value in (
-            ("agent-review-worker", review_worker),
+            ("agent-execution-worker", execution_worker),
             ("codex", codex),
         )
         if value is None
     ]
     if missing:
         raise WorkerError(f"required executable not found: {', '.join(missing)}")
-    assert review_worker is not None
+    assert execution_worker is not None
     assert codex is not None
     return [
-        review_worker,
+        execution_worker,
         "execute",
         "--provider",
         SUPPORTED_PROVIDER,
@@ -238,7 +236,9 @@ def nested_command(
         "--harness-model",
         selector,
         "--expect-protocol",
-        str(REVIEW_PROTOCOL_VERSION),
+        str(EXECUTION_WORKER_PROTOCOL_VERSION),
+        "--expect-source-sha256",
+        worker_source_sha256,
         "--prompt-payload",
         prompt_payload,
         "--expect-prompt-sha256",
@@ -326,6 +326,7 @@ def execute(
                 f"expected {expect_source_sha256}, installed {identity['source_sha256']}"
             )
         read_prompt_payload(prompt_payload, prompt_sha256)
+        nested_worker_source_sha256 = execution_source_sha256()
         result["source_sha256_before"] = source_tree_sha256(Path.cwd())
         result["status"] = "harness_failed"
         harness_result_path = Path.cwd() / "outputs" / f".agent-offload-harness-{task_id}.json"
@@ -338,6 +339,7 @@ def execute(
             harness_result_path=harness_result_path,
             harness_timeout=harness_timeout,
             ctx_timeout=ctx_timeout,
+            worker_source_sha256=nested_worker_source_sha256,
         )
         timeout = harness_timeout + ctx_timeout + 60
         completed = runner(
@@ -351,16 +353,17 @@ def execute(
         if not harness_result_path.is_file():
             detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic output"
             raise WorkerError(
-                f"agent-review worker exited {completed.returncode} without evidence: {detail}"
+                f"agent-execution worker exited {completed.returncode} without evidence: {detail}"
             )
         try:
             harness_value = json.loads(harness_result_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise WorkerError(f"cannot read agent-review worker evidence: {exc}") from exc
+            raise WorkerError(f"cannot read agent-execution worker evidence: {exc}") from exc
         harness_result = validate_harness_result(
             harness_value,
             task_id=task_id,
             prompt_sha256=prompt_sha256,
+            source_sha256=nested_worker_source_sha256,
         )
         result["harness_result"] = harness_result
         result["harness_session_id"] = harness_result.get("session_id")
@@ -377,10 +380,10 @@ def execute(
     except (WorkerError, subprocess.TimeoutExpired, OSError) as exc:
         if isinstance(exc, subprocess.TimeoutExpired):
             result["status"] = "harness_failed"
-            result["failure"] = f"agent-review worker exceeded {exc.timeout} seconds"
+            result["failure"] = f"agent-execution worker exceeded {exc.timeout} seconds"
         elif isinstance(exc, OSError):
             result["status"] = "harness_failed"
-            result["failure"] = f"cannot launch agent-review worker: {exc}"
+            result["failure"] = f"cannot launch agent-execution worker: {exc}"
         else:
             result["failure"] = str(exc)
     finally:

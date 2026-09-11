@@ -5,24 +5,30 @@ import shlex
 from pathlib import Path
 from types import SimpleNamespace
 
+from agent_execution.worker import installed_worker_identity
+
 from agent_offload import worker
 from agent_offload.protocol import WORKER_PROTOCOL_VERSION, worker_identity
 
 
 def completed_harness(task_id: str, prompt_sha256: str, report: str) -> dict[str, object]:
+    identity = installed_worker_identity()
     return {
-        "schema_version": "agent-review.worker-result/v2",
-        "worker_protocol_version": 6,
+        "schema_version": "agent-execution.worker-result/v1",
+        "worker_version": identity.package_version,
+        "worker_protocol_version": identity.protocol_version,
+        "worker_source_sha256": identity.source_sha256,
         "status": "completed",
         "model_call_id": task_id,
         "provider": "codex",
         "prompt_sha256": prompt_sha256,
+        "ctx_version": "ctx 1.0.0",
+        "worker_cwd": "/project",
+        "started_at": 1.0,
+        "completed_at": 2.0,
+        "model_call_started": True,
         "session_id": "thread-123",
-        "worker_identity": {
-            "schema_version": "agent-review.worker-identity/v1",
-            "protocol_version": 6,
-            "source_sha256": "a" * 64,
-        },
+        "worker_identity": identity.to_dict(),
         "harness": {
             "exit_status": 0,
             "stderr": "",
@@ -37,6 +43,10 @@ def completed_harness(task_id: str, prompt_sha256: str, report: str) -> dict[str
                     ),
                 ]
             ),
+        },
+        "evidence": {
+            "import_receipt": {"schema_version": 2},
+            "transcript": {"schema_version": 1},
         },
         "failure": "",
     }
@@ -61,7 +71,7 @@ def test_remote_nested_command_hides_model_from_weft_scanner(monkeypatch, tmp_pa
     monkeypatch.setattr(
         worker.shutil,
         "which",
-        lambda name: "/tools/agent-review-worker" if name == "agent-review-worker" else None,
+        lambda name: "/tools/agent-execution-worker" if name == "agent-execution-worker" else None,
     )
     monkeypatch.setattr(worker, "resolve_codex", lambda: "/tools/codex")
     command = worker.nested_command(
@@ -73,9 +83,10 @@ def test_remote_nested_command_hides_model_from_weft_scanner(monkeypatch, tmp_pa
         harness_result_path=tmp_path / "harness.json",
         harness_timeout=10,
         ctx_timeout=5,
+        worker_source_sha256=worker.execution_source_sha256(),
     )
     assert "--model" not in command
-    assert command[0] == "/tools/agent-review-worker"
+    assert command[0] == "/tools/agent-execution-worker"
     separator = command.index("--")
     assert command[separator + 1] == "/tools/codex"
     assert command[command.index("--harness-model") + 1] == "gpt-5.5"
@@ -92,7 +103,7 @@ def test_execute_writes_validated_report_and_full_harness(monkeypatch, tmp_path:
     monkeypatch.setattr(
         worker.shutil,
         "which",
-        lambda name: "/tools/agent-review-worker" if name == "agent-review-worker" else None,
+        lambda name: "/tools/agent-execution-worker" if name == "agent-execution-worker" else None,
     )
     monkeypatch.setattr(worker, "resolve_codex", lambda: "/tools/codex")
     prompt_sha256 = worker.sha256_text(prompt)
@@ -139,7 +150,7 @@ def test_execute_rejects_a_report_after_source_mutation(monkeypatch, tmp_path: P
     monkeypatch.setattr(
         worker.shutil,
         "which",
-        lambda name: "/tools/agent-review-worker" if name == "agent-review-worker" else None,
+        lambda name: "/tools/agent-execution-worker" if name == "agent-execution-worker" else None,
     )
     monkeypatch.setattr(worker, "resolve_codex", lambda: "/tools/codex")
     prompt_sha256 = worker.sha256_text(prompt)

@@ -170,7 +170,7 @@ def doctor(*, host: str, provider: str) -> dict[str, Any]:
             None,
         )
         capabilities = row.get("capabilities", []) if isinstance(row, dict) else []
-        required = {f"agent:{provider}", "tool:agent-offload"}
+        required = {f"agent:{provider}", "tool:agent-offload", "tool:agent-execution"}
         missing = sorted(required - set(capabilities if isinstance(capabilities, list) else []))
         checks.append(
             {
@@ -242,7 +242,8 @@ def remote_command(
 ) -> str:
     return shlex.join(
         [
-            "agent-offload-worker",
+            "python3",
+            "src/agent_offload/weft_entry.py",
             "execute",
             "--task-id",
             task_id,
@@ -368,6 +369,8 @@ def submit(
             SUPPORTED_PROVIDER,
             "--require-capability",
             "tool:agent-offload",
+            "--require-capability",
+            "tool:agent-execution",
             "--tag",
             "inventory",
             "--tag",

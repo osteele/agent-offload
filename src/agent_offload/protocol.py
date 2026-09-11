@@ -5,6 +5,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agent_execution.identity import source_sha256 as execution_source_sha256
+from agent_execution.worker import (
+    WORKER_PROTOCOL_VERSION as EXECUTION_WORKER_PROTOCOL_VERSION,
+)
+from agent_execution.worker import (
+    WorkerResult,
+)
+
 from . import __version__
 
 WORKER_PROTOCOL_VERSION = 1
@@ -64,6 +72,30 @@ def validate_identity(value: object) -> dict[str, Any]:
     return value
 
 
+def validate_execution_result(
+    value: object,
+    *,
+    task_id: str,
+    prompt_sha256: str,
+    source_sha256: str,
+) -> dict[str, Any]:
+    try:
+        execution_result = WorkerResult.parse(json.dumps(value))
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError(f"invalid agent-execution worker result: {exc}") from exc
+    if execution_result.worker_protocol_version != EXECUTION_WORKER_PROTOCOL_VERSION:
+        raise ProtocolError("nested execution worker protocol does not match the conductor")
+    if execution_result.worker_source_sha256 != source_sha256:
+        raise ProtocolError("nested execution worker source does not match the conductor")
+    if execution_result.model_call_id != task_id:
+        raise ProtocolError("nested execution task identifier does not match")
+    if execution_result.provider != SUPPORTED_PROVIDER:
+        raise ProtocolError("nested execution provider does not match")
+    if execution_result.prompt_sha256 != prompt_sha256:
+        raise ProtocolError("nested execution prompt digest does not match")
+    return execution_result.to_dict()
+
+
 def validate_result(
     value: object,
     *,
@@ -89,14 +121,24 @@ def validate_result(
     identity = validate_identity(value.get("worker_identity"))
     if source_sha256 is not None and identity.get("source_sha256") != source_sha256:
         raise ProtocolError("remote worker source does not match the submitting conductor")
+    harness = value.get("harness_result")
+    execution_result = (
+        validate_execution_result(
+            harness,
+            task_id=str(value.get("task_id") or ""),
+            prompt_sha256=str(value.get("prompt_sha256") or ""),
+            source_sha256=execution_source_sha256(),
+        )
+        if harness is not None
+        else None
+    )
     report = value.get("report")
     if status == "completed":
         if not isinstance(report, str) or not report.strip():
             raise ProtocolError("completed worker result has no report")
         if value.get("report_sha256") != sha256_text(report):
             raise ProtocolError("completed worker result has an invalid report digest")
-        harness = value.get("harness_result")
-        if not isinstance(harness, dict) or harness.get("status") != "completed":
+        if execution_result is None or execution_result["status"] != "completed":
             raise ProtocolError("completed worker result has no completed harness result")
         source_before = value.get("source_sha256_before")
         if (

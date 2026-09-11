@@ -74,7 +74,7 @@ Each task binds:
 - a random task and idempotency identifier;
 - the exact installed `agent-offload-worker` source digest;
 - the Weft source pin;
-- the nested `agent-review-worker` result, Codex session ID, stdout, stderr, and ctx evidence;
+- the nested `agent-execution-worker` result, Codex session ID, stdout, stderr, and ctx evidence;
 - the report SHA-256 digest and separate Markdown artifact.
 
 The remote worker refuses source or protocol drift before launching Codex. The conductor validates both returned artifacts before displaying the report. A malformed or ambiguous transport response is not treated as permission to submit a duplicate task.
@@ -106,5 +106,6 @@ After a worker source change, reinstall the local command and redeploy before su
 
 ```sh
 cd ~/code/agent-tools/agent-offload
+uv tool install --force --reinstall ../agent-review/packages/agent-execution
 uv tool install --force --reinstall .
 ```

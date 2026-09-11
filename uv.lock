@@ -3,9 +3,17 @@ revision = 3
 requires-python = ">=3.10"
 
 [[package]]
+name = "agent-execution"
+version = "0.1.0"
+source = { directory = "../agent-review/packages/agent-execution" }
+
+[[package]]
 name = "agent-offload"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "agent-execution" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -14,6 +22,7 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [{ name = "agent-execution", directory = "../agent-review/packages/agent-execution" }]
 
 [package.metadata.requires-dev]
 dev = [

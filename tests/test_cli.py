@@ -5,12 +5,15 @@ import shlex
 from types import SimpleNamespace
 
 import pytest
+from agent_execution.worker import installed_worker_identity
 
 from agent_offload import cli
 from agent_offload.protocol import RESULT_SCHEMA, sha256_text, worker_identity
 
 
 def completed_result(task_id: str, report: str) -> dict[str, object]:
+    prompt_sha256 = "a" * 64
+    execution_identity = installed_worker_identity()
     return {
         "schema_version": RESULT_SCHEMA,
         "task_id": task_id,
@@ -19,9 +22,31 @@ def completed_result(task_id: str, report: str) -> dict[str, object]:
         "selector": "gpt-5.5",
         "effort": "medium",
         "status": "completed",
-        "prompt_sha256": "a" * 64,
+        "prompt_sha256": prompt_sha256,
         "worker_identity": worker_identity(),
-        "harness_result": {"status": "completed"},
+        "harness_result": {
+            "schema_version": "agent-execution.worker-result/v1",
+            "model_call_id": task_id,
+            "provider": "codex",
+            "status": "completed",
+            "worker_version": execution_identity.package_version,
+            "worker_protocol_version": execution_identity.protocol_version,
+            "worker_source_sha256": execution_identity.source_sha256,
+            "prompt_sha256": prompt_sha256,
+            "ctx_version": "ctx 1.0.0",
+            "worker_cwd": "/project",
+            "started_at": 1.0,
+            "completed_at": 2.0,
+            "model_call_started": True,
+            "session_id": "thread-1",
+            "harness": {"exit_status": 0, "stdout": "{}", "stderr": ""},
+            "evidence": {
+                "import_receipt": {"schema_version": 2},
+                "transcript": {"schema_version": 1},
+            },
+            "failure": "",
+            "worker_identity": execution_identity.to_dict(),
+        },
         "harness_session_id": "thread-1",
         "report": report,
         "report_sha256": sha256_text(report),
@@ -64,7 +89,7 @@ def test_remote_command_uses_report_only_worker_protocol() -> None:
             ctx_timeout=5,
         )
     )
-    assert command[:2] == ["agent-offload-worker", "execute"]
+    assert command[:3] == ["python3", "src/agent_offload/weft_entry.py", "execute"]
     assert command[command.index("--mode") + 1] == "report"
     assert command[command.index("--harness-selector") + 1] == "gpt-5.5"
     assert "--model" not in command
@@ -79,7 +104,11 @@ def test_doctor_requires_declared_tool_and_observed_authentication(monkeypatch) 
                 "hosts": [
                     {
                         "name": "studio",
-                        "capabilities": ["agent:codex", "tool:agent-offload"],
+                        "capabilities": [
+                            "agent:codex",
+                            "tool:agent-offload",
+                            "tool:agent-execution",
+                        ],
                     }
                 ],
             },
@@ -109,7 +138,11 @@ def test_doctor_refuses_declared_but_unauthenticated_provider(monkeypatch) -> No
                 "hosts": [
                     {
                         "name": "studio",
-                        "capabilities": ["agent:codex", "tool:agent-offload"],
+                        "capabilities": [
+                            "agent:codex",
+                            "tool:agent-offload",
+                            "tool:agent-execution",
+                        ],
                     }
                 ],
             },
@@ -241,6 +274,43 @@ def test_retrieve_preserves_a_worker_failure_artifact(monkeypatch) -> None:
     retrieval = cli.retrieve("wj2", mark_processed=False)
     assert retrieval["report"] is None
     assert retrieval["diagnostic_report"].endswith("worker source mismatch")
+
+
+def test_retrieve_rejects_unbound_nested_failure_evidence(monkeypatch) -> None:
+    task_id = "task-3"
+    result = completed_result(task_id, "unused")
+    result.update(
+        {
+            "status": "harness_failed",
+            "report": None,
+            "report_sha256": None,
+            "failure": "agent harness failed",
+        }
+    )
+    result["harness_result"]["prompt_sha256"] = "b" * 64
+    monkeypatch.setattr(
+        cli,
+        "inspect_job",
+        lambda _job_id: {
+            "project": "agent-offload",
+            "status": "completed",
+            "produces": [
+                f"outputs/agent-offload-result-{task_id}.json",
+                f"outputs/agent-offload-report-{task_id}.md",
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "artifact_text",
+        lambda _job_id, path: (
+            json.dumps(result)
+            if path.endswith(".json")
+            else "# Agent offload failed\n\nagent harness failed\n"
+        ),
+    )
+    with pytest.raises(cli.OffloadError, match="nested execution prompt digest"):
+        cli.retrieve("wj3", mark_processed=False)
 
 
 def test_retrieve_refuses_report_bytes_not_bound_to_envelope(monkeypatch) -> None:
