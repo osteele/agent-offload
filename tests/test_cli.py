@@ -308,7 +308,7 @@ def test_retrieve_refuses_report_bytes_not_bound_to_envelope(monkeypatch) -> Non
         cli.retrieve("wj1")
 
 
-def test_doctor_parser_keeps_json_flag() -> None:
+def test_doctor_parser_keeps_durable_flags() -> None:
     """Regression: relay subcommand wiring must not drop durable-lane flags."""
     parser = cli.build_parser()
     args = parser.parse_args(["doctor", "--json", "--host", "agent@studio"])
@@ -316,3 +316,25 @@ def test_doctor_parser_keeps_json_flag() -> None:
     assert args.host == "agent@studio"
     bare = parser.parse_args(["doctor"])
     assert bare.json is False
+    assert bare.provider == cli.SUPPORTED_PROVIDER
+
+
+def test_cmd_doctor_survives_full_namespace(monkeypatch) -> None:
+    """cmd_doctor must read every attribute the doctor subparser defines.
+
+    The first relay wiring regression dropped --json and --provider while
+    leaving cmd_doctor reading both; a parse-only test could not see the
+    runtime AttributeError this asserts against.
+    """
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli,
+        "doctor",
+        lambda *, host, provider: (
+            seen.update(host=host, provider=provider) or {"available": True, "checks": []}
+        ),
+    )
+    parser = cli.build_parser()
+    args = parser.parse_args(["doctor", "--json"])
+    assert cli.cmd_doctor(args) == 0
+    assert seen == {"host": "studio", "provider": cli.SUPPORTED_PROVIDER}
