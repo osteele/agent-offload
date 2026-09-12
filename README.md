@@ -111,6 +111,6 @@ After a worker source change, reinstall the local command and redeploy:
 
 ```sh
 cd ~/code/agent-tools/agent-offload
-uv tool install --force --reinstall ../agent-review/packages/agent-execution
-uv tool install --force --reinstall .
+uv tool install --force --reinstall ../agent-execution
+uv tool install --force --reinstall --with ../agent-execution .
 ```

@@ -5,7 +5,7 @@ default:
 
 check:
     uv run ruff check src tests
-    uv run pytest
+    uv run --with ../agent-execution pytest
     bun test src/agent_offload/relay_runtime
 
 format:

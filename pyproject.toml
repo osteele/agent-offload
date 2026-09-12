@@ -3,9 +3,7 @@ name = "agent-offload"
 version = "0.1.0"
 description = "Durable report-only coding-agent work on remote Weft hosts"
 requires-python = ">=3.10"
-dependencies = [
-    "agent-execution",
-]
+dependencies = []
 
 [project.scripts]
 agent-offload = "agent_offload.cli:main"
@@ -26,6 +24,3 @@ line-length = 100
 
 [tool.pytest.ini_options]
 addopts = "-q"
-
-[tool.uv.sources]
-agent-execution = { path = "../agent-review/packages/agent-execution", editable = false }
