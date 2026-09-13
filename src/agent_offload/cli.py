@@ -293,8 +293,14 @@ def retrieve(
     expected_task_id: str | None = None,
     expected_prompt_sha256: str | None = None,
     expected_source_sha256: str | None = None,
+    expected_execution_source_sha256: str | None = None,
     mark_processed: bool = True,
 ) -> dict[str, Any]:
+    """Retrieve artifacts using an independently retained nested source baseline.
+
+    ``expected_execution_source_sha256`` must come from dispatch provenance,
+    never from the returned result or the current SDK installation.
+    """
     inspection = inspect_job(job_id)
     if inspection.get("project") != "agent-offload":
         raise OffloadError(f"job {job_id} is not an agent-offload job")
@@ -326,6 +332,7 @@ def retrieve(
             task_id=task_id,
             prompt_sha256=expected_prompt_sha256,
             source_sha256=expected_source_sha256,
+            execution_source_sha256=expected_execution_source_sha256,
         )
     except ProtocolError as exc:
         raise OffloadError(str(exc)) from exc

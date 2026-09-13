@@ -5,10 +5,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent_execution.identity import source_sha256 as execution_source_sha256
-from agent_execution.worker import (
-    WORKER_PROTOCOL_VERSION as EXECUTION_WORKER_PROTOCOL_VERSION,
-)
 from agent_execution.worker import (
     WorkerResult,
 )
@@ -81,22 +77,28 @@ def validate_execution_result(
     *,
     task_id: str,
     prompt_sha256: str,
-    source_sha256: str,
+    source_sha256: str | None,
+    expected_protocol_version: int,
 ) -> dict[str, Any]:
     try:
         execution_result = WorkerResult.parse(json.dumps(value))
     except (TypeError, ValueError) as exc:
         raise ProtocolError(f"invalid agent-execution worker result: {exc}") from exc
-    if execution_result.worker_protocol_version != EXECUTION_WORKER_PROTOCOL_VERSION:
-        raise ProtocolError("nested execution worker protocol does not match the conductor")
-    if execution_result.worker_source_sha256 != source_sha256:
-        raise ProtocolError("nested execution worker source does not match the conductor")
+    if execution_result.worker_protocol_version != expected_protocol_version:
+        raise ProtocolError("nested execution worker protocol does not match the dispatch")
     if execution_result.model_call_id != task_id:
         raise ProtocolError("nested execution task identifier does not match")
     if execution_result.provider != SUPPORTED_PROVIDER:
         raise ProtocolError("nested execution provider does not match")
     if execution_result.prompt_sha256 != prompt_sha256:
         raise ProtocolError("nested execution prompt digest does not match")
+    if source_sha256 is None:
+        raise ProtocolError(
+            "historical nested execution evidence is unverifiable: "
+            "the accepted offload dispatch did not retain a nested worker source baseline"
+        )
+    if execution_result.worker_source_sha256 != source_sha256:
+        raise ProtocolError("nested execution worker source does not match the dispatch")
     return execution_result.to_dict()
 
 
@@ -106,6 +108,7 @@ def validate_result(
     task_id: str | None = None,
     prompt_sha256: str | None = None,
     source_sha256: str | None = None,
+    execution_source_sha256: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ProtocolError("worker result must be a JSON object")
@@ -131,7 +134,9 @@ def validate_result(
             harness,
             task_id=str(value.get("task_id") or ""),
             prompt_sha256=str(value.get("prompt_sha256") or ""),
-            source_sha256=execution_source_sha256(),
+            source_sha256=execution_source_sha256,
+            # Native offload was retired while its nested worker used protocol 1.
+            expected_protocol_version=1,
         )
         if harness is not None
         else None

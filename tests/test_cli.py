@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from agent_execution.worker import installed_worker_identity
+from agent_execution.worker import WorkerIdentity
 
 from agent_offload import cli
 from agent_offload.protocol import RESULT_SCHEMA, sha256_text, worker_identity
@@ -14,7 +14,9 @@ from agent_offload.protocol import RESULT_SCHEMA, sha256_text, worker_identity
 
 def completed_result(task_id: str, report: str) -> dict[str, object]:
     prompt_sha256 = "a" * 64
-    execution_identity = installed_worker_identity()
+    execution_identity = WorkerIdentity(
+        package_version="0.1.0", protocol_version=1, source_sha256="d" * 64
+    )
     return {
         "schema_version": RESULT_SCHEMA,
         "task_id": task_id,
@@ -42,7 +44,7 @@ def completed_result(task_id: str, report: str) -> dict[str, object]:
             "session_id": "thread-1",
             "harness": {"exit_status": 0, "stdout": "{}", "stderr": ""},
             "evidence": {
-                "import_receipt": {"schema_version": 2},
+                "import_receipt": {"schema_version": 2, "outcome": "success"},
                 "transcript": {"schema_version": 1},
             },
             "failure": "",
@@ -202,10 +204,34 @@ def test_retrieve_validates_both_artifacts_before_marking_processed(monkeypatch)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(cli, "run_process", fake_run_process)
-    retrieval = cli.retrieve("wj1")
+    retrieval = cli.retrieve("wj1", expected_execution_source_sha256="d" * 64)
     assert retrieval["report"] == "Finding: schema drift."
     assert retrieval["marked_processed"] is True
     assert marked == [["weft", "job", "mark-processed", "wj1"]]
+
+
+def test_retrieve_refuses_missing_historical_nested_source_baseline(monkeypatch) -> None:
+    task_id = "task-1"
+    result = completed_result(task_id, "Historical report")
+    result_artifact = f"outputs/agent-offload-result-{task_id}.json"
+    report_artifact = f"outputs/agent-offload-report-{task_id}.md"
+    monkeypatch.setattr(
+        cli,
+        "inspect_job",
+        lambda _job_id: {
+            "status": "completed",
+            "project": "agent-offload",
+            "produces": [result_artifact, report_artifact],
+        },
+    )
+    monkeypatch.setattr(cli, "artifact_text", lambda *_args: json.dumps(result))
+
+    def unexpected_mark(*_args, **_kwargs):
+        raise AssertionError("unverifiable evidence must not mark the job processed")
+
+    monkeypatch.setattr(cli, "run_process", unexpected_mark)
+    with pytest.raises(cli.OffloadError, match="did not retain a nested worker source baseline"):
+        cli.retrieve("wj1")
 
 
 def test_retrieve_preserves_a_worker_failure_artifact(monkeypatch) -> None:
@@ -305,7 +331,7 @@ def test_retrieve_refuses_report_bytes_not_bound_to_envelope(monkeypatch) -> Non
         lambda _job_id, path: json.dumps(result) if path.endswith(".json") else "Different\n",
     )
     with pytest.raises(cli.OffloadError, match="does not match"):
-        cli.retrieve("wj1")
+        cli.retrieve("wj1", expected_execution_source_sha256="d" * 64)
 
 
 def test_doctor_parser_keeps_durable_flags() -> None:

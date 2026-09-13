@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_execution.identity import source_sha256 as execution_source_sha256
+from agent_execution.identity import worker_evidence_path
 from agent_execution.worker import (
     WORKER_PROTOCOL_VERSION as EXECUTION_WORKER_PROTOCOL_VERSION,
 )
@@ -30,6 +31,7 @@ from .protocol import (
 )
 
 SOURCE_EXCLUDES = {
+    ".agent-execution",
     ".git",
     ".jj",
     ".venv",
@@ -187,6 +189,7 @@ def validate_harness_result(
             task_id=task_id,
             prompt_sha256=prompt_sha256,
             source_sha256=source_sha256,
+            expected_protocol_version=EXECUTION_WORKER_PROTOCOL_VERSION,
         )
     except ProtocolError as exc:
         raise WorkerError(str(exc)) from exc
@@ -208,7 +211,6 @@ def nested_command(
     effort: str,
     prompt_payload: str,
     prompt_sha256: str,
-    harness_result_path: Path,
     harness_timeout: float,
     ctx_timeout: float,
     worker_source_sha256: str,
@@ -244,8 +246,6 @@ def nested_command(
         prompt_payload,
         "--expect-prompt-sha256",
         prompt_sha256,
-        "--evidence-out",
-        str(harness_result_path),
         "--timeout",
         str(harness_timeout),
         "--ctx-timeout",
@@ -331,14 +331,16 @@ def execute(
         nested_worker_source_sha256 = execution_source_sha256()
         result["source_sha256_before"] = source_tree_sha256(Path.cwd())
         result["status"] = "harness_failed"
-        harness_result_path = Path.cwd() / "outputs" / f".agent-offload-harness-{task_id}.json"
+        try:
+            harness_result_path = Path.cwd() / worker_evidence_path(task_id)
+        except ValueError as exc:
+            raise WorkerError(str(exc)) from exc
         command = nested_command(
             task_id=task_id,
             selector=selector,
             effort=effort,
             prompt_payload=prompt_payload,
             prompt_sha256=prompt_sha256,
-            harness_result_path=harness_result_path,
             harness_timeout=harness_timeout,
             ctx_timeout=ctx_timeout,
             worker_source_sha256=nested_worker_source_sha256,

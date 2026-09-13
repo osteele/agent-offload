@@ -70,3 +70,17 @@ def test_execute_refuses_source_drift_before_launch(monkeypatch, tmp_path: Path)
     assert "source mismatch" in result["failure"]
     assert result_path.is_file()
     assert report_path.read_text().startswith("# Agent offload failed\n\nworker source mismatch:")
+
+
+def test_source_snapshot_ignores_worker_evidence_but_detects_source_edits(tmp_path: Path) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("original\n")
+    before = worker.source_tree_sha256(tmp_path)
+
+    evidence = tmp_path / ".agent-execution" / "results" / "task-1.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text('{"status":"completed"}\n')
+    assert worker.source_tree_sha256(tmp_path) == before
+
+    source.write_text("modified\n")
+    assert worker.source_tree_sha256(tmp_path) != before

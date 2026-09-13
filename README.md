@@ -21,6 +21,13 @@ Retrieval validates the result envelope and report artifact before displaying
 either. By default it marks a successfully validated job processed. Pass
 `--no-mark-processed` for read-only validation.
 
+Historical native jobs used nested worker protocol 1. Their accepted outer
+dispatches did not retain the nested worker's source digest. Without an
+independently retained digest, retrieval refuses to certify nested evidence and
+reports the missing source baseline. The artifacts remain available in Weft,
+and the job is not marked processed. The current SDK installation and the
+result's own claimed digest cannot supply that baseline.
+
 `agent-offload doctor` reports native Codex execution as retired without probing
 Studio. `agent-offload run` refuses before creating a Weft job.
 
@@ -42,6 +49,12 @@ Each historical task binds:
 The conductor continues to validate both returned artifacts. A malformed or
 ambiguous transport response is not treated as permission to submit a duplicate
 task.
+
+The nested-worker adapter uses SDK protocol 2's protected result path,
+`.agent-execution/results/<task-id>.json`, with the same task ID passed as
+`--model-call-id`. It supplies no output-path override. Protected worker metadata
+is excluded from the source-immutability digest; edits to project source still
+fail that check. Native Codex execution remains retired.
 
 ## Attached relay (`relay`)
 
