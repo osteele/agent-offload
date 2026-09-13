@@ -209,6 +209,9 @@ def validate_relay_result(result: Mapping[str, Any], *, project_root: str) -> di
     _require(result, "prompt_sha256", (str,), "result")
     if not _SHA256.match(str(result["prompt_sha256"])):
         raise RelayProtocolError("result.prompt_sha256 malformed")
+    _require(result, "relay_source_sha256", (str,), "result")
+    if not _SHA256.match(str(result["relay_source_sha256"])):
+        raise RelayProtocolError("result.relay_source_sha256 malformed")
     _require(result, "started_at", (float, int), "result")
     _require(result, "ended_at", (float, int), "result")
     durability = _require(result, "durability", (str,), "result")

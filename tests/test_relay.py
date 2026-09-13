@@ -268,6 +268,7 @@ def test_happy_path_writes_validated_result(
     assert record["durability"] == "none-attached-live-local-tools"
     assert record["snapshot_equivalent"] is False
     assert record["model"] == {"provider": "anthropic", "id": "claude-opus-4-6"}
+    assert len(record["relay_source_sha256"]) == 64
     served = record["tool_calls"][0]["served_paths"][0]
     assert served["path"] == str(relay_project / "notes.txt")
     assert result_path.exists()

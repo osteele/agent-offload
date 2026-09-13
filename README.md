@@ -82,10 +82,10 @@ Trust boundary, by contrast with `run`:
   tools.
 
 Results are written under `outputs/relay-result-*.json` with schema
-`agent-offload.relay-result/v1`: harness and SDK identity, host identity,
-exact remote argv, provider/model, prompt digest, full RPC event stream,
-per-call tool evidence, final response, timestamps, and failure or
-cancellation status. The record states `durability:
+`agent-offload.relay-result/v1`: relay implementation digest, harness and SDK
+identity, host identity, exact remote argv, pinned provider/model, prompt digest,
+full RPC event stream, per-call tool evidence, final response, timestamps, and
+failure or cancellation status. The record states `durability:
 none-attached-live-local-tools` and `snapshot_equivalent: false`.
 
 ## Operations

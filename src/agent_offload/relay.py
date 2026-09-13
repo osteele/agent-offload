@@ -19,6 +19,7 @@ itself.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -61,6 +62,29 @@ DEFAULT_TIMEOUT_SECONDS = 600.0
 RELAY_DEADLINE_GRACE_SECONDS = 30.0
 
 TERMINATION_GRACE_SECONDS = 10.0
+RELAY_SOURCE_FILES = (
+    "relay.py",
+    "relay_protocol.py",
+    "relay_runtime/bun.lock",
+    "relay_runtime/confinement.ts",
+    "relay_runtime/event_failure.ts",
+    "relay_runtime/package.json",
+    "relay_runtime/relay_bridge.ts",
+)
+
+
+def relay_source_sha256() -> str:
+    package_root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for relative in RELAY_SOURCE_FILES:
+        encoded_path = relative.encode()
+        payload = (package_root / relative).read_bytes()
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
+
 
 #: Flags the remote argv must carry for the conductor to accept a result.
 #: The bridge enforces the same set when building the argv; this check is
@@ -260,6 +284,7 @@ def run_relay(
     bun = _require_bun()
     runtime_dir = Path(__file__).resolve().parent / "relay_runtime"
     bridge = _ensure_runtime(runtime_dir)
+    relay_source_before = relay_source_sha256()
 
     context_blocks = _local_context(project_root)
     system_prompt = "\n\n".join(
@@ -383,6 +408,9 @@ def run_relay(
         argv_tokens = shlex.split(str(bridge_result["remote_argv"]))
     except ValueError as exc:
         raise RelayProtocolError(f"remote argv is not valid shell syntax: {exc}") from exc
+    relay_source_after = relay_source_sha256()
+    if relay_source_after != relay_source_before:
+        raise RelayProtocolError("relay implementation changed during the attached request")
     missing = [flag for flag in REMOTE_DISABLE_FLAGS if flag not in argv_tokens]
     if missing:
         raise RelayProtocolError(
@@ -408,6 +436,7 @@ def run_relay(
         "context_files": [
             {"name": block["name"], "sha256": block["sha256"]} for block in context_blocks
         ],
+        "relay_source_sha256": relay_source_before,
         "prompt_sha256": bridge_result["prompt_sha256"],
         "system_prompt_sha256": sha256_text(system_prompt) if system_prompt else None,
         "started_at": bridge_result["started_at"],
