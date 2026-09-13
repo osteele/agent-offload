@@ -4,9 +4,11 @@
  * Every path the remote agent names is treated as hostile: URL or device
  * schemes are rejected, parent traversal collapses against the root, and a
  * symlink anywhere on the resolved path may not leave the root. Results are
- * bounded and each served file carries a content digest so the evidence
- * stream records what the model actually saw, not what a later revision of
- * the live tree contains.
+ * bounded — by bytes, matches, file count, and total traversal — and each
+ * served file carries a content digest so the evidence stream records what
+ * the model actually saw, not what a later revision of the live tree
+ * contains. Text is decoded strictly: invalid UTF-8 is a refusal, never a
+ * silent replacement, so served text is always exactly what the bytes said.
  */
 import { createHash } from "node:crypto";
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
@@ -18,9 +20,12 @@ export interface RelayBounds {
 	maxToolResultBytes: number;
 	/** Total files walked per glob/grep call, matching or not. */
 	maxTraversedFiles: number;
+	/** Encoded size cap for host-tool arguments, enforced before execution. */
+	maxToolArgsBytes: number;
 }
 
 export class ConfinementError extends Error {}
+
 
 export interface ServedPath {
 	path: string;
@@ -38,6 +43,29 @@ export interface ToolOutput {
 	};
 }
 
+
+/** Enforce the argument-size bound and reject unspecified properties before
+ * any host tool executes or logs anything about its arguments. */
+export function assertToolArgs(
+	tool: string,
+	params: unknown,
+	allowedKeys: readonly string[],
+	bounds: RelayBounds,
+): void {
+	const encoded = JSON.stringify(params) ?? "";
+	if (Buffer.byteLength(encoded) > bounds.maxToolArgsBytes) {
+		throw new ConfinementError(
+			`tool arguments exceed the ${bounds.maxToolArgsBytes}-byte bound for ${tool}`,
+		);
+	}
+	const keys = params === null || typeof params !== "object"
+		? []
+		: Object.keys(params as Record<string, unknown>);
+	const unexpected = keys.filter((key) => !allowedKeys.includes(key));
+	if (unexpected.length > 0) {
+		throw new ConfinementError(`unexpected arguments for ${tool}: ${unexpected.join(", ")}`);
+	}
+}
 function digest(bytes: Uint8Array): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
@@ -65,7 +93,9 @@ export async function confine(root: string, userPath: string): Promise<string> {
 	const rootReal = await realpath(root);
 	let joined: string;
 	try {
-		joined = userPath.startsWith("/") ? await realpath(userPath) : await realpath(`${rootReal}/${userPath}`);
+		joined = userPath.startsWith("/")
+			? await realpath(userPath)
+			: await realpath(`${rootReal}/${userPath}`);
 	} catch {
 		// A missing path is refused as confinement, not reported as a filesystem
 		// error: the model must not learn which outside paths exist.
@@ -83,18 +113,41 @@ function isTextual(bytes: Uint8Array): boolean {
 	return !bytes.includes(0);
 }
 
-function clipToLine(bytes: Uint8Array, maxBytes: number): { text: string; truncated: boolean } {
-	let view = bytes;
-	let truncated = bytes.length > maxBytes;
-	if (truncated) {
-		view = bytes.subarray(0, maxBytes);
+/** Strict UTF-8 decode: invalid sequences are a confinement refusal, not a
+ * silent replacement, so served text is always exactly what the bytes said. */
+function decodeUtf8(bytes: Uint8Array): string {
+	try {
+		return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	} catch {
+		throw new ConfinementError("file is not valid UTF-8");
 	}
-	let text = new TextDecoder("utf-8", { fatal: false }).decode(view);
-	if (truncated) {
-		const lastNewline = text.lastIndexOf("\n");
-		if (lastNewline > 0) text = text.slice(0, lastNewline);
+}
+
+/** Truncate decoded UTF-8 text to an encoded-byte budget on a char boundary. */
+function truncateUtf8(text: string, maxBytes: number): { text: string; truncated: boolean } {
+	if (Buffer.byteLength(text) <= maxBytes) {
+		return { text, truncated: false };
 	}
-	return { text, truncated };
+	let lo = 0;
+	let hi = text.length;
+	while (lo < hi) {
+		const mid = (lo + hi) >> 1;
+		if (Buffer.byteLength(text.slice(0, mid)) <= maxBytes) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	let cut = lo - 1;
+	// Never end on half a surrogate pair.
+	while (cut > 0 && /[\uD800-\uDFFF]/.test(text[cut - 1] ?? "")) {
+		cut -= 1;
+	}
+	const lastNewline = text.lastIndexOf("\n", cut);
+	if (lastNewline > 0) {
+		return { text: text.slice(0, lastNewline), truncated: true };
+	}
+	return { text: text.slice(0, cut), truncated: true };
 }
 
 /** Read one confined UTF-8 text file. */
@@ -122,7 +175,8 @@ export async function readBound(
 	if (!isTextual(bytes)) {
 		throw new ConfinementError(`binary file is not readable: ${userPath}`);
 	}
-	const { text, truncated } = clipToLine(bytes, bounds.maxToolResultBytes);
+	const text = decodeUtf8(bytes);
+	const { text: clipped, truncated } = truncateUtf8(text, bounds.maxToolResultBytes);
 	const served: ServedPath = {
 		path: resolved,
 		sha256: digest(bytes),
@@ -130,12 +184,55 @@ export async function readBound(
 		truncated,
 	};
 	return {
-		content: text,
+		content: clipped,
 		details: { served_paths: [served], skipped: [], truncated },
 	};
 }
 
-/** List files matching a glob-like suffix under root (bounded). */
+/** Translate a shell-style glob into a matcher over root-relative paths.
+ * `**` spans directories, `*` stays within one segment. */
+function globToMatcher(pattern: string): (relativePath: string) => boolean {
+	const source = pattern
+		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+		.replace(/\*\*/g, "\u0000")
+		.replace(/\*/g, "[^/]*")
+		.replace(/\u0000/g, ".*")
+		.replace(/\?/g, "[^/]");
+	return (relativePath) => new RegExp(`^${source}$`).test(relativePath);
+}
+
+interface WalkState {
+	visited: number;
+	maxTraversed: number;
+	stop: boolean;
+}
+
+type FileVisitor = (filePath: string) => Promise<void>;
+
+/** Bounded walk that never follows symlinks, never enters .git, and stops
+ * after maxTraversed files — matching or not — so a nonmatching tree
+ * terminates the call instead of funding an endless walk. */
+async function walk(dir: string, state: WalkState, visit: FileVisitor): Promise<void> {
+	if (state.stop) return;
+	const entries = await readdir(dir, { withFileTypes: true });
+	for (const entry of entries) {
+		if (state.stop) return;
+		if (entry.isSymbolicLink() || entry.name === ".git") continue;
+		const child = `${dir}/${entry.name}`;
+		if (entry.isDirectory()) {
+			await walk(child, state, visit);
+		} else if (entry.isFile()) {
+			state.visited += 1;
+			if (state.visited > state.maxTraversed) {
+				state.stop = true;
+				return;
+			}
+			await visit(child);
+		}
+	}
+}
+
+/** List files matching a glob under root (bounded). */
 export async function globBound(
 	root: string,
 	pattern: string,
@@ -191,18 +288,6 @@ export async function globBound(
 		details: { served_paths: matched, skipped, truncated },
 	};
 }
-/** Translate a shell-style glob into a matcher over root-relative paths.
- * `**` spans directories, `*` stays within one segment. */
-function globToMatcher(pattern: string): (relativePath: string) => boolean {
-	const source = pattern
-		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-		.replace(/\*\*/g, "\u0000")
-		.replace(/\*/g, "[^/]*")
-		.replace(/\u0000/g, ".*")
-		.replace(/\?/g, "[^/]");
-	return (relativePath) => new RegExp(`^${source}$`).test(relativePath);
-}
-
 
 /** Grep a literal pattern across textual files under root (bounded). */
 export async function grepBound(
@@ -231,7 +316,16 @@ export async function grepBound(
 			skipped.push(filePath);
 			return;
 		}
-		const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+		let text: string;
+		try {
+			text = decodeUtf8(bytes);
+		} catch (error) {
+			if (error instanceof ConfinementError) {
+				skipped.push(filePath);
+				return;
+			}
+			throw error;
+		}
 		const lines = text.split("\n");
 		let fileHits = 0;
 		for (const [index, line] of lines.entries()) {
@@ -260,42 +354,13 @@ export async function grepBound(
 			}
 		}
 	});
-	const content =
-		matches.length > 0
-			? matches.join("\n") + (truncated ? "\n...bound reached" : "")
-			: truncated
-				? "bound reached before any match"
-				: `no matches for ${JSON.stringify(pattern)}`;
-	return { content, details: { served_paths: served, skipped, truncated } };
-}
-
-interface WalkState {
-	visited: number;
-	maxTraversed: number;
-	stop: boolean;
-}
-
-type FileVisitor = (filePath: string) => Promise<void>;
-
-/** Bounded walk that never follows symlinks, never enters .git, and stops
- * after maxTraversed files — matching or not — so a nonmatching tree
- * terminates the call instead of funding an endless walk. */
-async function walk(dir: string, state: WalkState, visit: FileVisitor): Promise<void> {
-	if (state.stop) return;
-	const entries = await readdir(dir, { withFileTypes: true });
-	for (const entry of entries) {
-		if (state.stop) return;
-		if (entry.isSymbolicLink() || entry.name === ".git") continue;
-		const child = `${dir}/${entry.name}`;
-		if (entry.isDirectory()) {
-			await walk(child, state, visit);
-		} else if (entry.isFile()) {
-			state.visited += 1;
-			if (state.visited > state.maxTraversed) {
-				state.stop = true;
-				return;
-			}
-			await visit(child);
-		}
+	const content = matches.length > 0 ? matches.join("\n") : truncated
+		? "bound reached before any match"
+		: `no matches for ${JSON.stringify(pattern)}`;
+	if (Buffer.byteLength(content) > bounds.maxToolResultBytes) {
+		throw new ConfinementError(
+			`grep result exceeds the ${bounds.maxToolResultBytes}-byte output bound`,
+		);
 	}
+	return { content, details: { served_paths: served, skipped, truncated } };
 }

@@ -38,6 +38,7 @@ from .relay_protocol import (
     MAX_GREP_MATCHES,
     MAX_MATCH_FILES,
     MAX_READ_BYTES,
+    MAX_TOOL_ARGS_BYTES,
     MAX_TOOL_RESULT_BYTES,
     MAX_TRAVERSED_FILES,
     RELAY_PROVIDER,
@@ -45,6 +46,7 @@ from .relay_protocol import (
     RESULT_SCHEMA,
     RelayProtocolError,
     sha256_text,
+    validate_bridge_result_payload,
     validate_relay_result,
 )
 
@@ -104,6 +106,7 @@ class RelayBounds:
     max_grep_matches: int = MAX_GREP_MATCHES
     max_tool_result_bytes: int = MAX_TOOL_RESULT_BYTES
     max_traversed_files: int = MAX_TRAVERSED_FILES
+    max_tool_args_bytes: int = MAX_TOOL_ARGS_BYTES
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -112,6 +115,7 @@ class RelayBounds:
             "maxGrepMatches": self.max_grep_matches,
             "maxToolResultBytes": self.max_tool_result_bytes,
             "maxTraversedFiles": self.max_traversed_files,
+            "maxToolArgsBytes": self.max_tool_args_bytes,
         }
 
 
@@ -289,6 +293,8 @@ def run_relay(
     bridge_result: dict[str, Any] | None = None
     bridge_error: str | None = None
     timed_out = False
+    ready_seen = False
+    streamed_events: list[dict[str, Any]] = []
 
     try:
         while True:
@@ -307,17 +313,25 @@ def run_relay(
             if kind == "protocol_error":
                 raise RelayProtocolError(f"bridge stream violated its schema: {payload}")
             if kind == "ready":
+                if ready_seen:
+                    raise RelayProtocolError("duplicate ready frame in bridge stream")
+                ready_seen = True
                 print(
                     f"relay: agent ready on {host} "
                     f"(omp {payload['omp_version']}); tools {payload['registered_tools']}",
                     file=sys.stderr,
                 )
             elif kind == "event":
+                if not ready_seen:
+                    raise RelayProtocolError("event frame arrived before the ready frame")
                 event_count += 1
+                streamed_events.append(payload["event"])
                 name = payload["event"].get("type")
                 if name in {"tool_execution_start", "message_update"}:
                     print(f"relay: event {event_count}: {name}", file=sys.stderr)
             elif kind == "result":
+                if not ready_seen:
+                    raise RelayProtocolError("result frame arrived before the ready frame")
                 bridge_result = payload["result"]
                 break
             elif kind == "error":
@@ -336,6 +350,12 @@ def run_relay(
             f"bridge exited without a result frame (exit={process.returncode}); "
             "refusing to treat a partial stream as an outcome"
         )
+    # The streamed event frames are the primary evidence: the result frame's
+    # event list must match them exactly, so the bridge cannot omit or
+    # substitute lifecycle evidence between streaming and settlement.
+    if bridge_result["events"] != streamed_events:
+        raise RelayProtocolError("result events differ from the streamed event frames")
+    validate_bridge_result_payload(bridge_result)
     if bridge_result["host_target"] != host:
         raise RelayProtocolError(
             f"bridge host_target drift: {bridge_result['host_target']!r} != {host!r}"

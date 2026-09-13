@@ -70,13 +70,27 @@ def sha256_text(text: str) -> str:
 
 
 def validate_bridge_frame(frame: Mapping[str, Any]) -> str:
-    """Validate one bridge envelope frame; returns its ``frame`` kind."""
+    """Validate one bridge envelope frame; returns its ``frame`` kind.
+
+    Ready frames are validated deeply (identity fields and the exact
+    registered tool set) because the conductor's downstream checks are
+    indexed against them; a malformed ready must fail closed here.
+    """
     kind = _require(frame, "frame", (str,), "bridge_frame")
     if kind not in {"ready", "event", "result", "error"}:
         raise RelayProtocolError(f"bridge_frame.frame unknown kind {kind!r}")
     if frame.get("schema_version") != BRIDGE_SCHEMA:
         raise RelayProtocolError(f"bridge_frame.schema_version must be {BRIDGE_SCHEMA!r}")
-    if kind == "event":
+    if kind == "ready":
+        for key in ("sdk_version", "omp_version", "host_identity", "remote_argv"):
+            _require(frame, key, (str,), "bridge_frame")
+        registered = frame.get("registered_tools")
+        if sorted(str(tool) for tool in (registered or [])) != sorted(RELAY_TOOLS):
+            raise RelayProtocolError(
+                "ready registered_tools must be exactly "
+                f"{sorted(RELAY_TOOLS)}; observed {sorted(str(t) for t in (registered or []))}"
+            )
+    elif kind == "event":
         _require(frame, "event", (dict,), "bridge_frame")
     elif kind == "result":
         _require(frame, "result", (dict,), "bridge_frame")
@@ -141,9 +155,6 @@ def _validate_served_paths(call: Mapping[str, Any], root: str) -> None:
                 f"tool call {call.get('tool_call_id')!r} served path lacks content digest"
             )
 
-
-RELAY_PROVIDER = "anthropic"
-RELAY_MODEL_ID = "claude-opus-4-6"
 
 BRIDGE_RESULT_REQUIRED = (
     "sdk_version",
@@ -218,6 +229,21 @@ def validate_relay_result(result: Mapping[str, Any], *, project_root: str) -> di
             f"{RELAY_PROVIDER}/{RELAY_MODEL_ID}: "
             f"{model['provider']}/{model['id']}"
         )
+    failure = result.get("failure")
+    if failure is not None and not isinstance(failure, str):
+        raise RelayProtocolError("result.failure must be a string or null")
+    cancelled = result.get("cancelled")
+    if not isinstance(cancelled, bool):
+        raise RelayProtocolError("result.cancelled must be a boolean")
+    final_response = result.get("final_response")
+    if final_response is not None and not isinstance(final_response, str):
+        raise RelayProtocolError("result.final_response must be a string or null")
+    if (
+        failure is None
+        and not cancelled
+        and not (isinstance(final_response, str) and final_response.strip())
+    ):
+        raise RelayProtocolError("a success result requires a non-empty assistant response")
     registered = result.get("registered_tools")
     if sorted(str(tool) for tool in (registered or [])) != sorted(RELAY_TOOLS):
         raise RelayProtocolError(

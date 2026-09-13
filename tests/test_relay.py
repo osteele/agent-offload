@@ -1,8 +1,9 @@
 """Contract tests for the attached relay conductor.
 
 The bridge is replaced by a scripted fake so the conductor's observable
-contracts — versioned frames, complete tool lifecycle, served-path
-confinement, process-group termination on timeout, detach refusal — are
+contracts — versioned frames, ready-first sequencing, complete tool
+lifecycle, sanctioned tool names, served-path confinement, request
+binding, process-group termination on timeout, detach refusal — are
 exercised without a remote host or live provider.
 """
 
@@ -56,6 +57,28 @@ FAKE_BRIDGE = textwrap.dedent(
                "error": {"message": "server refused host tools"}})
         sys.exit(3)
 
+    flags = ("--no-tools --no-lsp --no-extensions --no-skills --no-rules "
+             "--no-session --no-pty")
+    if scenario == "lookalike":
+        flags = ("--no-tools=false --no-lsp --no-extensions --no-skills "
+                 "--no-rules --no-session --no-pty")
+    remote_argv = ("ssh agent@studio exec omp --mode rpc " + flags) if (
+        scenario != "no_flags"
+    ) else "ssh agent@studio exec omp --mode rpc"
+
+    ready = {"frame": "ready", "schema_version": "agent-offload.relay-bridge/v1",
+             "sdk_version": "0.0.0-test", "omp_version": "omp/v-test",
+             "host_identity": "test-host", "remote_argv": remote_argv,
+             "registered_tools": ["review_read", "review_glob", "review_grep"]}
+    if scenario != "no_ready":
+        frame(ready)
+    if scenario == "duplicate_ready":
+        frame(dict(ready))
+    if scenario == "malformed_ready":
+        frame({"frame": "ready", "schema_version": "agent-offload.relay-bridge/v1",
+               "sdk_version": "0.0.0-test",
+               "registered_tools": ["review_read", "review_glob", "review_grep"]})
+
     # The combined prompt must match the conductor's formulation exactly;
     # this digest is what the conductor binds its own computation against.
     prompt = request["prompt"]
@@ -65,14 +88,6 @@ FAKE_BRIDGE = textwrap.dedent(
     prompt_digest = hashlib.sha256(prompt.encode()).hexdigest()
 
     root = request["project_root"]
-    flags = ("--no-tools --no-lsp --no-extensions --no-skills --no-rules "
-             "--no-session --no-pty")
-    if scenario == "lookalike":
-        flags = "--no-tools=false --no-lsp --no-extensions --no-skills --no-rules " \
-                "--no-session --no-pty"
-    remote_argv = ("ssh agent@studio exec omp --mode rpc " + flags) if (
-        scenario != "no_flags"
-    ) else "ssh agent@studio exec omp --mode rpc"
     served = "/etc/passwd" if scenario == "outside_root" else root + "/notes.txt"
     digest = "a" * 64
     events = []
@@ -97,10 +112,28 @@ FAKE_BRIDGE = textwrap.dedent(
              "result": {"content": [{"type": "text", "text": "did things"}],
                         "details": {}, "isError": False}},
         ]
+    elif scenario == "evidence_substitution":
+        events = [
+            {"type": "tool_execution_start", "toolCallId": "c2", "toolName": "review_glob"},
+            {"type": "tool_execution_end", "toolCallId": "c2",
+             "result": {"content": [{"type": "text", "text": "substituted"}],
+                        "details": {}, "isError": False}},
+        ]
 
     for event in events:
         frame({"frame": "event", "schema_version": "agent-offload.relay-bridge/v1",
                "event": event})
+
+    if scenario == "evidence_substitution":
+        # Stream a different lifecycle than the one the result claims, so the
+        # conductor's streamed-vs-result equality check is what fires.
+        streamed = [
+            {"type": "tool_execution_start", "toolCallId": "streamed-1",
+             "toolName": "review_read"},
+        ]
+        for event in streamed:
+            frame({"frame": "event", "schema_version": "agent-offload.relay-bridge/v1",
+                   "event": event})
 
     registered = ["review_read", "review_glob", "review_grep"]
     if scenario == "registry_drift":
@@ -205,6 +238,15 @@ def test_requires_exactly_one_prompt_source(relay_project: Path) -> None:
     assert both == 2
 
 
+def test_parser_rejects_generic_selector_overrides() -> None:
+    """The grounded lane is pinned; generic override flags do not exist."""
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["relay", "--model", "zai/glm-5.3-flash"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["relay", "--provider", "openai"])
+
+
 def test_happy_path_writes_validated_result(
     relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -213,12 +255,38 @@ def test_happy_path_writes_validated_result(
     assert record["tool_call_count"] == 1
     assert record["durability"] == "none-attached-live-local-tools"
     assert record["snapshot_equivalent"] is False
+    assert record["model"] == {"provider": "anthropic", "id": "claude-opus-4-6"}
     served = record["tool_calls"][0]["served_paths"][0]
     assert served["path"] == str(relay_project / "notes.txt")
     assert result_path.exists()
     on_disk = json.loads(result_path.read_text())
     assert on_disk["schema_version"] == RESULT_SCHEMA
     assert record["bounds"]["maxReadBytes"] == 524288
+
+
+def test_request_pins_grounded_selector(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RELAY_FAKE_SCENARIO", "happy")
+    monkeypatch.setenv("RELAY_FAKE_REQUEST_OUT", str(_marker(relay_project, "request.json")))
+    monkeypatch.setenv("RELAY_FAKE_TERMINATED_MARKER", str(_marker(relay_project, "terminated")))
+    relay_module.run_relay(
+        project_root=relay_project,
+        prompt="review this",
+        host="agent@studio",
+        timeout_seconds=20.0,
+    )
+    request = json.loads(_marker(relay_project, "request.json").read_text())
+    assert request["schema_version"] == "agent-offload.relay-request/v1"
+    assert request["project_root"] == str(relay_project)
+    assert request["provider"] == "anthropic"
+    assert request["model"] == "anthropic/claude-opus-4-6"
+    assert request["bounds"]["maxReadBytes"] > 0
+    assert request["bounds"]["maxGrepMatches"] > 0
+    assert request["bounds"]["maxToolArgsBytes"] > 0
+    assert request["host_target"] == "agent@studio"
+    assert request["system_prompt"] is not None
+    assert "project instructions" in request["system_prompt"]
 
 
 def test_refuses_unpaired_tool_call(
@@ -242,83 +310,32 @@ def test_refuses_garbage_stream(
         _run_scenario(relay_project, monkeypatch, "garbage")
 
 
-def test_error_frame_fails_closed(
+def test_refuses_streamed_evidence_substitution(
     relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with pytest.raises(relay_module.RelayError, match="failed closed"):
-        _run_scenario(relay_project, monkeypatch, "error")
+    with pytest.raises(RelayProtocolError, match="differ from the streamed"):
+        _run_scenario(relay_project, monkeypatch, "evidence_substitution")
 
 
-def test_timeout_terminates_bridge_process_group(
+def test_refuses_missing_ready_frame(
     relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    marker = _marker(relay_project, "terminated")
-    monkeypatch.setenv("RELAY_FAKE_SCENARIO", "sleep")
-    monkeypatch.setenv("RELAY_FAKE_TERMINATED_MARKER", str(marker))
-    monkeypatch.setattr(relay_module, "RELAY_DEADLINE_GRACE_SECONDS", 0.3, raising=False)
-    with pytest.raises(relay_module.RelayError, match="exceeded"):
-        relay_module.run_relay(
-            project_root=relay_project,
-            prompt="review this",
-            host="agent@studio",
-            timeout_seconds=0.5,
-        )
-    assert marker.read_text() == "terminated"
+    with pytest.raises(RelayProtocolError, match="before the ready frame"):
+        _run_scenario(relay_project, monkeypatch, "no_ready")
 
 
-def test_refuses_remote_argv_missing_disable_flags(
+def test_refuses_duplicate_ready_frame(
     relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with pytest.raises(RelayProtocolError, match="--no-tools"):
-        _run_scenario(relay_project, monkeypatch, "no_flags")
+    with pytest.raises(RelayProtocolError, match="duplicate ready frame"):
+        _run_scenario(relay_project, monkeypatch, "duplicate_ready")
 
 
-def test_request_carries_bounds_and_absolute_root(
+def test_refuses_malformed_ready_frame(
     relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("RELAY_FAKE_SCENARIO", "happy")
-    monkeypatch.setenv("RELAY_FAKE_REQUEST_OUT", str(_marker(relay_project, "request.json")))
-    monkeypatch.setenv("RELAY_FAKE_TERMINATED_MARKER", str(_marker(relay_project, "terminated")))
-    relay_module.run_relay(
-        project_root=relay_project,
-        prompt="review this",
-        host="agent@studio",
-        timeout_seconds=20.0,
-    )
-    request = json.loads(_marker(relay_project, "request.json").read_text())
-    assert request["schema_version"] == "agent-offload.relay-request/v1"
-    assert request["project_root"] == str(relay_project)
-    assert request["bounds"]["maxReadBytes"] > 0
-    assert request["bounds"]["maxGrepMatches"] > 0
-    assert request["host_target"] == "agent@studio"
-    assert request["system_prompt"] is not None
-    assert "project instructions" in request["system_prompt"]
-
-
-def test_parser_rejects_generic_selector_overrides() -> None:
-    """The grounded lane is pinned; generic override flags do not exist."""
-    parser = cli.build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["relay", "--model", "zai/glm-5.3-flash"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["relay", "--provider", "openai"])
-
-
-def test_request_pins_grounded_selector(
-    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RELAY_FAKE_SCENARIO", "happy")
-    monkeypatch.setenv("RELAY_FAKE_REQUEST_OUT", str(_marker(relay_project, "request.json")))
-    monkeypatch.setenv("RELAY_FAKE_TERMINATED_MARKER", str(_marker(relay_project, "terminated")))
-    relay_module.run_relay(
-        project_root=relay_project,
-        prompt="review this",
-        host="agent@studio",
-        timeout_seconds=20.0,
-    )
-    request = json.loads(_marker(relay_project, "request.json").read_text())
-    assert request["provider"] == "anthropic"
-    assert request["model"] == "anthropic/claude-opus-4-6"
+    with pytest.raises(RelayProtocolError, match="omp_version missing or wrong type"):
+        _run_scenario(relay_project, monkeypatch, "malformed_ready")
 
 
 def test_refuses_unsanctioned_tool_name(
@@ -333,6 +350,13 @@ def test_refuses_registered_tools_drift(
 ) -> None:
     with pytest.raises(RelayProtocolError, match="registered_tools must be exactly"):
         _run_scenario(relay_project, monkeypatch, "registry_drift")
+
+
+def test_refuses_model_selector_drift(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="drifted from the pinned grounded selector"):
+        _run_scenario(relay_project, monkeypatch, "model_drift")
 
 
 def test_refuses_host_target_drift(
@@ -356,8 +380,25 @@ def test_refuses_prompt_digest_drift(
         _run_scenario(relay_project, monkeypatch, "prompt_drift")
 
 
-def test_refuses_lookalike_disable_flag(
+def test_refuses_error_frame(
     relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with pytest.raises(RelayProtocolError, match="--no-tools"):
-        _run_scenario(relay_project, monkeypatch, "lookalike")
+    with pytest.raises(relay_module.RelayError, match="failed closed"):
+        _run_scenario(relay_project, monkeypatch, "error")
+
+
+def test_timeout_terminates_bridge_process_group(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = _marker(relay_project, "terminated")
+    monkeypatch.setenv("RELAY_FAKE_SCENARIO", "sleep")
+    monkeypatch.setenv("RELAY_FAKE_TERMINATED_MARKER", str(marker))
+    monkeypatch.setattr(relay_module, "RELAY_DEADLINE_GRACE_SECONDS", 0.3, raising=False)
+    with pytest.raises(relay_module.RelayError, match="exceeded"):
+        relay_module.run_relay(
+            project_root=relay_project,
+            prompt="review this",
+            host="agent@studio",
+            timeout_seconds=0.5,
+        )
+    assert marker.read_text() == "terminated"

@@ -18,6 +18,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
+	assertToolArgs,
 	ConfinementError,
 	globBound,
 	grepBound,
@@ -173,9 +174,15 @@ function buildHostTools(request: RelayRequest) {
 					path: { type: "string", description: "Path relative to the project root" },
 				},
 				required: ["path"],
+				additionalProperties: false,
 			},
 			execute: async (params) => {
-				diagnostic(`review_read executing for ${JSON.stringify(params)}`);
+				try {
+					assertToolArgs("review_read", params, ["path"], bounds);
+				} catch (error) {
+					diagnostic(`review_read args refused: ${(error as Error).message}`);
+					return refuse(error);
+				}
 				try {
 					const output = await readBound(request.project_root, String(params.path), bounds);
 					diagnostic("review_read completed");
@@ -197,10 +204,19 @@ function buildHostTools(request: RelayRequest) {
 					pattern: { type: "string", description: "Relative path fragment, may include *" },
 				},
 				required: ["pattern"],
+				additionalProperties: false,
 			},
 			execute: async (params) => {
 				try {
-					return asToolResult(await globBound(request.project_root, String(params.pattern), bounds));
+					assertToolArgs("review_glob", params, ["pattern"], bounds);
+				} catch (error) {
+					diagnostic(`review_glob args refused: ${(error as Error).message}`);
+					return refuse(error);
+				}
+				try {
+					return asToolResult(
+						await globBound(request.project_root, String(params.pattern), bounds),
+					);
 				} catch (error) {
 					return refuse(error);
 				}
@@ -217,10 +233,19 @@ function buildHostTools(request: RelayRequest) {
 					pattern: { type: "string", description: "Literal text to find" },
 				},
 				required: ["pattern"],
+				additionalProperties: false,
 			},
 			execute: async (params) => {
 				try {
-					return asToolResult(await grepBound(request.project_root, String(params.pattern), bounds));
+					assertToolArgs("review_grep", params, ["pattern"], bounds);
+				} catch (error) {
+					diagnostic(`review_grep args refused: ${(error as Error).message}`);
+					return refuse(error);
+				}
+				try {
+					return asToolResult(
+						await grepBound(request.project_root, String(params.pattern), bounds),
+					);
 				} catch (error) {
 					return refuse(error);
 				}
