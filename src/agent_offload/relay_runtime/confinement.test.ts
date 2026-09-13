@@ -23,6 +23,7 @@ const bounds: RelayBounds = {
 	maxMatchFiles: 50,
 	maxGrepMatches: 50,
 	maxToolResultBytes: 256 * 1024,
+	maxTraversedFiles: 2000,
 };
 async function makeRoot(): Promise<string> {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "relay-confine-")));
@@ -139,6 +140,36 @@ describe("glob and grep bounds", () => {
 		try {
 			const out = await grepBound(root, "needle", tiny);
 			expect(out.details.truncated).toBe(true);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("traversal and output byte bounds", () => {
+	test("nonmatching traversal stops at the visited bound", async () => {
+		const root = await makeRoot();
+		const dir = join(root, "many");
+		await mkdir(dir);
+		for (let i = 0; i < 50; i += 1) {
+			await writeFile(join(dir, `f${i}.nomatch`), "nothing here");
+		}
+		const tiny: RelayBounds = { ...bounds, maxTraversedFiles: 10 };
+		try {
+			const out = await globBound(root, "*.definitely-absent", tiny);
+			expect(out.details.truncated).toBe(true);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("grep output respects the encoded byte cap", async () => {
+		const root = await makeRoot();
+		await writeFile(join(root, "long.txt"), `needle ${"x".repeat(300)}\n`);
+		const tiny: RelayBounds = { ...bounds, maxGrepMatches: 50, maxToolResultBytes: 1024 };
+		try {
+			const out = await grepBound(root, "needle", tiny);
+			expect(Buffer.byteLength(out.content)).toBeLessThanOrEqual(1024);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

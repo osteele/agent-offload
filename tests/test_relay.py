@@ -22,6 +22,7 @@ from agent_offload.relay_protocol import RESULT_SCHEMA, RelayProtocolError
 
 FAKE_BRIDGE = textwrap.dedent(
     """
+    import hashlib
     import json, os, signal, sys, time
 
     scenario = os.environ["RELAY_FAKE_SCENARIO"]
@@ -55,9 +56,20 @@ FAKE_BRIDGE = textwrap.dedent(
                "error": {"message": "server refused host tools"}})
         sys.exit(3)
 
+    # The combined prompt must match the conductor's formulation exactly;
+    # this digest is what the conductor binds its own computation against.
+    prompt = request["prompt"]
+    if request.get("system_prompt"):
+        prompt = ("<project-context>\\n" + request["system_prompt"]
+                  + "\\n</project-context>\\n\\n" + prompt)
+    prompt_digest = hashlib.sha256(prompt.encode()).hexdigest()
+
     root = request["project_root"]
     flags = ("--no-tools --no-lsp --no-extensions --no-skills --no-rules "
              "--no-session --no-pty")
+    if scenario == "lookalike":
+        flags = "--no-tools=false --no-lsp --no-extensions --no-skills --no-rules " \
+                "--no-session --no-pty"
     remote_argv = ("ssh agent@studio exec omp --mode rpc " + flags) if (
         scenario != "no_flags"
     ) else "ssh agent@studio exec omp --mode rpc"
@@ -78,23 +90,40 @@ FAKE_BRIDGE = textwrap.dedent(
         events = [
             {"type": "tool_execution_start", "toolCallId": "c1", "toolName": "review_read"},
         ]
+    elif scenario == "bad_tool":
+        events = [
+            {"type": "tool_execution_start", "toolCallId": "c1", "toolName": "bash"},
+            {"type": "tool_execution_end", "toolCallId": "c1",
+             "result": {"content": [{"type": "text", "text": "did things"}],
+                        "details": {}, "isError": False}},
+        ]
 
     for event in events:
         frame({"frame": "event", "schema_version": "agent-offload.relay-bridge/v1",
                "event": event})
 
+    registered = ["review_read", "review_glob", "review_grep"]
+    if scenario == "registry_drift":
+        registered = ["review_read"]
+    model = {"provider": "anthropic", "id": "claude-opus-4-6"}
+    if scenario == "model_drift":
+        model = {"provider": "anthropic", "id": "claude-opus-4-5"}
+    host_target = "agent@elsewhere" if scenario == "host_drift" else request["host_target"]
+    bounds = {"maxReadBytes": 1} if scenario == "bounds_drift" else request["bounds"]
+    result_digest = "c" * 64 if scenario == "prompt_drift" else prompt_digest
+
     frame({"frame": "result", "schema_version": "agent-offload.relay-bridge/v1",
            "result": {
                "sdk_version": "0.0.0-test", "omp_version": "omp/v-test",
-               "host_target": request["host_target"], "host_identity": "test-host",
+               "host_target": host_target, "host_identity": "test-host",
                "remote_argv": remote_argv, "remote_scratch": "/tmp/scratch",
-               "registered_tools": ["review_read", "review_glob", "review_grep"],
+               "registered_tools": registered,
                "session_id": "sess-1", "session_file": None,
-               "model": {"provider": "test-provider", "id": "test-model"},
+               "model": model,
                "started_at": 1.0, "ended_at": 2.0, "failure": None, "cancelled": False,
                "events": events, "final_response": "done",
                "stats": None,
-               "prompt_sha256": "b" * 64, "bounds": request["bounds"]}})
+               "prompt_sha256": result_digest, "bounds": bounds}})
     """
 ).strip()
 
@@ -290,3 +319,45 @@ def test_request_pins_grounded_selector(
     request = json.loads(_marker(relay_project, "request.json").read_text())
     assert request["provider"] == "anthropic"
     assert request["model"] == "anthropic/claude-opus-4-6"
+
+
+def test_refuses_unsanctioned_tool_name(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="unsanctioned relay tool"):
+        _run_scenario(relay_project, monkeypatch, "bad_tool")
+
+
+def test_refuses_registered_tools_drift(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="registered_tools must be exactly"):
+        _run_scenario(relay_project, monkeypatch, "registry_drift")
+
+
+def test_refuses_host_target_drift(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="host_target drift"):
+        _run_scenario(relay_project, monkeypatch, "host_drift")
+
+
+def test_refuses_bounds_drift(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="bounds drift"):
+        _run_scenario(relay_project, monkeypatch, "bounds_drift")
+
+
+def test_refuses_prompt_digest_drift(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="prompt digest does not match"):
+        _run_scenario(relay_project, monkeypatch, "prompt_drift")
+
+
+def test_refuses_lookalike_disable_flag(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="--no-tools"):
+        _run_scenario(relay_project, monkeypatch, "lookalike")

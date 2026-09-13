@@ -16,6 +16,8 @@ export interface RelayBounds {
 	maxMatchFiles: number;
 	maxGrepMatches: number;
 	maxToolResultBytes: number;
+	/** Total files walked per glob/grep call, matching or not. */
+	maxTraversedFiles: number;
 }
 
 export class ConfinementError extends Error {}
@@ -145,9 +147,17 @@ export async function globBound(
 	const rootReal = await realpath(root);
 	const glob = globToMatcher(pattern);
 	const matched: ServedPath[] = [];
+	const lines: string[] = [];
 	const skipped: string[] = [];
-	await walk(rootReal, rootReal, async (filePath) => {
-		if (matched.length >= bounds.maxMatchFiles) return;
+	let outBytes = 0;
+	let truncated = false;
+	const state: WalkState = { visited: 0, maxTraversed: bounds.maxTraversedFiles, stop: false };
+	await walk(rootReal, state, async (filePath) => {
+		if (matched.length >= bounds.maxMatchFiles) {
+			truncated = true;
+			state.stop = true;
+			return;
+		}
 		const relative = filePath.slice(rootReal.length + 1);
 		if (!glob(relative)) return;
 		const bytes = await readFile(filePath);
@@ -155,26 +165,31 @@ export async function globBound(
 			skipped.push(filePath);
 			return;
 		}
+		const line = `${filePath} (${bytes.length}B)`;
+		if (outBytes + Buffer.byteLength(line) + 1 > bounds.maxToolResultBytes) {
+			truncated = true;
+			state.stop = true;
+			return;
+		}
+		outBytes += Buffer.byteLength(line) + 1;
 		matched.push({
 			path: filePath,
 			sha256: digest(bytes),
 			bytes: bytes.length,
 			truncated: false,
 		});
+		lines.push(line);
 	});
-	if (matched.length >= bounds.maxMatchFiles) {
-		const truncatedOutput = `file bound ${bounds.maxMatchFiles} reached; listing first files:\n${matched
-			.map((entry) => `${entry.path} (${entry.bytes}B)`)
-			.join("\n")}`;
-		return {
-			content: truncatedOutput,
-			details: { served_paths: matched, skipped, truncated: true },
-		};
-	}
-	const listing = matched.length
-		? matched.map((entry) => `${entry.path} (${entry.bytes}B)`).join("\n")
-		: "no matching files";
-	return { content: listing, details: { served_paths: matched, skipped, truncated: false } };
+	if (state.stop) truncated = true;
+	const listing = lines.length
+		? lines.join("\n")
+		: truncated
+			? "bound reached before any matching file"
+			: "no matching files";
+	return {
+		content: listing,
+		details: { served_paths: matched, skipped, truncated },
+	};
 }
 /** Translate a shell-style glob into a matcher over root-relative paths.
  * `**` spans directories, `*` stays within one segment. */
@@ -202,11 +217,13 @@ export async function grepBound(
 	const matches: string[] = [];
 	const served: ServedPath[] = [];
 	const skipped: string[] = [];
-	let bytesSeen = 0;
+	let outBytes = 0;
 	let truncated = false;
-	await walk(rootReal, rootReal, async (filePath) => {
+	const state: WalkState = { visited: 0, maxTraversed: bounds.maxTraversedFiles, stop: false };
+	await walk(rootReal, state, async (filePath) => {
 		if (truncated || served.length >= bounds.maxMatchFiles) {
 			truncated = true;
+			state.stop = true;
 			return;
 		}
 		const bytes = await readFile(filePath);
@@ -216,28 +233,31 @@ export async function grepBound(
 		}
 		const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
 		const lines = text.split("\n");
-		const hits: string[] = [];
+		let fileHits = 0;
 		for (const [index, line] of lines.entries()) {
-			if (line.includes(pattern)) {
-				hits.push(`${filePath}:${index + 1}: ${line.slice(0, 400)}`);
-				if (hits.length >= bounds.maxGrepMatches) break;
+			if (!line.includes(pattern)) continue;
+			const hit = `${filePath}:${index + 1}: ${line.slice(0, 400)}`;
+			const hitBytes = Buffer.byteLength(hit) + 1;
+			if (outBytes + hitBytes > bounds.maxToolResultBytes) {
+				truncated = true;
+				state.stop = true;
+				return;
 			}
-		}
-		if (hits.length > 0) {
-			matches.push(...hits);
-			served.push({
-				path: filePath,
-				sha256: digest(bytes),
-				bytes: bytes.length,
-				truncated: false,
-			});
+			matches.push(hit);
+			outBytes += hitBytes;
+			fileHits += 1;
+			if (fileHits === 1) {
+				served.push({
+					path: filePath,
+					sha256: digest(bytes),
+					bytes: bytes.length,
+					truncated: false,
+				});
+			}
 			if (matches.length >= bounds.maxGrepMatches) {
 				truncated = true;
+				return;
 			}
-		}
-		bytesSeen += bytes.length;
-		if (bytesSeen > bounds.maxToolResultBytes * 16) {
-			truncated = true;
 		}
 	});
 	const content =
@@ -249,17 +269,32 @@ export async function grepBound(
 	return { content, details: { served_paths: served, skipped, truncated } };
 }
 
+interface WalkState {
+	visited: number;
+	maxTraversed: number;
+	stop: boolean;
+}
+
 type FileVisitor = (filePath: string) => Promise<void>;
 
-/** Bounded walk that never follows symlinks and never enters .git. */
-async function walk(rootReal: string, dir: string, visit: FileVisitor): Promise<void> {
+/** Bounded walk that never follows symlinks, never enters .git, and stops
+ * after maxTraversed files — matching or not — so a nonmatching tree
+ * terminates the call instead of funding an endless walk. */
+async function walk(dir: string, state: WalkState, visit: FileVisitor): Promise<void> {
+	if (state.stop) return;
 	const entries = await readdir(dir, { withFileTypes: true });
 	for (const entry of entries) {
+		if (state.stop) return;
 		if (entry.isSymbolicLink() || entry.name === ".git") continue;
 		const child = `${dir}/${entry.name}`;
 		if (entry.isDirectory()) {
-			await walk(rootReal, child, visit);
+			await walk(child, state, visit);
 		} else if (entry.isFile()) {
+			state.visited += 1;
+			if (state.visited > state.maxTraversed) {
+				state.stop = true;
+				return;
+			}
 			await visit(child);
 		}
 	}

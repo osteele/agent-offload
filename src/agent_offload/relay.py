@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import queue
+import shlex
 import signal
 import subprocess
 import sys
@@ -38,10 +39,12 @@ from .relay_protocol import (
     MAX_MATCH_FILES,
     MAX_READ_BYTES,
     MAX_TOOL_RESULT_BYTES,
+    MAX_TRAVERSED_FILES,
+    RELAY_PROVIDER,
+    RELAY_SELECTOR,
     RESULT_SCHEMA,
     RelayProtocolError,
     sha256_text,
-    validate_bridge_result_payload,
     validate_relay_result,
 )
 
@@ -70,11 +73,6 @@ REMOTE_DISABLE_FLAGS = (
     "--no-pty",
 )
 
-#: The grounded OMP lane's sole sanctioned inference selector. The
-#: integration contract pins the lane to this route; generic overrides are
-#: removed from the CLI and the conductor fails closed on any drift.
-RELAY_PROVIDER = "anthropic"
-RELAY_MODEL = "anthropic/claude-opus-4-6"
 TRUST_EPILOG = """trust boundary:
   attached     this command stays in the foreground; the remote agent dies
                with it. There is no job id, no resume, and no --detach.
@@ -105,6 +103,7 @@ class RelayBounds:
     max_match_files: int = MAX_MATCH_FILES
     max_grep_matches: int = MAX_GREP_MATCHES
     max_tool_result_bytes: int = MAX_TOOL_RESULT_BYTES
+    max_traversed_files: int = MAX_TRAVERSED_FILES
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -112,7 +111,20 @@ class RelayBounds:
             "maxMatchFiles": self.max_match_files,
             "maxGrepMatches": self.max_grep_matches,
             "maxToolResultBytes": self.max_tool_result_bytes,
+            "maxTraversedFiles": self.max_traversed_files,
         }
+
+
+def _relay_prompt(prompt: str, system_prompt: str | None) -> str:
+    """The exact prompt the bridge sends to the agent.
+
+    Cross-language contract: relay_bridge.ts combines prompt and system
+    prompt with this same formulation before digesting, and the conductor
+    binds the bridge's recorded digest to its own computation of it.
+    """
+    if not system_prompt:
+        return prompt
+    return f"<project-context>\n{system_prompt}\n</project-context>\n\n{prompt}"
 
 
 def _local_context(project_root: Path) -> list[dict[str, str]]:
@@ -247,13 +259,13 @@ def run_relay(
         "system_prompt": system_prompt or None,
         "host_target": host,
         "provider": RELAY_PROVIDER,
-        "model": RELAY_MODEL,
+        "model": RELAY_SELECTOR,
         "timeout_seconds": timeout_seconds,
         "bounds": RelayBounds().as_dict(),
     }
-    if request["provider"] != RELAY_PROVIDER or request["model"] != RELAY_MODEL:
+    if request["provider"] != RELAY_PROVIDER or request["model"] != RELAY_SELECTOR:
         raise RelayProtocolError(
-            f"relay selector drifted from the pinned grounded route {RELAY_PROVIDER}/{RELAY_MODEL}"
+            f"relay selector drifted from the pinned grounded route {RELAY_SELECTOR}"
         )
 
     process = subprocess.Popen(
@@ -324,12 +336,21 @@ def run_relay(
             f"bridge exited without a result frame (exit={process.returncode}); "
             "refusing to treat a partial stream as an outcome"
         )
+    if bridge_result["host_target"] != host:
+        raise RelayProtocolError(
+            f"bridge host_target drift: {bridge_result['host_target']!r} != {host!r}"
+        )
+    if bridge_result["bounds"] != request["bounds"]:
+        raise RelayProtocolError(
+            "bridge bounds drift from the conductor bounds: "
+            f"{bridge_result['bounds']!r} != {request['bounds']!r}"
+        )
+    expected_prompt_sha256 = sha256_text(_relay_prompt(prompt, system_prompt))
+    if bridge_result["prompt_sha256"] != expected_prompt_sha256:
+        raise RelayProtocolError("bridge prompt digest does not match the conductor prompt")
 
-    validate_bridge_result_payload(bridge_result)
-
-    missing = [
-        flag for flag in REMOTE_DISABLE_FLAGS if flag not in str(bridge_result["remote_argv"])
-    ]
+    argv_tokens = shlex.split(str(bridge_result["remote_argv"]))
+    missing = [flag for flag in REMOTE_DISABLE_FLAGS if flag not in argv_tokens]
     if missing:
         raise RelayProtocolError(
             "remote argv lacks required tool-disable flags: " + ", ".join(missing)

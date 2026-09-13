@@ -36,12 +36,20 @@ RELAY_TOOLS = ("review_read", "review_glob", "review_grep")
 MAX_TOOL_ARGS_BYTES = 64 * 1024
 #: A single local read may return at most this many bytes.
 MAX_READ_BYTES = 512 * 1024
-#: Glob and grep may traverse at most this many files per call.
+#: Glob and grep may return at most this many files/matches per call.
 MAX_MATCH_FILES = 500
-#: Grep may return at most this many matches per call.
 MAX_GREP_MATCHES = 500
+#: Glob and grep may traverse at most this many files per call, matching or
+#: not — a nonmatching tree must terminate the call, not fund an endless walk.
+MAX_TRAVERSED_FILES = 2000
 #: Tool results are capped at this size after bounds are applied.
 MAX_TOOL_RESULT_BYTES = 256 * 1024
+
+#: The grounded OMP lane's sole sanctioned inference selector, split for
+#: result-attestation binding.
+RELAY_PROVIDER = "anthropic"
+RELAY_MODEL_ID = "claude-opus-4-6"
+RELAY_SELECTOR = f"{RELAY_PROVIDER}/{RELAY_MODEL_ID}"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -94,6 +102,11 @@ def validate_complete_tool_lifecycle(events: list[Mapping[str, Any]]) -> list[di
             tool = event.get("toolName")
             if not isinstance(call_id, str) or not isinstance(tool, str):
                 raise RelayProtocolError(f"event {index}: malformed tool_execution_start")
+            if tool not in RELAY_TOOLS:
+                raise RelayProtocolError(
+                    f"event {index}: unsanctioned relay tool {tool!r}; "
+                    f"sanctioned tools are {sorted(RELAY_TOOLS)}"
+                )
             if call_id in started:
                 raise RelayProtocolError(f"event {index}: tool call {call_id!r} started twice")
             started[call_id] = {"tool_call_id": call_id, "tool": tool}
@@ -128,6 +141,9 @@ def _validate_served_paths(call: Mapping[str, Any], root: str) -> None:
                 f"tool call {call.get('tool_call_id')!r} served path lacks content digest"
             )
 
+
+RELAY_PROVIDER = "anthropic"
+RELAY_MODEL_ID = "claude-opus-4-6"
 
 BRIDGE_RESULT_REQUIRED = (
     "sdk_version",
@@ -194,6 +210,20 @@ def validate_relay_result(result: Mapping[str, Any], *, project_root: str) -> di
     model = _require(result, "model", (dict,), "result")
     _require(model, "provider", (str,), "result.model")
     _require(model, "id", (str,), "result.model")
+    # Selector attestation: the evidence binds to the pinned grounded route,
+    # so SDK/server-side drift cannot hide inside an otherwise valid result.
+    if model["provider"] != RELAY_PROVIDER or model["id"] != RELAY_MODEL_ID:
+        raise RelayProtocolError(
+            "result model drifted from the pinned grounded selector "
+            f"{RELAY_PROVIDER}/{RELAY_MODEL_ID}: "
+            f"{model['provider']}/{model['id']}"
+        )
+    registered = result.get("registered_tools")
+    if sorted(str(tool) for tool in (registered or [])) != sorted(RELAY_TOOLS):
+        raise RelayProtocolError(
+            "result registered_tools must be exactly "
+            f"{sorted(RELAY_TOOLS)}; observed {sorted(str(t) for t in (registered or []))}"
+        )
     events = _require(result, "remote_events", (list,), "result")
     calls = validate_complete_tool_lifecycle(events)
     for call in calls:
