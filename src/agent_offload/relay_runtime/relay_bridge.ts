@@ -26,6 +26,7 @@ import {
 	type RelayBounds,
 	type ToolOutput,
 } from "./confinement.js";
+import { failedTurnMessage } from "./event_failure.js";
 
 const HOST_TOOLS = ["review_read", "review_glob", "review_grep"] as const;
 const RELAY_PROVIDER = "anthropic";
@@ -308,6 +309,12 @@ async function main(): Promise<number> {
 			return ["ssh", ...SSH_OPTS, request.host_target, lastRemoteArgv];
 		},
 	});
+	let rejectTurnFailure: ((reason?: unknown) => void) | null = null;
+	let observedTurnFailure: string | null = null;
+	const turnFailure = new Promise<never>((_resolve, reject) => {
+		rejectTurnFailure = reject;
+	});
+	void turnFailure.catch(() => {});
 
 	try {
 		await client.start();
@@ -326,9 +333,15 @@ async function main(): Promise<number> {
 			remote_argv: lastRemoteArgv,
 			registered_tools: registered,
 		});
-
 		const unsubscribe = client.onEvent((event) => {
 			events.push(event);
+			const failureMessage = failedTurnMessage(event);
+			if (failureMessage) observedTurnFailure = failureMessage;
+			if (failureMessage && rejectTurnFailure) {
+				const reject = rejectTurnFailure;
+				rejectTurnFailure = null;
+				reject(new Error(failureMessage));
+			}
 			void writeFrame({
 				frame: "event",
 				schema_version: BRIDGE_SCHEMA,
@@ -341,7 +354,8 @@ async function main(): Promise<number> {
 		}
 		try {
 			await client.prompt(prompt);
-			await client.waitForIdle(request.timeout_seconds * 1000);
+			await Promise.race([client.waitForIdle(request.timeout_seconds * 1000), turnFailure]);
+			if (observedTurnFailure) throw new Error(observedTurnFailure);
 		} catch (error) {
 			failure = cancelled
 				? "cancelled locally"
