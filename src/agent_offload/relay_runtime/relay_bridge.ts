@@ -26,11 +26,12 @@ import {
 	type ToolOutput,
 } from "./confinement.js";
 
-const BRIDGE_SCHEMA = "agent-offload.relay-bridge/v1";
+const HOST_TOOLS = ["review_read", "review_glob", "review_grep"] as const;
+const RELAY_PROVIDER = "anthropic";
+const RELAY_MODEL = "anthropic/claude-opus-4-6";
 const REQUEST_SCHEMA = "agent-offload.relay-request/v1";
 const SDK_VERSION = "18.1.17";
 const SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
-const HOST_TOOLS = ["review_read", "review_glob", "review_grep"] as const;
 
 /** Remote surfaces the relay agent must never reach. Enforced twice: as omp
  * CLI flags and through a config overlay written to the remote scratch. */
@@ -111,6 +112,16 @@ function readRequest(): RelayRequest {
 	const bounds = raw.bounds as RelayBounds | undefined;
 	if (!bounds || bounds.maxReadBytes <= 0 || bounds.maxGrepMatches <= 0) {
 		throw new Error("request.bounds missing or empty");
+	}
+	// Defense in depth behind the conductor's pin: the grounded lane serves
+	// exactly one selector, so any drift arrives here only as a bug.
+	if (
+		(raw.provider !== undefined && raw.provider !== RELAY_PROVIDER) ||
+		(raw.model !== undefined && raw.model !== RELAY_MODEL)
+	) {
+		throw new Error(
+			`fail-closed: grounded relay is pinned to ${RELAY_PROVIDER}/${RELAY_MODEL}`,
+		);
 	}
 	return raw as unknown as RelayRequest;
 }

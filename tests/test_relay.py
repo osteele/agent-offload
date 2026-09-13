@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_offload import cli
 from agent_offload import relay as relay_module
 from agent_offload.relay_protocol import RESULT_SCHEMA, RelayProtocolError
 
@@ -126,8 +127,6 @@ def _relay_namespace(**overrides: object) -> argparse.Namespace:
         "project": None,
         "prompt": "review this",
         "prompt_file": None,
-        "model": None,
-        "provider": None,
         "host": "agent@studio",
         "timeout": 30.0,
         "json": False,
@@ -156,8 +155,6 @@ def _run_scenario(
         project_root=relay_project,
         prompt="review this",
         host="agent@studio",
-        provider=None,
-        model=None,
         timeout_seconds=timeout_seconds,
     )
 
@@ -235,8 +232,6 @@ def test_timeout_terminates_bridge_process_group(
             project_root=relay_project,
             prompt="review this",
             host="agent@studio",
-            provider=None,
-            model=None,
             timeout_seconds=0.5,
         )
     assert marker.read_text() == "terminated"
@@ -247,20 +242,6 @@ def test_refuses_remote_argv_missing_disable_flags(
 ) -> None:
     with pytest.raises(RelayProtocolError, match="--no-tools"):
         _run_scenario(relay_project, monkeypatch, "no_flags")
-    marker = _marker(relay_project, "terminated")
-    monkeypatch.setenv("RELAY_FAKE_SCENARIO", "sleep")
-    monkeypatch.setenv("RELAY_FAKE_TERMINATED_MARKER", str(marker))
-    monkeypatch.setattr(relay_module, "RELAY_DEADLINE_GRACE_SECONDS", 0.3, raising=False)
-    with pytest.raises(relay_module.RelayError, match="exceeded"):
-        relay_module.run_relay(
-            project_root=relay_project,
-            prompt="review this",
-            host="agent@studio",
-            provider=None,
-            model=None,
-            timeout_seconds=0.5,
-        )
-    assert marker.read_text() == "terminated"
 
 
 def test_request_carries_bounds_and_absolute_root(
@@ -273,8 +254,6 @@ def test_request_carries_bounds_and_absolute_root(
         project_root=relay_project,
         prompt="review this",
         host="agent@studio",
-        provider=None,
-        model=None,
         timeout_seconds=20.0,
     )
     request = json.loads(_marker(relay_project, "request.json").read_text())
@@ -285,3 +264,29 @@ def test_request_carries_bounds_and_absolute_root(
     assert request["host_target"] == "agent@studio"
     assert request["system_prompt"] is not None
     assert "project instructions" in request["system_prompt"]
+
+
+def test_parser_rejects_generic_selector_overrides() -> None:
+    """The grounded lane is pinned; generic override flags do not exist."""
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["relay", "--model", "zai/glm-5.3-flash"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["relay", "--provider", "openai"])
+
+
+def test_request_pins_grounded_selector(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RELAY_FAKE_SCENARIO", "happy")
+    monkeypatch.setenv("RELAY_FAKE_REQUEST_OUT", str(_marker(relay_project, "request.json")))
+    monkeypatch.setenv("RELAY_FAKE_TERMINATED_MARKER", str(_marker(relay_project, "terminated")))
+    relay_module.run_relay(
+        project_root=relay_project,
+        prompt="review this",
+        host="agent@studio",
+        timeout_seconds=20.0,
+    )
+    request = json.loads(_marker(relay_project, "request.json").read_text())
+    assert request["provider"] == "anthropic"
+    assert request["model"] == "anthropic/claude-opus-4-6"

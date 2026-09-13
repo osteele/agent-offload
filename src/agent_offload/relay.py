@@ -70,7 +70,12 @@ REMOTE_DISABLE_FLAGS = (
     "--no-pty",
 )
 
-TRUST_EPILOG = """trust boundary (differs from `run`):
+#: The grounded OMP lane's sole sanctioned inference selector. The
+#: integration contract pins the lane to this route; generic overrides are
+#: removed from the CLI and the conductor fails closed on any drift.
+RELAY_PROVIDER = "anthropic"
+RELAY_MODEL = "anthropic/claude-opus-4-6"
+TRUST_EPILOG = """trust boundary:
   attached     this command stays in the foreground; the remote agent dies
                with it. There is no job id, no resume, and no --detach.
   live-local   the remote agent's three tools (review_read, review_glob,
@@ -81,6 +86,9 @@ TRUST_EPILOG = """trust boundary (differs from `run`):
                root; URL schemes, devices, symlink escapes, binary and
                oversized inputs are refused. Output, matches, files, and
                wall time are bounded.
+  pinned       the inference selector is fixed to
+               anthropic/claude-opus-4-6; no --model/--provider override
+               exists on this lane.
   fail-closed  if the remote side cannot confirm that built-in tools are
                disabled and exactly the three host tools are registered,
                the relay refuses instead of degrading.
@@ -218,8 +226,6 @@ def run_relay(
     project_root: Path,
     prompt: str,
     host: str,
-    provider: str | None,
-    model: str | None,
     timeout_seconds: float,
 ) -> tuple[Path, dict[str, Any]]:
     """Run one attached relay request; returns (result_path, record)."""
@@ -240,11 +246,15 @@ def run_relay(
         "prompt": prompt,
         "system_prompt": system_prompt or None,
         "host_target": host,
-        "provider": provider,
-        "model": model,
+        "provider": RELAY_PROVIDER,
+        "model": RELAY_MODEL,
         "timeout_seconds": timeout_seconds,
         "bounds": RelayBounds().as_dict(),
     }
+    if request["provider"] != RELAY_PROVIDER or request["model"] != RELAY_MODEL:
+        raise RelayProtocolError(
+            f"relay selector drifted from the pinned grounded route {RELAY_PROVIDER}/{RELAY_MODEL}"
+        )
 
     process = subprocess.Popen(
         _bridge_command(bun, bridge),
@@ -374,7 +384,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
     if args.detach:
         print(
             "agent-offload: the relay lane is attached by design; --detach is "
-            "not available. Use `run` for the durable lane.",
+            "not available and durable submission is retired.",
             file=sys.stderr,
         )
         return 2
@@ -399,8 +409,6 @@ def cmd_relay(args: argparse.Namespace) -> int:
             project_root=project_root,
             prompt=prompt,
             host=args.host,
-            provider=args.provider,
-            model=args.model,
             timeout_seconds=args.timeout,
         )
     except RelayProtocolError as exc:
@@ -436,8 +444,6 @@ def build_relay_parser(subparsers: argparse._SubParsersAction) -> None:
     relay.add_argument("project", nargs="?", type=Path, default=Path.cwd())
     relay.add_argument("--prompt", "-p", help="task prompt for the remote agent")
     relay.add_argument("--prompt-file", type=Path, help="read the prompt from a file")
-    relay.add_argument("--model", default=None, help="pin the inference selector (provider/model)")
-    relay.add_argument("--provider", default=None, help="override the provider leg separately")
     relay.add_argument(
         "--host",
         default="agent@studio",
