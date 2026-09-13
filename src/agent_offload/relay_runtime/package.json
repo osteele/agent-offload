@@ -3,7 +3,14 @@
   "private": true,
   "description": "Bun bridge: maintained omp RpcClient over SSH with locally confined host tools",
   "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit --skipLibCheck --resolveJsonModule --allowSyntheticDefaultImports --module esnext --moduleResolution bundler --target es2022 relay_bridge.ts confinement.ts confinement.test.ts"
+  },
   "dependencies": {
     "@oh-my-pi/pi-coding-agent": "18.1.17"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
   }
 }

@@ -23,6 +23,7 @@ const bounds: RelayBounds = {
 	maxMatchFiles: 50,
 	maxGrepMatches: 50,
 	maxToolResultBytes: 256 * 1024,
+	maxToolArgsBytes: 64 * 1024,
 	maxTraversedFiles: 2000,
 };
 async function makeRoot(): Promise<string> {
