@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -65,6 +66,8 @@ FAKE_BRIDGE = textwrap.dedent(
     remote_argv = ("ssh agent@studio exec omp --mode rpc " + flags) if (
         scenario != "no_flags"
     ) else "ssh agent@studio exec omp --mode rpc"
+    if scenario == "malformed_argv":
+        remote_argv = "'"
 
     ready = {"frame": "ready", "schema_version": "agent-offload.relay-bridge/v1",
              "sdk_version": "0.0.0-test", "omp_version": "omp/v-test",
@@ -145,18 +148,27 @@ FAKE_BRIDGE = textwrap.dedent(
     bounds = {"maxReadBytes": 1} if scenario == "bounds_drift" else request["bounds"]
     result_digest = "c" * 64 if scenario == "prompt_drift" else prompt_digest
 
+    result = {
+        "sdk_version": "0.0.0-test", "omp_version": "omp/v-test",
+        "host_target": host_target, "host_identity": "test-host",
+        "remote_argv": remote_argv, "remote_scratch": "/tmp/scratch",
+        "registered_tools": registered,
+        "session_id": "sess-1", "session_file": None,
+        "model": model,
+        "started_at": 1.0, "ended_at": 2.0, "failure": None, "cancelled": False,
+        "events": events, "final_response": "done",
+        "stats": None,
+        "prompt_sha256": result_digest, "bounds": bounds}
+    if scenario == "missing_events":
+        del result["events"]
+    if scenario == "empty_success":
+        result["final_response"] = ""
+    if scenario == "bad_failure":
+        result["failure"] = 7
+    if scenario == "bad_cancelled":
+        result["cancelled"] = "no"
     frame({"frame": "result", "schema_version": "agent-offload.relay-bridge/v1",
-           "result": {
-               "sdk_version": "0.0.0-test", "omp_version": "omp/v-test",
-               "host_target": host_target, "host_identity": "test-host",
-               "remote_argv": remote_argv, "remote_scratch": "/tmp/scratch",
-               "registered_tools": registered,
-               "session_id": "sess-1", "session_file": None,
-               "model": model,
-               "started_at": 1.0, "ended_at": 2.0, "failure": None, "cancelled": False,
-               "events": events, "final_response": "done",
-               "stats": None,
-               "prompt_sha256": result_digest, "bounds": bounds}})
+           "result": result})
     """
 ).strip()
 
@@ -378,6 +390,59 @@ def test_refuses_prompt_digest_drift(
 ) -> None:
     with pytest.raises(RelayProtocolError, match="prompt digest does not match"):
         _run_scenario(relay_project, monkeypatch, "prompt_drift")
+
+
+def test_refuses_missing_result_field_before_access(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="missing keys: 'events'"):
+        _run_scenario(relay_project, monkeypatch, "missing_events")
+
+
+def test_refuses_malformed_remote_argv(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="not valid shell syntax"):
+        _run_scenario(relay_project, monkeypatch, "malformed_argv")
+
+
+def test_terminate_group_falls_back_when_group_signal_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+
+    def deny_group_signal(_pid: int, _signal: int) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(relay_module.os, "killpg", deny_group_signal)
+    try:
+        relay_module._terminate_group(process)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    assert process.poll() is not None
+
+
+def test_refuses_empty_success_response(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="requires a non-empty assistant response"):
+        _run_scenario(relay_project, monkeypatch, "empty_success")
+
+
+@pytest.mark.parametrize("scenario", ["bad_failure", "bad_cancelled"])
+def test_refuses_invalid_result_status_types(
+    relay_project: Path,
+    fake_bridge: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    with pytest.raises(RelayProtocolError, match=r"must be a (string or null|boolean)"):
+        _run_scenario(relay_project, monkeypatch, scenario)
 
 
 def test_refuses_error_frame(

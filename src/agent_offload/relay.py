@@ -198,6 +198,11 @@ def _terminate_group(process: subprocess.Popen[str]) -> None:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+    except PermissionError:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
     try:
         process.wait(timeout=TERMINATION_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
@@ -205,6 +210,11 @@ def _terminate_group(process: subprocess.Popen[str]) -> None:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
         process.wait(timeout=10)
 
 
@@ -350,12 +360,12 @@ def run_relay(
             f"bridge exited without a result frame (exit={process.returncode}); "
             "refusing to treat a partial stream as an outcome"
         )
+    validate_bridge_result_payload(bridge_result)
     # The streamed event frames are the primary evidence: the result frame's
     # event list must match them exactly, so the bridge cannot omit or
     # substitute lifecycle evidence between streaming and settlement.
     if bridge_result["events"] != streamed_events:
         raise RelayProtocolError("result events differ from the streamed event frames")
-    validate_bridge_result_payload(bridge_result)
     if bridge_result["host_target"] != host:
         raise RelayProtocolError(
             f"bridge host_target drift: {bridge_result['host_target']!r} != {host!r}"
@@ -369,7 +379,10 @@ def run_relay(
     if bridge_result["prompt_sha256"] != expected_prompt_sha256:
         raise RelayProtocolError("bridge prompt digest does not match the conductor prompt")
 
-    argv_tokens = shlex.split(str(bridge_result["remote_argv"]))
+    try:
+        argv_tokens = shlex.split(str(bridge_result["remote_argv"]))
+    except ValueError as exc:
+        raise RelayProtocolError(f"remote argv is not valid shell syntax: {exc}") from exc
     missing = [flag for flag in REMOTE_DISABLE_FLAGS if flag not in argv_tokens]
     if missing:
         raise RelayProtocolError(
@@ -401,7 +414,7 @@ def run_relay(
         "ended_at": bridge_result["ended_at"],
         "durability": "none-attached-live-local-tools",
         "snapshot_equivalent": False,
-        "cancelled": bool(bridge_result["cancelled"]),
+        "cancelled": bridge_result["cancelled"],
         "failure": bridge_result["failure"],
         "bounds": bridge_result["bounds"],
         "remote_events": events,
