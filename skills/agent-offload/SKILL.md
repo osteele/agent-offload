@@ -1,70 +1,50 @@
 ---
 name: agent-offload
-description: Run durable report-only coding-agent work on Studio through Weft. Use when analysis, investigation, or review should be offloaded to Studio; when a task should survive the requesting session; when choosing between local and remote agent execution; or when retrieving and validating an agent-offload job.
+description: Run durable remote coding tasks on Studio through Weft, retrieve proposed changes, and apply them after verification. Also retrieve historical report-only jobs or operate attached OMP relays.
 ---
 
 # Agent Offload
 
-Use `agent-offload` for self-contained repository analysis whose deliverable is a report. The current Studio lane is Codex-only and report-only. Never send a write task, expect remote edits, or treat the returned report as verified fact. Codex runs in a disposable Weft snapshot; the worker rejects the report if the source-tree digest changes.
+Use the task lane when a repository brief can stand alone and the work should survive the requesting session. Agent Offload owns task identity, retained baselines, result retrieval, and application. Agent Execution owns the model harness and execution evidence. Weft owns snapshots, job lifecycle, and artifact transport. Agent Dispatch exposes the task CLI in its Remote coding sheet.
 
-The worker pins `gpt-5.5`. Do not override it with `gpt-6-astra`: Studio's Codex
-0.153.4 code-mode host times out before repository reads for that model.
+## Submit and monitor
 
-## Route the task
-
-Offload when the brief can stand alone, the result may arrive later, and another context is useful. Keep work local when it needs interaction, GUI state, local-only credentials, or edits to the requesting working copy.
-
-For automatic selection:
+Write a brief naming the repository scope, desired behavior, exclusions, and expected verification:
 
 ```sh
-python ~/.claude/skills/coding-delegate/pick_delegate.py pick \
-  --mode report --executor auto --brief BRIEF
+agent-offload task submit PROJECT --brief BRIEF --host studio --check 'just check'
+agent-offload task list
+agent-offload task status TASK_ID
+weft status --wait JOB_ID
 ```
 
-`auto` prefers Studio and falls back locally. Use `--executor studio` when fallback would violate the task's resource or isolation requirement. Studio refuses `--mode write`.
+Save the returned task and Weft job identities. A local timeout does not cancel the task. An ambiguous submission retains its identity; use `agent-offload task resume TASK_ID` to retry with the same idempotency key. Do not resubmit with a new identity.
 
-## Submit
+The default writer is `openai-codex/gpt-6-astra` through OMP. `--selector` accepts Agent Execution's registered writers. The agent uses `workspace-write-no-shell`: it edits the disposable snapshot but cannot execute shell commands. The optional `--check` runs separately afterward, with arguments parsed as shell quoting and no shell expansion. A failing check prevents application. Without a check, `validation` is null.
 
-Make the brief name the repository scope, exact questions, exclusions, evidence to inspect, and the report format. Then run:
-
-```sh
-agent-offload run PROJECT --brief BRIEF
-```
-
-Use `--detach` for an asynchronous job. The printed `wj…` identifier is the durable handle. A local wait timeout does not cancel the job.
-
-Do not bypass `agent-offload doctor`. It checks versioned Weft inventory plus Studio Codex authentication. The worker performs the authoritative protocol and source-digest check before model launch.
+Checks must preserve ordinary source files and their permissions. Edits, additions, and deletions made by a check fail the task, even with exit zero. Excluded caches such as `__pycache__` may change.
 
 ## Retrieve and verify
 
 ```sh
-agent-offload status JOB
-agent-offload retrieve JOB
+agent-offload task retrieve TASK_ID
+agent-offload task diff TASK_ID
+agent-offload task apply TASK_ID
 ```
 
-Retrieval discovers artifact names from the versioned Weft job record, validates the result schema, task binding, report digest, worker identity, nested Agent Review evidence, and separate report bytes, then marks the job processed.
+Apply the `delegated-work-verification` skill before accepting changes. Inspect the diff, report, and check evidence. Retrieval validates the retained request, worker identity, transcript, and change bundle. Application checks every affected local file against the submitted baseline before writing and retains rollback bytes in the task journal. Resolve local conflicts deliberately; do not overwrite them to force application.
 
-The result is delegated work. Apply the `delegated-work-verification` skill before relying on findings or changing code from them. Inspect the nested `harness_result` in JSON when provenance, the Codex transcript, stderr, or ctx evidence matters:
+Tasks support ordinary UTF-8 files, at most 2 MiB each and 64 MiB total. Symlinks and protected metadata are rejected. Snapshot census failures return failed task artifacts; inspect their reports. Keep tasks requiring interaction, local credentials, or GUI state local.
+
+## Cancel and deploy
 
 ```sh
-agent-offload retrieve JOB --json
+agent-offload task cancel TASK_ID
+agent-host-sync --account agent apply --stage tools --tool agent-offload
 ```
 
-## Operate
+Cancellation uses `weft cancel JOB_ID`. Local and remote package source digests must match. The updater's exit code 4 means installation succeeded but existing sessions must restart; fresh Weft jobs use the updated executable.
 
-Use Weft for job lifecycle operations:
+## Other lanes
 
-```sh
-weft job inspect JOB --json
-weft job kill JOB
-```
-
-Refresh the installed worker only through the Studio account updater:
-
-```sh
-cd ~/code/agent-tools/agent-host-sync
-uv run agent-host-sync --account agent plan --stage tools --tool agent-offload
-uv run agent-host-sync --account agent apply --stage tools --tool agent-offload
-```
-
-The updater's exit code 4 means installation succeeded but existing remote sessions must restart. New Weft jobs start fresh processes and use the updated executable.
+Native `agent-offload run` submission is retired. `agent-offload status JOB` and `agent-offload retrieve JOB` remain for historical report-only jobs. The `relay` commands support attached OMP sessions; relays do not provide durable task orchestration.

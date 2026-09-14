@@ -1,12 +1,51 @@
 # agent-offload
 
-`agent-offload` validates and retrieves results from historical report-only
+Agent-offload provides durable remote coding tasks and an attached read-only relay. Agent-execution owns the constrained worker and execution evidence; Weft owns scheduling, source snapshots, job lifecycle, and artifact storage. Agent-offload owns task requests, retained baselines, result validation, and explicit application of returned changes.
+
+## Durable coding tasks
+
+```sh
+agent-offload task submit /path/to/project --brief brief.txt --host studio --check 'just check'
+agent-offload task list
+agent-offload task status TASK_ID
+agent-offload task retrieve TASK_ID
+agent-offload task diff TASK_ID
+agent-offload task apply TASK_ID
+agent-offload task cancel TASK_ID
+```
+
+Submit returns a task identity and Weft job identity without waiting for the agent. Requests and accepted job bindings live under `~/.local/state/agent-offload/tasks` (override with `AGENT_OFFLOAD_STATE`). JSON responses use `agent-offload.task/v1`, `agent-offload.tasks/v1`, and `agent-offload.task-result/v1`. Consumers use this CLI rather than reading the registry. Agent Dispatch's **Remote coding** control uses the same API.
+
+`task status` and `task list` expose Weft's observed lifecycle as `job_status`. For completed or failed jobs, `status` comes from the validated task result, including `failed` and `validation_failed`. If that result is unavailable or invalid, `status` is `unknown` with a diagnostic; job completion alone does not establish task success.
+
+Each task runs against a Weft source snapshot with `workspace-write-no-shell`. The agent can read and edit project files but cannot run shell commands. `--check` supplies an optional, caller-chosen validation command executed after the agent finishes; its arguments use shell quoting without shell expansion. A failing check prevents application. Without a check, the result's `validation` field is null. The default writer is `openai-codex/gpt-6-astra`; `--selector` also accepts the writer identities registered by agent-execution. The default agent timeout is 1800 seconds; `--timeout` accepts 1–7200 seconds.
+
+Checks must preserve ordinary source files, including their permissions. A check that edits, creates, or deletes source files fails the task even if it exits successfully. Excluded cache directories such as `__pycache__` and `.pytest_cache` may change.
+
+A timed-out check publishes `validation_failed` with captured output and a timeout diagnostic. The worker exits unsuccessfully after publishing the result, so it remains available for retrieval and cannot be applied.
+
+Worker setup and snapshot census failures publish a failed result with a diagnostic report and no changes. `task cancel` delegates to `weft cancel JOB_ID`.
+
+Retrieval validates task identity, retained request and worker digests, the writer's tool policy and transcript, and every changed file's baseline. Apply checks all destination files before writing any of them and refuses local conflicts, symlink paths, and protected agent or VCS metadata. Returned changes must be UTF-8 text; individual files are limited to 2 MiB and the source manifest to 10000 files and 64 MiB. Existing binary source files can be read but cannot be returned as edits. Application keeps a backup in the task journal and does not commit or deploy project changes.
+
+Tasks in the same registry serialize applications to a canonical project path. A competing application is refused until the current application finishes; retrying then checks its baseline against the updated files.
+
+If submission is interrupted, use `agent-offload task resume TASK_ID`. The retained idempotency identity prevents a second job; a changed baseline refuses resubmission. `--id` lets a caller choose the identity before starting the command. Submission failures retain that identity and never fall back to local execution. Cancellation operates on the accepted Weft job.
+
+Install matching agent-offload and agent-execution versions on the submitting machine and worker. The worker refuses a source-digest mismatch. The `agent-offload-task-worker` executable must be available on the chosen host. Use the account updater to install the worker and its dependency:
+
+```sh
+agent-host-sync --account agent apply --stage tools --tool agent-offload
+```
+
+## Historical report jobs
+
+The historical lane validates and retrieves results from report-only
 Codex jobs submitted through Weft. New native Codex submissions are retired:
 `run`, direct submission, and remote worker execution refuse the provider before
 launching it.
 
-Use the grounded OMP Anthropic route for repository-grounded execution.
-OpenAI through OMP is packet-only.
+The historical report lane's replacement for grounded reads is the OMP Anthropic route. Durable coding tasks use the separate workspace-writer policy described above.
 
 ## Historical jobs
 
@@ -67,7 +106,7 @@ grounded access to the working tree.
 
 ```sh
 agent-offload relay /path/to/project --prompt "Map the auth flow" --timeout 600
-agent-offload relay . --prompt-file brief.txt --model provider/model --json
+agent-offload relay . --prompt-file brief.txt --json
 ```
 
 Trust boundary, by contrast with `run`:

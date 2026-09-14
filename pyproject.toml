@@ -1,13 +1,14 @@
 [project]
 name = "agent-offload"
 version = "0.1.0"
-description = "Durable report-only coding-agent work on remote Weft hosts"
+description = "Durable remote coding tasks and attached agent relays"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
 agent-offload = "agent_offload.cli:main"
 agent-offload-worker = "agent_offload.worker_cli:main"
+agent-offload-task-worker = "agent_offload.task_worker:main"
 
 [dependency-groups]
 dev = [

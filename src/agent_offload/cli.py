@@ -25,6 +25,7 @@ from .protocol import (
     validate_result,
 )
 from .relay import build_relay_parser
+from .tasks import build_task_parser
 from .worker import failure_report
 
 WEFT_RECEIPT_SCHEMA = "weft.run.receipt.v1"
@@ -458,6 +459,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.set_defaults(handler=cmd_doctor)
 
     build_relay_parser(subparsers)
+    build_task_parser(subparsers)
     return parser
 
 
