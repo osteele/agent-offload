@@ -69,6 +69,18 @@ def installed_build_id(start: Path | None = None) -> str | None:
 
 
 def worker_identity() -> dict[str, Any]:
+    """Describe this installation, including the identities it depends on.
+
+    The relay digest and the execution worker's identity are reported by the
+    installation itself rather than recomputed by a caller against the
+    installed tree. A caller cannot reliably reach this package's interpreter
+    from outside: an installed console script may be a shell wrapper rather
+    than a direct-shebang script whenever its interpreter path is long.
+    """
+    from agent_execution.worker import installed_worker_identity
+
+    from .relay import relay_source_sha256
+
     return {
         "schema_version": IDENTITY_SCHEMA,
         "protocol_version": WORKER_PROTOCOL_VERSION,
@@ -76,6 +88,8 @@ def worker_identity() -> dict[str, Any]:
         "source_sha256": package_source_sha256(),
         "package_root": str(Path(__file__).resolve().parent),
         "build_id": installed_build_id(),
+        "relay_source_sha256": relay_source_sha256(),
+        "execution": installed_worker_identity().to_dict(),
     }
 
 
