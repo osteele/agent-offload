@@ -9,7 +9,12 @@ import pytest
 from agent_execution.worker import WorkerIdentity
 
 from agent_offload import cli
-from agent_offload.protocol import RESULT_SCHEMA, sha256_text, worker_identity
+from agent_offload.protocol import (
+    RESULT_SCHEMA,
+    installed_build_id,
+    sha256_text,
+    worker_identity,
+)
 
 
 def completed_result(task_id: str, report: str) -> dict[str, object]:
@@ -364,3 +369,32 @@ def test_cmd_doctor_survives_full_namespace(monkeypatch) -> None:
     args = parser.parse_args(["doctor", "--json"])
     assert cli.cmd_doctor(args) == 0
     assert seen == {"host": "studio", "provider": cli.SUPPORTED_PROVIDER}
+
+
+def _installed_layout(root: Path, build_id: str, *, marker: str | None) -> Path:
+    """Mirror an installed build's directory depth under a build store."""
+    build = root / "builds/agent-offload" / build_id
+    module = build / "tools/agent-offload/lib/python3.11/site-packages/agent_offload"
+    module.mkdir(parents=True)
+    if marker is not None:
+        (build / "BUILD_ID").write_text(marker + "\n")
+    return module / "protocol.py"
+
+
+def test_build_id_reports_the_build_the_package_runs_from(tmp_path: Path) -> None:
+    build_id = "a" * 64
+    origin = _installed_layout(tmp_path, build_id, marker=build_id)
+    assert installed_build_id(origin) == build_id
+
+
+def test_build_id_ignores_a_marker_naming_another_build(tmp_path: Path) -> None:
+    # A marker whose content is not its own directory name is not this build's
+    # marker, so a stray or copied file cannot forge a build identity.
+    origin = _installed_layout(tmp_path, "b" * 64, marker="c" * 64)
+    assert installed_build_id(origin) is None
+
+
+def test_build_id_is_absent_for_a_source_checkout(tmp_path: Path) -> None:
+    origin = _installed_layout(tmp_path, "d" * 64, marker=None)
+    assert installed_build_id(origin) is None
+    assert worker_identity()["build_id"] is None

@@ -45,6 +45,29 @@ def package_source_sha256() -> str:
     return digest.hexdigest()
 
 
+#: Depth bound for the walk that locates an installed build's marker. The
+#: installed layout is builds/<tool>/<id>/tools/<name>/lib/python3.x/
+#: site-packages/agent_offload, so twelve levels reach the marker from any
+#: module in the package while keeping the walk off unrelated ancestors.
+_BUILD_MARKER_DEPTH = 12
+
+
+def installed_build_id(start: Path | None = None) -> str | None:
+    """Return the content-addressed build this package runs from, if any.
+
+    A build directory carries a ``BUILD_ID`` file whose content is the
+    directory's own name, so a stray marker elsewhere on the filesystem
+    cannot be mistaken for one. A source checkout has no marker and reports
+    ``None``: running uninstalled is a legitimate state, not a failure.
+    """
+    origin = (start or Path(__file__)).resolve()
+    for parent in list(origin.parents)[:_BUILD_MARKER_DEPTH]:
+        marker = parent / "BUILD_ID"
+        if marker.is_file() and marker.read_text(encoding="utf-8").strip() == parent.name:
+            return parent.name
+    return None
+
+
 def worker_identity() -> dict[str, Any]:
     return {
         "schema_version": IDENTITY_SCHEMA,
@@ -52,6 +75,7 @@ def worker_identity() -> dict[str, Any]:
         "package_version": __version__,
         "source_sha256": package_source_sha256(),
         "package_root": str(Path(__file__).resolve().parent),
+        "build_id": installed_build_id(),
     }
 
 
