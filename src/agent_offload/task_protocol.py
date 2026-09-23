@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 SCHEMA = "agent-offload.task/v1"
 RESULT_SCHEMA = "agent-offload.task-result/v1"
 LIST_SCHEMA = "agent-offload.tasks/v1"
+SELECTORS_SCHEMA = "agent-offload.task-selectors/v1"
 MAX_FILE = 2 * 1024 * 1024
 MAX_TOTAL = 64 * 1024 * 1024
 EXCLUDED = {

@@ -20,7 +20,7 @@ weft status --wait JOB_ID
 
 Save the returned task and Weft job identities. A local timeout does not cancel the task. An ambiguous submission retains its identity; use `agent-offload task resume TASK_ID` to retry with the same idempotency key. Do not resubmit with a new identity.
 
-The default writer is `openai-codex/gpt-6-astra` through OMP. `--selector` accepts Agent Execution's registered writers. The agent uses `workspace-write-no-shell`: it edits the disposable snapshot but cannot execute shell commands. The optional `--check` runs separately afterward, with arguments parsed as shell quoting and no shell expansion. A failing check prevents application. Without a check, `validation` is null.
+The default writer is `openai-codex/gpt-6-astra` through OMP. `--selector` accepts Agent Execution's registered writers; `agent-offload task selectors --json` lists them for this installation. The agent uses `workspace-write-no-shell`: it edits the disposable snapshot but cannot execute shell commands. The optional `--check` runs separately afterward, with arguments parsed as shell quoting and no shell expansion. A failing check prevents application. Without a check, `validation` is null.
 
 Checks must preserve ordinary source files and their permissions. Edits, additions, and deletions made by a check fail the task, even with exit zero. Excluded caches such as `__pycache__` may change.
 

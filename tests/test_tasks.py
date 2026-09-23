@@ -306,3 +306,35 @@ def test_check_must_preserve_complete_proposal(tmp_path, monkeypatch, check_sour
         result = task_worker.execute(request, tmp_path)
         assert result["status"] == "completed"
         assert result["changes"] == changes
+
+
+def test_selectors_report_the_accepted_writers(capsys):
+    from agent_execution.omp_execution import OMP_WRITER_SELECTORS
+
+    from agent_offload import cli
+    from agent_offload.task_protocol import SELECTORS_SCHEMA
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["task", "selectors", "--json"])
+    assert exited.value.code == 0
+    value = json.loads(capsys.readouterr().out)
+    assert value["schema_version"] == SELECTORS_SCHEMA
+    assert value["selectors"] == sorted(OMP_WRITER_SELECTORS)
+    assert value["default"] in value["selectors"]
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["task", "selectors"])
+    assert exited.value.code == 0
+    assert capsys.readouterr().out.split() == sorted(OMP_WRITER_SELECTORS)
+
+
+def test_submit_accepts_exactly_the_listed_selectors():
+    from agent_offload import cli
+    from agent_offload.tasks import selectors
+
+    parser = cli.build_parser()
+    for selector in selectors()["selectors"]:
+        args = parser.parse_args(["task", "submit", ".", "--prompt", "x", "--selector", selector])
+        assert args.selector == selector
+    with pytest.raises(SystemExit):
+        parser.parse_args(["task", "submit", ".", "--prompt", "x", "--selector", "none/none"])

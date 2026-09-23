@@ -27,6 +27,7 @@ from .task_protocol import (
     MAX_TOTAL,
     RESULT_SCHEMA,
     SCHEMA,
+    SELECTORS_SCHEMA,
     TaskError,
     decode,
     digest,
@@ -39,6 +40,8 @@ from .task_protocol import (
     task_id,
     validate_changes,
 )
+
+DEFAULT_SELECTOR = "openai-codex/gpt-6-astra"
 
 
 def state_root() -> Path:
@@ -374,9 +377,22 @@ def apply_changes(root: Path, changes: list[dict], backup: Path) -> None:
         raise
 
 
+def selectors() -> dict:
+    return {
+        "schema_version": SELECTORS_SCHEMA,
+        "default": DEFAULT_SELECTOR,
+        "selectors": sorted(OMP_WRITER_SELECTORS),
+    }
+
+
 def handler(args: argparse.Namespace) -> int:
     try:
-        if args.action == "submit":
+        if args.action == "selectors":
+            value = selectors()
+            if not args.json:
+                print("\n".join(value["selectors"]))
+                return 0
+        elif args.action == "submit":
             brief = args.prompt if args.prompt is not None else args.brief.read_text()
             value = submit(
                 args.project,
@@ -475,12 +491,17 @@ def build_task_parser(subparsers) -> None:
     brief.add_argument("--prompt")
     submit_parser.add_argument("--host", default="studio")
     submit_parser.add_argument(
-        "--selector", choices=sorted(OMP_WRITER_SELECTORS), default="openai-codex/gpt-6-astra"
+        "--selector", choices=sorted(OMP_WRITER_SELECTORS), default=DEFAULT_SELECTOR
     )
     submit_parser.add_argument("--timeout", type=float, default=1800)
     submit_parser.add_argument("--check", help="validation argv, shell-quoted; no shell expansion")
     submit_parser.add_argument("--id", help="caller-generated idempotency identity")
     submit_parser.set_defaults(handler=handler)
+    selectors_parser = actions.add_parser(
+        "selectors", help="list the writer selectors this installation accepts"
+    )
+    selectors_parser.add_argument("--json", action="store_true")
+    selectors_parser.set_defaults(handler=handler)
     actions.add_parser("list").set_defaults(handler=handler)
     for action in ("status", "resume", "cancel", "retrieve", "diff", "apply"):
         item = actions.add_parser(action)
