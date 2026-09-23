@@ -1,6 +1,6 @@
 ---
 name: agent-offload
-description: Run durable remote coding tasks on Studio through Weft, retrieve proposed changes, and apply them after verification. Also retrieve historical report-only jobs or operate attached OMP relays.
+description: Run coding agents on Studio instead of this machine, through OMP. Durable tasks edit a Weft snapshot and return a diff to verify and apply; attached relays run the agent remotely against the local live tree; historical report jobs remain retrievable. Use when delegating coding, repair, or analysis work to run on Studio, and for submitting, monitoring, retrieving, or applying such work.
 ---
 
 # Agent Offload
