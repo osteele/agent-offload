@@ -41,7 +41,7 @@ from .task_protocol import (
     validate_changes,
 )
 
-DEFAULT_SELECTOR = "openai-codex/gpt-6-astra"
+DEFAULT_SELECTOR = "openai-codex/gpt-6-sol"
 
 
 def state_root() -> Path:

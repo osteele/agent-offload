@@ -7,7 +7,7 @@
     "typecheck": "tsc --noEmit --skipLibCheck --resolveJsonModule --allowSyntheticDefaultImports --module esnext --moduleResolution bundler --target es2022 *.ts"
   },
   "dependencies": {
-    "@oh-my-pi/pi-coding-agent": "18.1.17"
+    "@oh-my-pi/pi-coding-agent": "18.2.10"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",

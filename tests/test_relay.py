@@ -141,7 +141,7 @@ FAKE_BRIDGE = textwrap.dedent(
     registered = ["review_read", "review_glob", "review_grep"]
     if scenario == "registry_drift":
         registered = ["review_read"]
-    model = {"provider": "anthropic", "id": "claude-opus-4-6"}
+    model = {"provider": "anthropic", "id": "claude-opus-5-5"}
     if scenario == "model_drift":
         model = {"provider": "anthropic", "id": "claude-opus-4-5"}
     host_target = "agent@elsewhere" if scenario == "host_drift" else request["host_target"]
@@ -267,7 +267,7 @@ def test_happy_path_writes_validated_result(
     assert record["tool_call_count"] == 1
     assert record["durability"] == "none-attached-live-local-tools"
     assert record["snapshot_equivalent"] is False
-    assert record["model"] == {"provider": "anthropic", "id": "claude-opus-4-6"}
+    assert record["model"] == {"provider": "anthropic", "id": "claude-opus-5-5"}
     assert len(record["relay_source_sha256"]) == 64
     served = record["tool_calls"][0]["served_paths"][0]
     assert served["path"] == str(relay_project / "notes.txt")
@@ -293,7 +293,7 @@ def test_request_pins_grounded_selector(
     assert request["schema_version"] == "agent-offload.relay-request/v1"
     assert request["project_root"] == str(relay_project)
     assert request["provider"] == "anthropic"
-    assert request["model"] == "anthropic/claude-opus-4-6"
+    assert request["model"] == "anthropic/claude-opus-5-5"
     assert request["bounds"]["maxReadBytes"] > 0
     assert request["bounds"]["maxGrepMatches"] > 0
     assert request["bounds"]["maxToolArgsBytes"] > 0

@@ -30,10 +30,10 @@ import { failedTurnMessage } from "./event_failure.js";
 
 const HOST_TOOLS = ["review_read", "review_glob", "review_grep"] as const;
 const RELAY_PROVIDER = "anthropic";
-const RELAY_MODEL = "anthropic/claude-opus-4-6";
+const RELAY_MODEL = "anthropic/claude-opus-5-5";
 const BRIDGE_SCHEMA = "agent-offload.relay-bridge/v1";
 const REQUEST_SCHEMA = "agent-offload.relay-request/v1";
-const SDK_VERSION = "18.1.17";
+const SDK_VERSION = "18.2.10";
 const SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
 
 /** Remote surfaces the relay agent must never reach. Enforced twice: as omp

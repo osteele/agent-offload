@@ -48,7 +48,7 @@ MAX_TOOL_RESULT_BYTES = 256 * 1024
 #: The grounded OMP lane's sole sanctioned inference selector, split for
 #: result-attestation binding.
 RELAY_PROVIDER = "anthropic"
-RELAY_MODEL_ID = "claude-opus-4-6"
+RELAY_MODEL_ID = "claude-opus-5-5"
 RELAY_SELECTOR = f"{RELAY_PROVIDER}/{RELAY_MODEL_ID}"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")

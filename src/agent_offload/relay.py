@@ -111,7 +111,7 @@ TRUST_EPILOG = """trust boundary:
                oversized inputs are refused. Output, matches, files, and
                wall time are bounded.
   pinned       the inference selector is fixed to
-               anthropic/claude-opus-4-6; no --model/--provider override
+               anthropic/claude-opus-5-5; no --model/--provider override
                exists on this lane.
   fail-closed  if the remote side cannot confirm that built-in tools are
                disabled and exactly the three host tools are registered,
