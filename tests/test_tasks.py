@@ -217,6 +217,85 @@ def test_corrupt_task_is_visible_without_hiding_healthy_tasks(tmp_path, monkeypa
     assert next(row for row in rows if row["id"] == "broken")["error"]
 
 
+def fake_tools(tmp_path, monkeypatch, *, files: list[str], excludes: list[str], run: str) -> None:
+    """Put fake rg and weft executables alone on PATH.
+
+    rg lists files; `weft sync inspect` reports excludes; any other weft
+    command runs the shell fragment run.
+    """
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    listing = tmp_path / "rg-files"
+    listing.write_text("".join(f"{name}\n" for name in files))
+    inspection = tmp_path / "inspection.json"
+    inspection.write_text(json.dumps({"local_dir": "unused", "excludes": excludes}))
+    for name, content in {
+        "rg": f'#!/bin/sh\n/bin/cat "{listing}"\n',
+        "weft": (
+            f'#!/bin/sh\nif [ "$1 $2" = "sync inspect" ]; then /bin/cat "{inspection}"; exit 0; fi\n'
+            f"{run}\n"
+        ),
+    }.items():
+        path = tools / name
+        path.write_text(content)
+        path.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools))
+
+
+def test_baseline_omits_files_weft_snapshot_excludes(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    project = tmp_path / "project"
+    files = [
+        "hello.py",
+        "CLAUDE.md",
+        "testdata/case.txt",
+        "src/bin/tool.sh",
+        "src/module.pyc",
+        "src/keep.py",
+        "notes/draft.txt",
+    ]
+    for name in files:
+        (project / name).parent.mkdir(parents=True, exist_ok=True)
+        (project / name).write_text(name)
+    fake_tools(
+        tmp_path,
+        monkeypatch,
+        files=files,
+        excludes=["CLAUDE.md", "testdata", "bin", "*.pyc", "[^a-m]otes"],
+        run="exit 1",
+    )
+    with pytest.raises(TaskError, match="resume this identity"):
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity="snapshot",
+        )
+    assert sorted(read_record("snapshot")["request"]["baseline"]) == ["hello.py", "src/keep.py"]
+
+
+def test_baseline_requires_weft_source_exclusions(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "hello.py").write_text("hello")
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
+    (tmp_path / "inspection.json").write_text(json.dumps({"local_dir": "unused"}))
+    with pytest.raises(TaskError, match="source exclusions"):
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity="uninspected",
+        )
+
+
 def test_submission_timeout_retains_identity_and_request(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
     project = tmp_path / "project"
@@ -224,16 +303,13 @@ def test_submission_timeout_retains_identity_and_request(tmp_path, monkeypatch):
     (project / "hello.py").write_text("hello")
     # External executables are simulated; the task's submission and persistence
     # code run unchanged, including the failure path after payload publication.
-    tools = tmp_path / "bin"
-    tools.mkdir()
-    for name, content in {
-        "rg": "#!/bin/sh\nprintf 'hello.py\\n'\n",
-        "weft": "#!/bin/sh\necho 'transport lost after acceptance' >&2\nexit 1\n",
-    }.items():
-        path = tools / name
-        path.write_text(content)
-        path.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tools))
+    fake_tools(
+        tmp_path,
+        monkeypatch,
+        files=["hello.py"],
+        excludes=[".git"],
+        run="echo 'transport lost after acceptance' >&2\nexit 1",
+    )
     with pytest.raises(TaskError, match="resume this identity"):
         submit(
             project,

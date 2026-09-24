@@ -14,6 +14,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from agent_execution.identity import source_sha256
@@ -130,10 +131,7 @@ def submit(
     with locked(identity) as directory:
         if (directory / "task.json").exists():
             raise TaskError(f"task {identity} already exists; inspect it or use task resume")
-        names = run(
-            ["rg", "--files", "--hidden", "-g", "!.git", "-g", "!.jj"], cwd=project
-        ).splitlines()
-        names = [n for n in names if not any(p.lower() in EXCLUDED for p in Path(n).parts)]
+        names = snapshot_names(project)
         request = {
             "schema_version": SCHEMA,
             "id": identity,
@@ -162,6 +160,33 @@ def submit(
         # The identity and immutable request survive an interrupted submission.
         save(directory / "task.json", record)
         return send(record, directory)
+
+
+def snapshot_names(project: Path) -> list[str]:
+    """Project files that Weft's source snapshot will carry to the worker.
+
+    The worker requires every baseline file to exist in its snapshot, so a file
+    that Weft's source exclusions drop must not enter the baseline. Weft reports
+    the exclusions it applies; each is a Go glob matched against every path
+    component, as weft's shouldExclude does.
+    """
+    names = run(
+        ["rg", "--files", "--hidden", "-g", "!.git", "-g", "!.jj"], cwd=project
+    ).splitlines()
+    inspected = json.loads(run(["weft", "sync", "inspect", str(project), "--json"], cwd=project))
+    excludes = inspected.get("excludes") if isinstance(inspected, dict) else None
+    if not isinstance(excludes, list) or not all(isinstance(p, str) for p in excludes):
+        raise TaskError("weft sync inspect did not report the source exclusions")
+    # Go spells a negated character class [^...]; fnmatch spells it [!...].
+    patterns = [p.replace("[^", "[!") for p in excludes]
+    return [
+        name
+        for name in names
+        if not any(
+            part.lower() in EXCLUDED or any(fnmatchcase(part, p) for p in patterns)
+            for part in Path(name).parts
+        )
+    ]
 
 
 def send(record: dict, directory: Path) -> dict:
