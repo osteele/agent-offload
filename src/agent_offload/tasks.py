@@ -43,6 +43,11 @@ from .task_protocol import (
 )
 
 DEFAULT_SELECTOR = "openai-codex/gpt-6-sol"
+HOST_SYNC = "agent-host-sync --account agent apply --stage tools --tool agent-offload"
+
+
+class ResultUnavailable(TaskError):
+    """Weft could not supply the task's result artifact."""
 
 
 def state_root() -> Path:
@@ -224,7 +229,7 @@ def send(record: dict, directory: Path) -> dict:
                 "--project",
                 "agent-offload",
                 "--idempotency-key",
-                record["id"],
+                idempotency_key(record),
                 "--output",
                 result_path(record["id"]),
                 "--produces",
@@ -241,7 +246,7 @@ def send(record: dict, directory: Path) -> dict:
             cwd=Path(record["project"]),
             timeout=180,
         )
-        receipt = WeftReceipt.parse(raw, idempotency_key=record["id"])
+        receipt = WeftReceipt.parse(raw, idempotency_key=idempotency_key(record))
         if not receipt.job_id:
             raise TaskError("Weft did not accept the task")
         record.update(
@@ -261,6 +266,48 @@ def send(record: dict, directory: Path) -> dict:
     return summary(record)
 
 
+def idempotency_key(record: dict) -> str:
+    """The Weft idempotency key of the record's current submission attempt."""
+    attempt = record.get("attempt", 1)
+    return record["id"] if attempt == 1 else f"{record['id']}-{attempt}"
+
+
+def check_baseline_unchanged(record: dict) -> None:
+    # A new source snapshot must not silently replace the retained baseline.
+    if (
+        manifest(Path(record["project"]), list(record["request"]["baseline"]))
+        != record["request"]["baseline"]
+    ):
+        raise TaskError("project changed since submission; inspect Weft before resuming")
+
+
+def resubmit(record: dict, directory: Path) -> dict:
+    """Submit the retained request again after its job failed without a result."""
+    check_baseline_unchanged(record)
+    record.update(
+        prior_job_ids=[*record.get("prior_job_ids", []), record["job_id"]],
+        attempt=record.get("attempt", 1) + 1,
+        job_id=None,
+        status="submitting",
+    )
+    # A new attempt key lets Weft accept a second job; it survives interruption.
+    save(directory / "task.json", record)
+    return send(record, directory)
+
+
+def unpublished_failure(record: dict, observed: dict, error: ResultUnavailable) -> str:
+    try:
+        log = run(["weft", "job", "log", record["job_id"], "-n", "20"], timeout=15).strip()
+    except TaskError as log_error:
+        log = f"(job log unavailable: {log_error})"
+    return (
+        f"job {record['job_id']} failed with exit code {observed.get('exit_code')} "
+        f"without publishing a task result ({error}). Job log tail:\n{log}\n"
+        f"If the worker reports a version mismatch, update the host with `{HOST_SYNC}`. "
+        f"`agent-offload task resume {record['id']}` resubmits the retained request."
+    )
+
+
 def summary(record: dict) -> dict:
     return {
         key: record.get(key)
@@ -275,6 +322,7 @@ def summary(record: dict) -> dict:
             "job_id",
             "error",
             "applied_at",
+            "prior_job_ids",
         )
     }
 
@@ -299,7 +347,22 @@ def status(record: dict) -> dict:
         row["job_status"] = observed["status"]
         row["status"] = observed["status"]
         if observed["status"] in {"completed", "failed"}:
-            row["status"] = retrieve(record, include_diff=False)["status"]
+            try:
+                row["status"] = retrieve(record, include_diff=False)["status"]
+            except ResultUnavailable as error:
+                publication = observed.get("publication")
+                published = (
+                    isinstance(publication, dict)
+                    and publication.get("required_artifacts_state") == "ready"
+                )
+                # A completed job, or one whose result Weft reports as ready,
+                # should have a result; failing to read it is not a job failure.
+                if observed["status"] != "failed" or published:
+                    raise
+                row.update(
+                    status="failed_without_result",
+                    error=unpublished_failure(record, observed, error),
+                )
         row["observed_at"] = time.time()
     except (OSError, ValueError, TypeError, KeyError) as error:
         row.update(status="unknown", error=str(error))
@@ -309,7 +372,10 @@ def status(record: dict) -> dict:
 def retrieve(record: dict, *, include_diff: bool = True) -> dict:
     if not record.get("job_id"):
         raise TaskError("task has no accepted job identity")
-    raw = run(["weft", "artifact", "cat", record["job_id"], result_path(record["id"])])
+    try:
+        raw = run(["weft", "artifact", "cat", record["job_id"], result_path(record["id"])])
+    except TaskError as error:
+        raise ResultUnavailable(str(error)) from error
     if len(raw.encode()) > MAX_TOTAL * 3:
         raise TaskError("task artifact exceeds size limit")
     result = object_json(raw, RESULT_SCHEMA)
@@ -463,16 +529,10 @@ def handler(args: argparse.Namespace) -> int:
                 elif args.action == "resume":
                     if record.get("job_id"):
                         value = status(record)
+                        if value["status"] == "failed_without_result":
+                            value = resubmit(record, directory)
                     else:
-                        # A new source snapshot must not silently replace the
-                        # baseline of a submission whose acceptance is unknown.
-                        if (
-                            manifest(Path(record["project"]), list(record["request"]["baseline"]))
-                            != record["request"]["baseline"]
-                        ):
-                            raise TaskError(
-                                "project changed during unresolved submission; inspect Weft before resuming"
-                            )
+                        check_baseline_unchanged(record)
                         value = send(record, directory)
                 elif args.action == "cancel":
                     if not record.get("job_id"):

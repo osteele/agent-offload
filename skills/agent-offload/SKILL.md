@@ -18,7 +18,7 @@ agent-offload task status TASK_ID
 weft status --wait JOB_ID
 ```
 
-Save the returned task and Weft job identities. A local timeout does not cancel the task. An ambiguous submission retains its identity; use `agent-offload task resume TASK_ID` to retry with the same idempotency key. Do not resubmit with a new identity.
+Save the returned task and Weft job identities. A local timeout does not cancel the task. An ambiguous submission retains its identity; use `agent-offload task resume TASK_ID` to retry with the same idempotency key. Do not resubmit with a new identity. A task whose job failed before publishing a result reports `failed_without_result` with the job log tail; fix the cause (usually a worker version mismatch, fixed by updating the host) and run `task resume`, which retries the retained request as a new attempt of the same task.
 
 The default writer is `openai-codex/gpt-6-sol` through OMP. Use `--selector openai-codex/gpt-6-luna` for cheaper bounded work. Reserve `openai-codex/gpt-6-astra` for explicit, rare largest-model escalations. `--selector` accepts Agent Execution's registered writers; `agent-offload task selectors --json` lists them for this installation. The agent uses `workspace-write-no-shell`: it edits the disposable snapshot but cannot execute shell commands. The optional `--check` runs separately afterward, with arguments parsed as shell quoting and no shell expansion. A failing check prevents application. Without a check, `validation` is null.
 

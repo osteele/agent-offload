@@ -39,9 +39,20 @@ def task_factory(tmp_path, monkeypatch):
     weft.write_text(
         f"#!{sys.executable}\n"
         "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        f"with open({str(tmp_path / 'weft-calls')!r}, 'a') as stream: stream.write(json.dumps(args) + '\\n')\n"
+        "if args[0] == 'run':\n"
+        "    key = args[args.index('--idempotency-key') + 1]\n"
+        "    print(json.dumps({'api_version': 'weft.run.receipt.v1', 'job_id': 'wj-retry',\n"
+        "        'placement_decision': 'accepted_immediately', 'accepted_immediately': True,\n"
+        "        'selected_host': 'studio', 'source_pin': 'pin', 'idempotency_key': key}))\n"
+        "    sys.exit(0)\n"
         f"with open({str(replies)!r}) as stream: data = json.load(stream)\n"
-        "key = 'job' if sys.argv[1:3] == ['job', 'inspect'] else 'result'\n"
-        "print(json.dumps(data[sys.argv[3]][key]))\n"
+        "kind = {('job', 'inspect'): 'job', ('job', 'log'): 'log'}.get(tuple(args[:2]), 'result')\n"
+        "entry = data[args[2]]\n"
+        "if kind not in entry:\n"
+        "    sys.exit(f'no {kind} for {args[2]}')\n"
+        "print(entry[kind] if kind == 'log' else json.dumps(entry[kind]))\n"
     )
     weft.chmod(0o755)
     monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
@@ -153,6 +164,7 @@ def task_factory(tmp_path, monkeypatch):
         }
         with tasks.locked(identity) as directory:
             tasks.save(directory / "task.json", record)
+            (directory / "request.json").write_text(json.dumps(request))
         payloads[record["job_id"]] = {
             "job": {"id": record["job_id"], "status": "completed"},
             "result": result,
@@ -189,6 +201,80 @@ def test_unverifiable_completion_does_not_hide_healthy_tasks(task_factory, tmp_p
     assert rows["broken"]["job_status"] == "completed"
     assert "retained dispatch" in rows["broken"]["error"]
     assert rows["healthy"]["status"] == "completed"
+
+
+def unpublished_failure(tmp_path, record, *, job_status="failed", artifacts="unknown"):
+    """Make the record's job end without a published result, as a worker refused at startup."""
+    replies = tmp_path / "replies.json"
+    payloads = json.loads(replies.read_text())
+    payloads[record["job_id"]] = {
+        "job": {
+            "id": record["job_id"],
+            "status": job_status,
+            "exit_code": 1,
+            "publication": {"required_artifacts_state": artifacts},
+        },
+        "log": "agent-offload-task-worker: installed source digest does not match",
+    }
+    replies.write_text(json.dumps(payloads))
+
+
+def test_failed_job_without_result_reports_definite_status(task_factory, tmp_path, capsys):
+    record, _ = task_factory("refused")
+    unpublished_failure(tmp_path, record)
+    assert tasks.handler(argparse.Namespace(action="status", id=record["id"])) == 0
+    row = json.loads(capsys.readouterr().out)
+    assert row["status"] == "failed_without_result"
+    assert row["job_status"] == "failed"
+    assert "without publishing a task result" in row["error"]
+    assert "installed source digest does not match" in row["error"]
+    assert f"agent-offload task resume {record['id']}" in row["error"]
+
+
+@pytest.mark.parametrize(
+    "job_status,artifacts",
+    [("completed", "unknown"), ("failed", "ready")],
+    ids=["completed", "published"],
+)
+def test_missing_result_of_publishing_job_stays_unknown(
+    task_factory, tmp_path, capsys, job_status, artifacts
+):
+    record, _ = task_factory("unreadable")
+    unpublished_failure(tmp_path, record, job_status=job_status, artifacts=artifacts)
+    assert tasks.handler(argparse.Namespace(action="status", id=record["id"])) == 0
+    row = json.loads(capsys.readouterr().out)
+    assert row["status"] == "unknown"
+    assert "no result" in row["error"]
+
+
+def test_resume_resubmits_failed_job_under_new_attempt_key(task_factory, tmp_path, capsys):
+    record, _ = task_factory("retry")
+    unpublished_failure(tmp_path, record)
+    assert tasks.handler(argparse.Namespace(action="resume", id=record["id"])) == 0
+    row = json.loads(capsys.readouterr().out)
+    assert row["job_id"] == "wj-retry"
+    assert row["status"] == "queued"
+    assert row["prior_job_ids"] == [record["job_id"]]
+    retained = tasks.read_record(record["id"])
+    assert retained["attempt"] == 2
+    calls = [json.loads(line) for line in (tmp_path / "weft-calls").read_text().splitlines()]
+    submitted = next(call for call in calls if call[0] == "run")
+    assert submitted[submitted.index("--idempotency-key") + 1] == "retry-2"
+    assert submitted[submitted.index("--output") + 1] == result_path("retry")
+
+
+def test_resume_refuses_failed_job_when_baseline_changed(task_factory, tmp_path, capsys):
+    record, _ = task_factory("drifted")
+    unpublished_failure(tmp_path, record)
+    (Path(record["project"]) / "hello.py").write_text("edited locally\n")
+    assert tasks.handler(argparse.Namespace(action="resume", id=record["id"])) == 1
+    assert "project changed" in capsys.readouterr().err
+    retained = tasks.read_record(record["id"])
+    assert retained["job_id"] == record["job_id"]
+    assert "attempt" not in retained
+    assert not any(
+        json.loads(line)[0] == "run" for line in (tmp_path / "weft-calls").read_text().splitlines()
+    )
 
 
 def test_task_applications_cannot_overwrite_each_other(task_factory, monkeypatch):
