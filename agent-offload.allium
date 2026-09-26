@@ -1,0 +1,941 @@
+-- allium: 3
+-- agent-offload.allium
+
+-- Scope: The whole agent-offload system — durable remote coding tasks, the attached
+--         relay, and the historical report lane.
+-- Includes:
+--   Task identity, idempotency, submission, resume, cancellation
+--   Task worker execution constraints, requested checks, result publication
+--   Result retrieval validation, change application, application journal
+--   Attached relay sessions, confined local tools, provenance, fail-closed evidence
+--   Historical job retrieval validation and retirement refusals
+-- Excludes:
+--   Weft internals (scheduling, source snapshots, job lifecycle, artifact storage):
+--     external boundary, specified elsewhere
+--   agent-execution writer internals: the writer's coding behavior is a black box
+--     behind its evidence contract
+--   OMP harness behavior and SSH transport: external boundaries
+--   Retired native Codex worker internals: only its refusal surface and the
+--     validation of its historical artifacts are specified
+-- Terminology:
+--   Task worker: agent-offload-task-worker, the durable lane's remote writer
+--   Nested worker: the retired historical lane's inner worker, evidence-only
+--   Task result / historical worker result / relay result record: the three
+--     distinct result artifacts, never interchangeable
+-- Invariants confirmed as deliberate design: evidence-based status,
+--   least-capability lanes, fail-closed with no fallback. Atomic serialized
+--   application and explicit consequential steps are enforced per rule, not
+--   asserted as system invariants.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity Principal {
+    -- Placeholder for any party at a boundary: the local consumer (a coding
+    -- agent or a human driving the CLI), or the relay's remote agent runtime.
+}
+
+external entity Project {
+    root: String
+}
+
+external entity WeftJob {
+    id: String
+    status: queued | running | completed | failed | dead | canceled | cancelled | killed
+    source_pin: String?
+    exit_code: Integer?
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value BaselineEntry {
+    path: String
+    content_digest: String
+    mode: Integer
+}
+
+value BaselineManifest {
+    -- Exactly the files the Weft source snapshot carries. Files under the
+    -- excluded cache directories (dependency, build and tool caches) never
+    -- enter the baseline, and changes under them are invisible by design:
+    -- not validated, not captured, not applied.
+    entries: List<BaselineEntry>
+}
+
+value Change {
+    path: String
+    deleted: Boolean
+    before_content_digest: String?
+    before_mode: Integer?
+    after_content: String?
+    after_mode: Integer?
+
+    -- Content fields are text (String). A binary baseline file therefore
+    -- cannot be edited, deleted, or mode-changed through this lane at all:
+    -- the refusal is intended, and such changes happen outside the system.
+}
+
+value CheckOutcome {
+    command: List<String>
+    exit_code: Integer?
+    timed_out: Boolean
+    stdout_tail: String
+    stderr_tail: String
+}
+
+value ApplicationBackup {
+    changes: List<Change>
+}
+
+value ContextFile {
+    name: String
+    content_digest: String
+}
+
+value ServedPath {
+    path: String
+    content_digest: String
+    byte_count: Integer
+    truncated: Boolean
+}
+
+value ToolCall {
+    tool: String
+    is_error: Boolean
+    served_paths: List<ServedPath>
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract EvidenceContract {
+    @invariant Identity
+        -- An accepted artifact carries the digests of the exact request,
+        -- worker source, and report it was produced from. A mismatch with
+        -- the retained dispatch refuses the artifact.
+    @invariant Completeness
+        -- Partial, ambiguous, or unreadable evidence is refused or reported
+        -- as unresolved; it is never promoted to success and never silently
+        -- retried or substituted from a current installation.
+    @invariant Provenance
+        -- Every byte the system serves or applies is recorded with a content
+        -- digest of exactly those bytes.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity Task {
+    id: String
+    project: Project
+    brief: String
+    selector: String
+    check: List<String>?
+    timeout: Duration
+    baseline: BaselineManifest
+    request_digest: String
+    worker_source_digest: String
+    attempt: Integer
+    job: WeftJob?
+    prior_job_ids: List<String>
+    error: String?
+
+    -- Evidence-based status. completed, failed and validation_failed come
+    -- only from a validated task result. queued and running mirror the
+    -- accepted Weft job's observed lifecycle. unknown means observation or
+    -- evidence was unreadable; it never implies success.
+    status: submitting | submission_unknown | queued | running | completed | failed | validation_failed | failed_without_result | unknown | applied
+
+    applied_at: Timestamp when status = applied
+    backup: ApplicationBackup?
+
+    result: TaskResult with task = this
+
+    invariant AppliedTerminal {
+        status = applied implies applied_at != null
+    }
+}
+
+entity TaskResult {
+    task: Task
+    status: completed | failed | validation_failed
+    worker_completed: Boolean
+    worker_source_digest: String
+    request_digest: String
+    report: String
+    changes: List<Change>
+    validation: CheckOutcome?
+
+    invariant ValidationFailureCarriesOutcome {
+        status = validation_failed implies validation != null
+    }
+
+    invariant ChangesWithinBounds {
+        changes.count <= config.max_change_files
+    }
+}
+
+entity RelaySession {
+    project: Project
+    prompt_digest: String
+    context_files: List<ContextFile>
+    selector: String
+    timeout: Duration
+    started_at: Timestamp
+    registered_tools: Set<String>
+    remote_events: List<String>
+    read_calls: List<ToolCall>
+    final_response: String?
+    failure: String?
+
+    -- Attached and live: the record states what this session is, and the
+    -- validator refuses any other durability claim.
+    status: running | completed | failed | cancelled
+    durability: String
+    snapshot_equivalent: Boolean
+
+    invariant BlankRoomRecorded {
+        durability = "none-attached-live-local-tools"
+        snapshot_equivalent = false
+    }
+}
+
+entity HistoricalJob {
+    job: WeftJob
+    expected_task_id: String
+
+    -- refused is terminal and permanent: the artifacts stay available in
+    -- Weft, and the job is never marked processed.
+    status: unvalidated | validated | refused | processed
+    processed_at: Timestamp?
+    refusal_reason: String?
+
+    result: HistoricalResult with record = this
+
+    invariant RefusalsNeverProcessed {
+        status = refused implies processed_at = null
+    }
+}
+
+entity HistoricalResult {
+    record: HistoricalJob
+    envelope_status: completed | preflight_failed | harness_failed | evidence_failed
+    provider: String
+    mode: String
+    selector: String
+    prompt_digest: String
+    report: String
+    report_digest: String
+    snapshot_preserved: Boolean
+    nested_evidence_present: Boolean
+    nested_source_digest_retained: Boolean
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    admitted_selector: String = "openai-codex/gpt-6-sol"     -- durable lane writer
+    historical_selector: String = "gpt-5.5"                  -- retired lane, validation only
+    pinned_relay_selector: String = "anthropic/claude-opus-5-5"
+
+    max_task_timeout: Duration = 120.minutes
+    default_task_timeout: Duration = 30.minutes
+    check_timeout: Duration = 15.minutes
+
+    max_file_bytes: Integer = 2 * 1024 * 1024                -- per returned file
+    max_change_files: Integer = 10000
+    max_bundle_bytes: Integer = 64 * 1024 * 1024
+
+    relay_default_timeout: Duration = 10.minutes
+    relay_grace: Duration = 30.seconds
+    relay_context_file_bytes: Integer = 32 * 1024
+    relay_max_tool_args_bytes: Integer = 64 * 1024
+    relay_max_read_bytes: Integer = 512 * 1024
+    relay_max_result_bytes: Integer = 256 * 1024
+    relay_max_match_files: Integer = 500
+    relay_max_grep_matches: Integer = 500
+    relay_max_traversed_files: Integer = 2000
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Durable task lane: submission and resume
+
+rule SubmitTask {
+    when: SubmitTask(caller, project, brief, selector, check, timeout, requested_id?)
+
+    requires: length(brief) > 0
+    requires: writer_selector_admitted(selector)
+    requires: timeout >= 1.second and timeout <= config.max_task_timeout
+    requires: check = null or path_dependencies_within_snapshot(project)
+        -- A check cannot run against dependencies outside the snapshot; a
+        -- project without a check is accepted regardless.
+    requires: requested_id = null or not Tasks.any(t => t.id = requested_id)
+
+    ensures:
+        let task = Task.created(
+            id: requested_id ?? generated_task_id(),
+            project: project,
+            brief: brief,
+            selector: selector,
+            check: check,
+            timeout: timeout,
+            baseline: baseline_manifest(project),
+            request_digest: digest_of(brief),
+            worker_source_digest: bundled_worker_digest(),
+            attempt: 1,
+            job: null,
+            prior_job_ids: [],
+            status: submitting
+        )
+    ensures: SubmissionSent(task)
+    @guidance
+        -- The retained request and the submitting record are durable before
+        -- the job is sent, so an interrupted submission leaves a resumable
+        -- identity. There is no local-execution fallback: a send that cannot
+        -- be resolved leaves the task submission_unknown for explicit resume.
+    @guidance
+        -- A bundled-vs-installed worker digest mismatch refuses before
+        -- queueing, with a reinstall hint. An unprobeable installation
+        -- defers the refusal to the worker's own identity check. A caller
+        -- chosen id that already exists is refused in favor of resume.
+}
+
+rule SubmissionAccepted {
+    when: SubmissionSent(task)
+
+    requires: send_succeeded(task)
+    ensures: task.job = accepted_job(task)
+    ensures: task.status = queued
+    ensures: task.error = null
+}
+
+rule SubmissionUnresolved {
+    when: SubmissionSent(task)
+
+    requires: not send_succeeded(task)
+    ensures: task.status = submission_unknown
+    ensures: task.error = send_error(task)
+}
+
+rule ResumeTask {
+    when: ResumeTask(caller, task)
+
+    -- Any terminal job state whose task never published a valid result is
+    -- resumable as a new attempt, except a job the consumer explicitly
+    -- canceled.
+    -- Implementation delta: the current code resubmits only after a Weft
+    -- `failed` observation (failed_without_result); killed and dead jobs
+    -- currently leave resume as a read-only no-op.
+    requires: task.result = null
+    requires: task.status != applied
+    requires: task.job = null or task.job?.status in {failed, dead, killed}
+    requires: task.job = null or not task.job?.status in {canceled, cancelled}
+    requires: baseline_unchanged(task)
+
+    ensures:
+        if task.job = null:
+            task.status = queued
+            SubmissionSent(task)
+        else:
+            task.prior_job_ids = task.prior_job_ids + task.job?.id
+            task.attempt = task.attempt + 1
+            task.job = null
+            task.status = submitting
+            SubmissionSent(task)
+    @guidance
+        -- An unsubmitted or unresolved submission resumes under the same
+        -- idempotency identity, so Weft cannot accept a second job for it. A
+        -- terminal job without a result resumes under a fresh attempt-scoped
+        -- identity, keeping the task's identity while listing the earlier
+        -- job in prior_job_ids.
+}
+
+rule CancelTask {
+    when: CancelTask(caller, task)
+
+    requires: task.job != null
+    ensures: CancellationDelegated(task.job)
+    @guidance
+        -- Cancellation operates on the accepted Weft job; task-local state
+        -- such as the baseline and any applied marker is untouched. A task
+        -- with no accepted job identity must resolve its submission first.
+}
+
+-- Durable task lane: observation and evidence
+
+rule MirrorRunningJob {
+    when: ObserveTask(caller, task)
+
+    requires: task.result = null
+    requires: task.job?.status in {queued, running}
+    ensures: task.status = task.job?.status
+}
+
+rule ResolveCompletedJob {
+    when: ObserveTask(caller, task)
+
+    requires: task.job?.status = completed
+    requires: task.result = null
+    ensures:
+        if artifact_validatable(task):
+            TaskEvidenceValidated(task)
+        else:
+            task.status = unknown
+            DiagnosticEmitted(task, "task result unavailable or invalid")
+}
+
+rule MarkFailedJob {
+    when: ObserveTask(caller, task)
+
+    requires: task.job?.status in {failed, dead, killed}
+    requires: task.result = null
+    ensures:
+        if artifact_validatable(task):
+            TaskEvidenceValidated(task)
+        else:
+            task.status = failed_without_result
+            DiagnosticEmitted(task, log_tail(task.job))
+    @guidance
+        -- The diagnostic carries the job's exit code and the tail of the job
+        -- log, with a hint to update the worker host and resume.
+}
+
+rule ValidateRetrievedResult {
+    when: RetrieveTaskResult(caller, task)
+
+    requires: task.job != null
+    requires: artifact_readable(task) and artifact_within_bounds(task)
+    requires: artifact_identity_matches(task)
+        -- result id, request digest and worker source digest must equal the
+        -- retained dispatch.
+    requires: worker_evidence_valid(task)
+        -- worker identity, admitted tool policy, transcript evidence and
+        -- prompt digest must match the retained request.
+    requires: change_baselines_match(task)
+        -- every change: safe relative path, no duplicates or overlaps,
+        -- before-digest and mode equal to the retained baseline for existing
+        -- files, absence matching for new files, per-file and bundle bounds.
+    ensures: TaskEvidenceValidated(task)
+    @guidance
+        -- Retrieval never marks the Weft job processed in this lane and
+        -- never mutates task state by itself; only application does.
+}
+
+rule MaterializeTaskResult {
+    when: TaskEvidenceValidated(task)
+
+    requires: task.result = null
+    ensures:
+        let evidence = ArtifactOf(task)
+        let result = TaskResult.created(
+            task: task,
+            status: evidence.status,
+            worker_completed: evidence.worker_completed,
+            worker_source_digest: evidence.worker_source_digest,
+            request_digest: evidence.request_digest,
+            report: evidence.report,
+            changes: evidence.changes,
+            validation: evidence.validation
+        )
+        task.status = result.status
+}
+
+-- Durable task lane: remote worker execution
+
+rule WorkerAcceptsTask {
+    when: WorkerExecutionBegan(task, payload)
+
+    requires: payload.request_digest = task.request_digest
+    requires: payload.task_id = task.id
+    requires: payload.worker_source_digest = task.worker_source_digest
+    requires: snapshot_census(task.project) = task.baseline.entries
+    ensures: WorkerSessionStarted(task)
+}
+
+rule WorkerPublishesSetupFailure {
+    when: WorkerExecutionBegan(task, payload)
+
+    requires: payload.request_digest != task.request_digest
+        or payload.task_id != task.id
+        or payload.worker_source_digest != task.worker_source_digest
+        or snapshot_census(task.project) != task.baseline.entries
+    ensures: ResultArtifactPublished(task)
+    ensures: WorkerRefusesFurtherWork(task)
+    @guidance
+        -- A setup or census failure publishes a failed result with a
+        -- diagnostic report and no changes, so the failure stays retrievable;
+        -- it never falls back to executing anyway.
+}
+
+rule WorkerProposesChanges {
+    when: WorkerSessionStarted(task)
+
+    let proposed = writer_edit(task.brief, task.baseline.entries)
+
+    requires: baseline_consistent(task, proposed)
+        -- each changed file's before-digest and mode must equal the retained
+        -- baseline; a change to a file the snapshot does not carry is
+        -- refused; additions and deletions by the writer are legal changes.
+    requires: within_change_bounds(proposed)
+    ensures: WorkerProposalReady(task, proposed)
+    @guidance
+        -- The writer edits the snapshot under a workspace-write policy that
+        -- admits no shell; its coding behavior is a black box specified only
+        -- by this evidence contract.
+}
+
+rule WorkerPublishesSuccess {
+    when: WorkerProposalReady(task, proposed)
+
+    requires: task.check = null
+        or (check_preserved_sources(task, proposed)
+            and check_exit_code(task, proposed) = 0
+            and not check_timed_out(task, proposed))
+    ensures: ResultArtifactPublished(task)
+    @guidance
+        -- The check must preserve ordinary source files including their
+        -- permissions; edits restricted to excluded cache directories are
+        -- invisible to the census and tolerated.
+}
+
+rule WorkerPublishesValidationFailure {
+    when: WorkerProposalReady(task, proposed)
+
+    requires: task.check != null
+    requires: not check_preserved_sources(task, proposed)
+        or check_exit_code(task, proposed) != 0
+        or check_timed_out(task, proposed)
+    ensures: ResultArtifactPublished(task)
+    ensures: WorkerRefusesFurtherWork(task)
+    @guidance
+        -- A check that edits, creates, or deletes source files fails the
+        -- task even when it exits successfully. A timed-out check publishes
+        -- the captured output and a timeout diagnostic. The worker exits
+        -- unsuccessfully after publishing a non-completed result, so the
+        -- result remains retrievable and can never be applied.
+}
+
+-- Durable task lane: application
+
+rule ApplyTaskResult {
+    when: ApplyTaskResult(caller, task)
+
+    requires: task.result != null and task.result.status = completed
+    requires: task.status != applied
+    requires: project_apply_lock_held(task.project)
+        -- applications to the same canonical project path serialize; a
+        -- competing application is refused until the holder finishes.
+    requires:
+        for change in task.result.changes:
+            destination_matches_before(task.project, change)
+        -- every destination: existing bytes and mode equal the change's
+        -- before-state, new files do not exist, paths are safe (inside the
+        -- project, no symlinked components, no protected agent or VCS
+        -- metadata), and content is text within the per-file bound.
+
+    ensures: task.backup = ApplicationBackup.of(task.result.changes)
+    ensures:
+        for change in task.result.changes:
+            apply_change(task.project, change)
+    ensures: task.applied_at = now
+    ensures: task.status = applied
+    @guidance
+        -- The backup journal is written before the first write; a failure
+        -- mid-application rolls back in reverse (created files deleted,
+        -- prior bytes and modes restored). Application never commits or
+        -- deploys; a retried application after the project moved on faces
+        -- the per-file before-state check and refuses.
+}
+
+-- Relay lane
+
+rule StartRelay {
+    when: StartRelay(caller, project, prompt, timeout, detached, host?)
+
+    requires: not detached
+        -- the relay lane is attached by design; there is no job identity,
+        -- no resume, and no detached mode.
+    requires: length(prompt) > 0
+    requires: timeout > 0.seconds
+    requires: remote_preflight_succeeds(host)
+    ensures:
+        let session = RelaySession.created(
+            project: project,
+            prompt_digest: digest_of(prompt),
+            context_files: local_context_files(project, config.relay_context_file_bytes),
+            selector: config.pinned_relay_selector,
+            timeout: timeout,
+            started_at: now,
+            registered_tools: {`review_read`, `review_glob`, `review_grep`},
+            remote_events: [],
+            read_calls: [],
+            status: running,
+            durability: "none-attached-live-local-tools",
+            snapshot_equivalent: false
+        )
+    ensures: RemoteBlankRoomConfigured(session)
+    @guidance
+        -- The remote runtime is stripped twice: harness flags in the remote
+        -- argv and a disable overlay written to a fresh scratch directory.
+        -- The remote side discovers no project context of its own; it
+        -- receives only the explicitly shipped project instructions and the
+        -- prompt, both digested. The local process group owns the remote
+        -- tree; it dies with the local command.
+}
+
+rule ServeConfinedToolCall {
+    when: ReviewToolCall(caller, session, tool, args)
+
+    requires: tool in {`review_read`, `review_glob`, `review_grep`}
+    requires: session.status = running
+    requires: encoded_size(args) <= config.relay_max_tool_args_bytes
+    requires: resolves_inside_root(args, session.project)
+        -- canonicalized real paths inside the project root; URL and device
+        -- schemes, parent traversal, and symlink escapes are refused, and a
+        -- missing path reports confinement rather than filesystem detail.
+    requires: serves_regular_text(args, config.relay_max_read_bytes)
+    ensures:
+        for served in served_inputs(args):
+            session.read_calls = session.read_calls
+                + ToolCall{
+                    tool: tool,
+                    is_error: false,
+                    served_paths: [
+                        ServedPath{
+                            path: served.path,
+                            content_digest: served.digest,
+                            byte_count: served.bytes,
+                            truncated: served.truncated
+                        }
+                    ]
+                }
+    ensures: ToolResultReturned(session, within_result_bound(config.relay_max_result_bytes))
+    @guidance
+        -- Every file whose bytes were served carries provenance: real path,
+        -- content digest of the exact bytes, byte count, truncation. A
+        -- matching file contributing matches that were cut by the output
+        -- bound is still recorded.
+}
+
+rule CompleteRelaySession {
+    when: RelayResultFrameReceived(session, frame)
+
+    requires: frame.events = session.remote_events
+        -- lifecycle evidence cannot be omitted or substituted
+    requires: frame.registered_tools = {`review_read`, `review_glob`, `review_grep`}
+    requires: tool_lifecycles_complete(session)
+        -- every started tool call has exactly one matching end; unsanctioned
+        -- tools, double starts, and unresolved calls refuse the result
+    requires: served_paths_inside_root(session)
+    requires: frame.model = session.selector
+    ensures: session.final_response = frame.response
+    ensures: session.status = completed
+    ensures: RelayRecordWritten(session)
+}
+
+rule FailRelaySession {
+    when: RelayFailureObserved(session, reason)
+
+    requires: session.status = running
+    ensures: session.failure = reason
+    ensures: session.status = failed
+    ensures: remote_process_tree_terminated(session)
+    @guidance
+        -- Failure is fail-closed at every stage: a refused tool registration,
+        -- an incomplete lifecycle, a served path outside the root, or a
+        -- bridge that exits without a result is refused, and a remote
+        -- failure never falls back to enabling remote tools.
+}
+
+rule TimeoutRelaySession {
+    when: session: RelaySession.started_at + session.timeout + config.relay_grace <= now
+
+    requires: session.status = running
+    ensures: session.status = failed
+    ensures: session.failure = "relay exceeded its timeout"
+    ensures: remote_process_tree_terminated(session)
+}
+
+rule CancelRelaySession {
+    when: CancelRelay(caller, session)
+
+    requires: session.status = running
+    ensures: session.status = cancelled
+    ensures: session.failure = "cancelled locally"
+    ensures: remote_process_tree_terminated(session)
+    ensures: RelayRecordWritten(session)
+}
+
+-- Historical lane
+
+rule ValidateHistoricalJob {
+    when: RetrieveHistoricalJob(caller, record, mark_processed)
+
+    let envelope = EnvelopeOf(record.job)
+
+    requires: owned_by_this_system(record.job)
+    requires: record.job?.status in {completed, failed, dead, canceled, cancelled, killed}
+    requires: declared_artifacts(record.job) = {"task result artifact", "report artifact"}
+    requires: record.job?.source_pin != null
+    requires: envelope_identity_matches(envelope, record.expected_task_id)
+        -- provider and mode pinned to the retired report lane, selector
+        -- pinned to config.historical_selector, task id and prompt digest
+        -- matching the dispatch, report digest matching the report text
+    requires: not (envelope.nested_evidence_present
+        and not envelope.nested_source_digest_retained)
+    requires: envelope.status != completed
+        or (length(envelope.report) > 0 and envelope.snapshot_preserved)
+    ensures: HistoricalResult.created(
+        record: record,
+        envelope_status: envelope.status,
+        provider: envelope.provider,
+        mode: envelope.mode,
+        selector: envelope.selector,
+        prompt_digest: envelope.prompt_digest,
+        report: envelope.report,
+        report_digest: digest_of(envelope.report),
+        snapshot_preserved: envelope.snapshot_preserved,
+        nested_evidence_present: envelope.nested_evidence_present,
+        nested_source_digest_retained: envelope.nested_source_digest_retained
+    )
+    ensures: report_artifact_byte_equals(envelope.report)
+    ensures:
+        if mark_processed:
+            record.status = processed
+            record.processed_at = now
+        else:
+            record.status = validated
+}
+
+rule RefuseUnverifiableHistoricalEvidence {
+    when: RetrieveHistoricalJob(caller, record, mark_processed)
+
+    let envelope = EnvelopeOf(record.job)
+
+    requires: envelope.nested_evidence_present
+    requires: not envelope.nested_source_digest_retained
+    ensures: record.status = refused
+    ensures: record.refusal_reason = "historical nested execution evidence is unverifiable: the accepted dispatch did not retain a nested worker source baseline"
+    ensures: HistoricalRefusalReported(record)
+    @guidance
+        -- Nested worker evidence whose source baseline was never retained is
+        -- unverifiable in principle: no later installation and no digest the
+        -- result claims about itself can supply it. This refusal is
+        -- permanent and the job is never marked processed.
+}
+
+rule RefuseRetiredNativeSubmission {
+    when: RequestNativeRun(caller, brief)
+
+    ensures: RetirementRefusalReported("native Codex execution is retired; use the grounded OMP Anthropic route or an OpenAI packet-only route")
+    @guidance
+        -- The refusal happens before any Weft job is created; there is no
+        -- provider escape hatch and no fallback to another lane.
+}
+
+rule ReportRetiredNativeStatus {
+    when: RunDoctor(caller)
+
+    ensures: ReadinessReportedAvailable(false)
+    @guidance
+        -- Readiness reports the retirement without probing the remote host.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UniqueTaskIdentity {
+    for a in Tasks:
+        for b in Tasks:
+            a != b implies a.id != b.id
+}
+
+invariant NoUnvalidatedOutcome {
+    for task in Tasks:
+        task.status in {completed, failed, validation_failed}
+            implies task.result != null
+}
+
+invariant SuccessRequiresWorkerAndCheck {
+    for task in Tasks:
+        task.status = completed
+            implies task.result?.worker_completed
+                and (task.check = null or task.result?.validation?.exit_code = 0)
+}
+
+invariant AppliedImpliesCompletedAndBackedUp {
+    for task in Tasks:
+        task.status = applied
+            implies task.result?.status = completed
+                and task.backup != null
+}
+
+invariant RelayProvenanceComplete {
+    for session in RelaySessions:
+        for call in session.read_calls:
+            call.is_error or call.served_paths.count > 0
+}
+
+invariant HistoricalRefusalsNeverProcessed {
+    for record in HistoricalJobs:
+        record.status = refused implies record.processed_at = null
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface TaskControl {
+    facing caller: Principal
+    context task: Task
+
+    exposes:
+        task.status
+        task.job?.status
+        task.prior_job_ids
+        task.error
+        task.result?.status
+        task.result?.validation
+
+    provides:
+        SubmitTask(caller, project, brief, selector, check, timeout, requested_id?)
+        ObserveTask(caller, task)
+        ResumeTask(caller, task)
+        CancelTask(caller, task)
+        RetrieveTaskResult(caller, task)
+        ApplyTaskResult(caller, task)
+
+    contracts:
+        fulfils EvidenceContract
+
+    @guarantee EvidenceBasedStatus
+        -- Status is asserted only from validated task results. Job
+        -- completion, exit codes, and absence of failure never establish
+        -- success; unreadable or ambiguous evidence reports unknown or
+        -- failed_without_result with a diagnostic.
+    @guarantee NoLocalFallback
+        -- A submission failure never falls back to local execution; the
+        -- identity and its request are retained for explicit resume.
+}
+
+surface WorkerExecution {
+    facing task_worker: Principal
+    context task: Task
+
+    provides:
+        WorkerExecutionBegan(task, payload)
+
+    contracts:
+        demands EvidenceContract
+
+    @guarantee SnapshotOnly
+        -- The worker sees exactly the snapshot the baseline describes, under
+        -- a workspace-write policy that admits no shell; anything else it
+        -- might reach is outside this specification's grant.
+}
+
+surface RelayLaunch {
+    facing caller: Principal
+
+    provides:
+        StartRelay(caller, project, prompt, timeout, detached, host?)
+        CancelRelay(caller, session)
+
+    contracts:
+        fulfils EvidenceContract
+
+    @guarantee AttachedOnly
+        -- The command stays in the foreground; the remote process tree dies
+        -- with it. Detachment is refused; there is no job id and no resume.
+    @guarantee BlankRoom
+        -- The remote runtime discovers nothing on its own: built-in tools,
+        -- extensions, skills, rules, sessions, and terminals are disabled
+        -- twice, and only the explicitly shipped project instructions and
+        -- prompt reach it, with digests recorded.
+}
+
+surface RelayToolAccess {
+    facing remote_agent: Principal
+    context session: RelaySession
+
+    exposes:
+        session.project.root
+
+    provides:
+        ReviewToolCall(caller, session, tool, args)
+
+    contracts:
+        demands EvidenceContract
+
+    @guarantee Confinement
+        -- Exactly the three sanctioned tools are registered; paths resolve
+        -- inside the project root; reads, matches, traversals, argument and
+        -- result sizes, and wall time are bounded; text-only inputs; any
+        -- violation refuses rather than degrades, and a remote failure never
+        -- enables remote tools.
+    @guarantee LiveTreeProvenance
+        -- The tree is live, so two reads may observe different revisions;
+        -- the record therefore claims snapshot equivalence never, and serves
+        -- per-call provenance for every byte actually delivered.
+}
+
+surface RelayBridge {
+    facing relay_bridge: Principal
+    context session: RelaySession
+
+    provides:
+        RelayResultFrameReceived(session, frame)
+        RelayFailureObserved(session, reason)
+
+    contracts:
+        fulfils EvidenceContract
+
+    @guarantee StreamFidelity
+        -- The result frame must equal the streamed event record exactly; a
+        -- bridge that exits without a result frame is refused as a partial
+        -- stream and is never treated as an outcome.
+}
+
+surface HistoricalArchive {
+    facing caller: Principal
+    context record: HistoricalJob
+
+    exposes:
+        record.job?.status
+        record.status
+        record.refusal_reason
+        record.result?.report
+
+    provides:
+        RetrieveHistoricalJob(caller, record, mark_processed)
+        InspectWeftJob(caller, record.job)
+        RequestNativeRun(caller, brief)
+        RunDoctor(caller)
+
+    contracts:
+        fulfils EvidenceContract
+
+    @guarantee UnverifiableEvidenceIsTerminal
+        -- Nested worker evidence without a retained source baseline is
+        -- refused at every retrieval, by every later installation, forever;
+        -- the artifacts stay available in Weft and the job is never marked
+        -- processed.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Is the title suppression flag part of the attested blank-room disable set? The bridge enforces eight disable flags, the conductor attests seven."
+open question "Is a relay result record written when the bridge fails before the ready frame, or only for streams that reached a result?"
