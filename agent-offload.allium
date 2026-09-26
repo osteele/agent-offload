@@ -610,21 +610,17 @@ rule ServeConfinedToolCall {
         -- schemes, parent traversal, and symlink escapes are refused, and a
         -- missing path reports confinement rather than filesystem detail.
     requires: serves_regular_text(args, config.relay_max_read_bytes)
-    ensures:
-        for served in served_inputs(args):
-            session.read_calls = session.read_calls
-                + ToolCall{
-                    tool: tool,
-                    is_error: false,
-                    served_paths: [
-                        ServedPath{
-                            path: served.path,
-                            content_digest: served.digest,
-                            byte_count: served.bytes,
-                            truncated: served.truncated
-                        }
-                    ]
-                }
+    ensures: session.read_calls = session.read_calls
+        + ToolCall{
+            tool: tool,
+            is_error: false,
+            -- Exactly one ToolCall per relay call, including a no-match call:
+            -- an empty glob or a grep with no hits records an empty
+            -- served_paths list and is a successful result. Each served path
+            -- carries the real path, the digest of the exact bytes served,
+            -- the byte count, and whether truncation cut the output.
+            served_paths: ServedEvidence.of(args),
+        }
     ensures: ToolResultReturned(session, within_result_bound(config.relay_max_result_bytes))
     @guidance
         -- Every file whose bytes were served carries provenance: real path,
@@ -632,8 +628,6 @@ rule ServeConfinedToolCall {
         -- matching file contributing matches that were cut by the output
         -- bound is still recorded. A call that matches nothing records an
         -- empty served_paths list and is a successful result, not an error.
-        -- Open item: the rule should record exactly one ToolCall per relay
-        -- call, including no-match calls whose served_paths list is empty.
 }
 
 rule CompleteRelaySession {
