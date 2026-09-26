@@ -38,6 +38,8 @@ Install matching agent-offload and agent-execution versions on the submitting ma
 agent-host-sync --account agent apply --stage tools --tool agent-offload
 ```
 
+Verify a deployment by comparing identities, not by reading files. `agent-offload-worker identity` prints the deployed package's `source_sha256` and `build_id`; run it on the submitting machine and on the host, and require equal `source_sha256` — equal digests mean byte-identical deployed code. On a host served by `agent-host-sync`, the live code is what `~/.local/state/agent-host-sync/builds/<tool>/current/` resolves to, and the entry points under `~/.local/bin` must resolve through that pointer. A stale `~/.local/share/uv/tools/<tool>/` environment can still exist from an earlier install and answer with old bytes; do not verify by grepping package files or reading any path you did not resolve through the build pointer.
+
 ## Historical report jobs
 
 The historical lane validates and retrieves results from report-only
