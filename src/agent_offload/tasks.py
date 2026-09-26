@@ -146,6 +146,13 @@ def submit(
             "so the check would fail remotely after the writer has finished. Use "
             f"{WORKSPACE_LANE} for projects with external path dependencies"
         )
+    # Strict provenance pinning is the default, ratified 2026-09-26: a dispatch
+    # is bound to the exact tooling bytes that produced it, and a mismatch is
+    # refused rather than warned about. The rejected alternative -- warn-and-
+    # continue -- would convert the provenance guarantee behind task
+    # retrieve/apply into a best-effort label that every downstream consumer
+    # inherits. The refusal is cheap: surfaced as failed_without_result before
+    # real work, retryable via `task resume` after `agent-host-sync`.
     bundled_execution = source_sha256()
     installed_execution = installed_execution_source_sha256()
     if installed_execution is not None and installed_execution != bundled_execution:
@@ -510,6 +517,13 @@ def retrieve(record: dict, *, include_diff: bool = True) -> dict:
         or worker.worker_protocol_version != WORKER_PROTOCOL_VERSION
         or worker.worker_source_sha256 != request["execution_sha256"]
     ):
+        # Strict provenance pinning is the default, ratified 2026-09-26: a dispatch
+        # is bound to the exact tooling bytes that produced it, and a mismatch is
+        # refused rather than warned about. The rejected alternative -- warn-and-
+        # continue -- would convert the provenance guarantee behind task
+        # retrieve/apply into a best-effort label that every downstream consumer
+        # inherits. Unlike the earlier gates, this refusal is a hard error at
+        # retrieve time: a mismatched result is never accepted.
         raise TaskError("worker identity differs from the retained dispatch")
     if worker.status == "completed":
         validate_omp_transcript(

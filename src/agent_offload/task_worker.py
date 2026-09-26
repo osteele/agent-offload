@@ -142,6 +142,13 @@ def main() -> None:
         request = object_json(data.decode(), SCHEMA)
         if request["id"] != args.task_id:
             raise TaskError("task identity mismatch")
+        # Strict provenance pinning is the default, ratified 2026-09-26: a dispatch
+        # is bound to the exact tooling bytes that produced it, and a mismatch is
+        # refused rather than warned about. The rejected alternative -- warn-and-
+        # continue -- would convert the provenance guarantee behind task
+        # retrieve/apply into a best-effort label that every downstream consumer
+        # inherits. The refusal is cheap: surfaced as failed_without_result before
+        # real work, retryable via `task resume` after `agent-host-sync`.
         if request["offload_sha256"] != package_source_sha256():
             raise TaskError("installed agent-offload differs from the submitting version")
         if request["execution_sha256"] != source_sha256():
