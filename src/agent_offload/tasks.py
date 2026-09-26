@@ -127,12 +127,11 @@ def submit(
     project = project.expanduser().resolve(strict=True)
     if not project.is_dir() or not brief.strip():
         raise TaskError("a project directory and nonempty brief are required")
-    if (
-        selector not in OMP_WRITER_SELECTORS
-        or not math.isfinite(timeout)
-        or not 1 <= timeout <= 7200
-    ):
-        raise TaskError("unsupported writer selector or timeout (1–7200 seconds)")
+    if selector not in OMP_WRITER_SELECTORS:
+        permitted = ", ".join(sorted(OMP_WRITER_SELECTORS))
+        raise TaskError(f"writer selector {selector!r} is not admitted; permitted: {permitted}")
+    if not math.isfinite(timeout) or not 1 <= timeout <= 7200:
+        raise TaskError(f"timeout {timeout!r} is outside the permitted range (1-7200 seconds)")
     with locked(identity) as directory:
         if (directory / "task.json").exists():
             raise TaskError(f"task {identity} already exists; inspect it or use task resume")

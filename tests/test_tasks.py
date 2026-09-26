@@ -414,3 +414,18 @@ def test_submit_accepts_exactly_the_listed_selectors():
         assert args.selector == selector
     with pytest.raises(SystemExit):
         parser.parse_args(["task", "submit", ".", "--prompt", "x", "--selector", "none/none"])
+
+
+def test_refused_selector_and_refused_timeout_say_which_one_failed(tmp_path):
+    from agent_execution.omp_execution import OMP_WRITER_SELECTORS
+
+    admitted = min(OMP_WRITER_SELECTORS)
+    with pytest.raises(TaskError) as refusal:
+        submit(tmp_path, "brief", host="studio", selector="none/none", timeout=60, check=[])
+    assert "none/none" in str(refusal.value)
+    assert "timeout" not in str(refusal.value)
+
+    with pytest.raises(TaskError) as refusal:
+        submit(tmp_path, "brief", host="studio", selector=admitted, timeout=99999, check=[])
+    assert "timeout" in str(refusal.value)
+    assert "selector" not in str(refusal.value)
