@@ -7,7 +7,9 @@ import fcntl
 import json
 import math
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -44,6 +46,8 @@ from .task_protocol import (
 
 DEFAULT_SELECTOR = "openai-codex/gpt-6-sol"
 HOST_SYNC = "agent-host-sync --account agent apply --stage tools --tool agent-offload"
+EXECUTION_IDENTITY_SCHEMA = "agent-execution.worker-identity/v1"
+WORKSPACE_LANE = "agent-host-sync workspace run --dependency <path> ... <command>"
 
 
 class ResultUnavailable(TaskError):
@@ -132,6 +136,26 @@ def submit(
         raise TaskError(f"writer selector {selector!r} is not admitted; permitted: {permitted}")
     if not math.isfinite(timeout) or not 1 <= timeout <= 7200:
         raise TaskError(f"timeout {timeout!r} is outside the permitted range (1-7200 seconds)")
+    # The writer cannot execute anything (workspace-write-no-shell), so only a
+    # supplied check builds remotely and only it can hit the missing dependency.
+    stale = escaping_path_dependencies(project) if check else []
+    if stale:
+        raise TaskError(
+            "project declares path dependencies outside the snapshot "
+            f"({', '.join(stale)}); the worker receives only the project directory, "
+            "so the check would fail remotely after the writer has finished. Use "
+            f"{WORKSPACE_LANE} for projects with external path dependencies"
+        )
+    bundled_execution = source_sha256()
+    installed_execution = installed_execution_source_sha256()
+    if installed_execution is not None and installed_execution != bundled_execution:
+        raise TaskError(
+            f"the installed agent-execution ({installed_execution[:12]}) differs from the "
+            f"copy bundled into this agent-offload ({bundled_execution[:12]}); the worker "
+            "would refuse the task after it queued. Reinstall agent-offload so it rebundles "
+            "the current agent-execution: `uv tool install --force --reinstall --with "
+            "../agent-execution .` in the agent-offload checkout"
+        )
     with locked(identity) as directory:
         if (directory / "task.json").exists():
             raise TaskError(f"task {identity} already exists; inspect it or use task resume")
@@ -164,6 +188,91 @@ def submit(
         # The identity and immutable request survive an interrupted submission.
         save(directory / "task.json", record)
         return send(record, directory)
+
+
+def installed_execution_source_sha256() -> str | None:
+    """Source digest reported by the installed agent-execution worker, if any.
+
+    agent-offload's tool environment bundles its own agent-execution copy
+    (``uv tool install --with ../agent-execution``), and reinstalling
+    agent-execution alone never refreshes that copy. The installed
+    ``agent-execution-worker`` reports the identity the remote worker compares
+    against. A missing or unreadable probe leaves the decision to the worker's
+    own refusal when the job starts.
+    """
+    executable = shutil.which("agent-execution-worker")
+    if not executable:
+        return None
+    try:
+        identity = object_json(run([executable, "identity"], timeout=15), EXECUTION_IDENTITY_SCHEMA)
+    except TaskError:
+        return None
+    observed = identity.get("source_sha256")
+    return observed if isinstance(observed, str) and len(observed) == 64 else None
+
+
+def swiftpm_path_dependencies(source: str) -> list[str]:
+    """The ``path`` argument of every ``.package(...)`` dependency in a manifest."""
+    # A commented-out dependency must not refuse a valid project.
+    source = re.sub(r"//[^\n]*", "", source)
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+    declared = []
+    position = 0
+    while (call := source.find(".package(", position)) != -1:
+        depth = 1
+        end = call + len(".package(")
+        while end < len(source) and depth:
+            if source[end] == "(":
+                depth += 1
+            elif source[end] == ")":
+                depth -= 1
+            end += 1
+        body = source[call + len(".package(") : end - 1 if depth == 0 else end]
+        declared.extend(re.findall(r'\bpath:\s*"([^"]+)"', body))
+        position = end
+    return declared
+
+
+def pyproject_path_dependencies(text: str) -> list[str]:
+    """Path dependencies declared in a pyproject.toml.
+
+    The package supports Python 3.10, where tomllib is unavailable, so this
+    covers the two local spellings textually: ``[tool.uv.sources]`` path
+    entries and ``name @ file://`` requirements. Commented lines are skipped,
+    and unexpanded placeholders such as ``${PROJECT_ROOT}`` are skipped
+    because their containment cannot be judged locally.
+    """
+    declared = []
+    in_sources = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_sources = stripped == "[tool.uv.sources]"
+            continue
+        if in_sources:
+            declared.extend(re.findall(r'\bpath\s*=\s*"([^"]+)"', stripped))
+        declared.extend(re.findall(r'"[^"]*@ file://([^"]+)"', stripped))
+    return [entry for entry in declared if "${" not in entry]
+
+
+def escaping_path_dependencies(project: Path) -> list[str]:
+    """Declared local path dependencies the project-only source snapshot cannot carry.
+
+    The worker builds inside a snapshot of the project directory alone, so a
+    SwiftPM ``.package(path:)`` or a pyproject path source resolving outside it
+    is missing remotely and fails the check after the writer has finished.
+    Dependencies inside the project travel with the snapshot.
+    """
+    declared: list[str] = []
+    package = project / "Package.swift"
+    if package.is_file():
+        declared.extend(swiftpm_path_dependencies(package.read_text()))
+    pyproject = project / "pyproject.toml"
+    if pyproject.is_file():
+        declared.extend(pyproject_path_dependencies(pyproject.read_text()))
+    return [entry for entry in declared if not (project / entry).resolve().is_relative_to(project)]
 
 
 def snapshot_names(project: Path) -> list[str]:

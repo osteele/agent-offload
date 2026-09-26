@@ -24,6 +24,8 @@ The default writer is `openai-codex/gpt-6-sol` through OMP. Use `--selector open
 
 Checks must preserve ordinary source files and their permissions. Edits, additions, and deletions made by a check fail the task, even with exit zero. Excluded caches such as `__pycache__` may change.
 
+The snapshot carries only the project directory. A `--check` run is refused when the project's `Package.swift` or `[tool.uv.sources]` path dependencies resolve outside it; without `--check` nothing builds remotely and such projects are accepted — run check-dependent projects in the workspace lane (`agent-host-sync workspace run --dependency <path> ...`). Submit also compares the agent-execution copy bundled into agent-offload against the installed `agent-execution-worker` and refuses a stale bundle with a reinstall hint, instead of queueing a task the worker would refuse.
+
 ## Retrieve and verify
 
 ```sh

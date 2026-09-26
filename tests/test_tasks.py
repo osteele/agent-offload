@@ -429,3 +429,168 @@ def test_refused_selector_and_refused_timeout_say_which_one_failed(tmp_path):
         submit(tmp_path, "brief", host="studio", selector=admitted, timeout=99999, check=[])
     assert "timeout" in str(refusal.value)
     assert "selector" not in str(refusal.value)
+
+
+def identity_stub(tmp_path, source_sha256: str) -> None:
+    """Add an agent-execution-worker identity probe beside the fake rg/weft tools."""
+    import shlex
+
+    payload = json.dumps(
+        {"schema_version": "agent-execution.worker-identity/v1", "source_sha256": source_sha256}
+    )
+    worker = tmp_path / "bin" / "agent-execution-worker"
+    worker.write_text(f"#!/bin/sh\n/bin/echo {shlex.quote(payload)}\n")
+    worker.chmod(0o755)
+
+
+def bare_project(tmp_path, monkeypatch) -> Path:
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "hello.py").write_text("hello")
+    return project
+
+
+def test_submit_refuses_a_stale_bundled_agent_execution(tmp_path, monkeypatch):
+    project = bare_project(tmp_path, monkeypatch)
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
+    identity_stub(tmp_path, "0" * 64)
+    with pytest.raises(TaskError, match="bundled into this agent-offload") as refusal:
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity="stale",
+        )
+    assert "uv tool install" in str(refusal.value)
+    assert not (tmp_path / "state" / "tasks" / "stale").exists()
+
+
+def test_submit_accepts_an_installed_agent_execution_matching_the_bundle(tmp_path, monkeypatch):
+    from agent_execution.identity import source_sha256
+
+    project = bare_project(tmp_path, monkeypatch)
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
+    identity_stub(tmp_path, source_sha256())
+    # The weft stub refuses every run, so reaching it proves the probe passed.
+    with pytest.raises(TaskError, match="resume this identity"):
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity="matching",
+        )
+
+
+def test_submit_refuses_swiftpm_path_dependencies_outside_the_project(tmp_path, monkeypatch):
+    project = bare_project(tmp_path, monkeypatch)
+    (project / "Package.swift").write_text(
+        "// swift-tools-version:5.9\n"
+        "dependencies = [\n"
+        '  .package(path: "../workflow-state"),\n'
+        '  // .package(path: "../commented-out"),\n'
+        '  .package(url: "https://github.com/apple/swift-argument-parser", from: "1.0.0"),\n'
+        "]\n"
+    )
+    with pytest.raises(TaskError) as refusal:
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=["just", "check"],
+            identity="swift",
+        )
+    assert "../workflow-state" in str(refusal.value)
+    assert "commented-out" not in str(refusal.value)
+    assert "agent-host-sync workspace run --dependency" in str(refusal.value)
+    # Without a check nothing builds remotely, so the manifest is accepted.
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
+    with pytest.raises(TaskError, match="resume this identity"):
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity="swift-no-check",
+        )
+
+
+def test_submit_allows_path_dependencies_inside_the_project(tmp_path, monkeypatch):
+    project = bare_project(tmp_path, monkeypatch)
+    (project / "Package.swift").write_text(
+        'dependencies = [\n  .package(path: "Packages/Helper"),\n]\n'
+    )
+    (project / "Packages" / "Helper").mkdir(parents=True)
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
+    # The weft stub refuses every run, so reaching it proves the manifest passed.
+    with pytest.raises(TaskError, match="resume this identity"):
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity="contained",
+        )
+
+
+def test_submit_refuses_pyproject_path_sources_outside_the_project(tmp_path, monkeypatch):
+    project = bare_project(tmp_path, monkeypatch)
+    (project / "pyproject.toml").write_text(
+        "[project]\n"
+        'name = "sample"\n'
+        'dependencies = ["sample-lib @ file:///opt/outside"]\n'
+        "\n"
+        "[tool.uv.sources]\n"
+        'sample-lib = { path = "../sample-lib" }\n'
+    )
+    with pytest.raises(TaskError) as refusal:
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=["just", "check"],
+            identity="python",
+        )
+    assert "../sample-lib" in str(refusal.value)
+    assert "/opt/outside" in str(refusal.value)
+
+
+def test_submit_ignores_commented_and_placeholder_pyproject_paths(tmp_path, monkeypatch):
+    project = bare_project(tmp_path, monkeypatch)
+    (project / "pyproject.toml").write_text(
+        "[project]\n"
+        'name = "sample"\n'
+        '# dependencies = ["gone @ file:///opt/commented"]\n'
+        'dependencies = ["local @ file:///${PROJECT_ROOT}/packages/local"]\n'
+        "\n"
+        "[tool.uv.sources]\n"
+        '# local = { path = "../commented" }\n'
+        'local = { path = "packages/local" }\n'
+    )
+    (project / "packages" / "local").mkdir(parents=True)
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
+    # The weft stub refuses every run, so reaching it proves no path was refused.
+    with pytest.raises(TaskError, match="resume this identity"):
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=["just", "check"],
+            identity="placeholders",
+        )
