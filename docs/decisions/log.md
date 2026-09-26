@@ -12,6 +12,8 @@ decision-records skill; a full record needs Oliver's explicit confirmation.
   `task retrieve`/`apply` results attributable to exact tooling bytes,
   accepting a wasted queue slot per skew and keeping host updates in the
   manual `agent-host-sync` lane (agent-host-sync decision 0001: never mutate
-  an installed path in place). Ratified by Oliver in the agent-offload
-  session; enforcement sites are `tasks.py` submit preflight and retrieval,
+  an installed path in place). Ratified by Oliver on 2026-09-26
+  (relayed by Noble Harmonica; which live session hosted the ratification is
+  not established, and at least two agent-offload sessions exist). Enforcement
+  sites are `tasks.py` submit preflight and retrieval,
   and `task_worker.py` worker start.
