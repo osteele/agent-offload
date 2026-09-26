@@ -408,6 +408,12 @@ rule MarkFailedJob {
     @guidance
         -- The diagnostic carries the job's exit code and the tail of the job
         -- log, with a hint to update the worker host and resume.
+        -- Implementation delta: the current code maps only `failed` jobs
+        -- through this rule. Weft's `dead` and `killed` statuses pass through
+        -- `task status` unmapped, as do `canceled` and `cancelled`, and a
+        -- failed job whose publication reports ready but whose result cannot
+        -- be read resolves to `unknown` rather than
+        -- `failed_without_result`.
 }
 
 rule ValidateRetrievedResult {
@@ -624,7 +630,10 @@ rule ServeConfinedToolCall {
         -- Every file whose bytes were served carries provenance: real path,
         -- content digest of the exact bytes, byte count, truncation. A
         -- matching file contributing matches that were cut by the output
-        -- bound is still recorded.
+        -- bound is still recorded. A call that matches nothing records an
+        -- empty served_paths list and is a successful result, not an error.
+        -- Open item: the rule should record exactly one ToolCall per relay
+        -- call, including no-match calls whose served_paths list is empty.
 }
 
 rule CompleteRelaySession {
@@ -687,6 +696,10 @@ rule ValidateHistoricalJob {
     requires: record.job?.status in {completed, failed, dead, canceled, cancelled, killed}
     requires: declared_artifacts(record.job) = {"task result artifact", "report artifact"}
     requires: record.job?.source_pin != null
+        -- Implementation delta: the CLI retrieval path does not enforce the
+        -- source pin; it validates the task id against the artifact name,
+        -- the pinned provider, mode and selector, and a report digest for
+        -- completed results.
     requires: envelope_identity_matches(envelope, record.expected_task_id)
         -- provider and mode pinned to the retired report lane, selector
         -- pinned to config.historical_selector, task id and prompt digest
@@ -695,6 +708,12 @@ rule ValidateHistoricalJob {
         and not envelope.nested_source_digest_retained)
     requires: envelope.status != completed
         or (length(envelope.report) > 0 and envelope.snapshot_preserved)
+        -- Implementation delta: a completed envelope always requires
+        -- completed nested evidence, so on the CLI path a completed result
+        -- without a retained nested baseline refuses under
+        -- RefuseUnverifiableHistoricalEvidence; and the processed
+        -- transition happens only when Weft accepts the mark-processed
+        -- request.
     ensures: HistoricalResult.created(
         record: record,
         envelope_status: envelope.status,
@@ -784,7 +803,13 @@ invariant AppliedImpliesCompletedAndBackedUp {
 invariant RelayProvenanceComplete {
     for session in RelaySessions:
         for call in session.read_calls:
-            call.is_error or call.served_paths.count > 0
+            for served in call.served_paths:
+                served.content_digest != null
+                    -- Provenance is required for every path whose bytes were
+                    -- actually served. A call that matched nothing records an
+                    -- empty served_paths list and is a successful result, not
+                    -- an error: an empty glob or a grep with no hits returns
+                    -- its explanatory content with nothing served.
 }
 
 invariant HistoricalRefusalsNeverProcessed {
