@@ -151,8 +151,9 @@ def submit(
     # refused rather than warned about. The rejected alternative -- warn-and-
     # continue -- would convert the provenance guarantee behind task
     # retrieve/apply into a best-effort label that every downstream consumer
-    # inherits. The refusal is cheap: surfaced as failed_without_result before
-    # real work, retryable via `task resume` after `agent-host-sync`.
+    # inherits. This preflight refusal stops the task before any Weft job
+    # exists; after `agent-host-sync`, submitting again is a plain `task
+    # submit` (or `task resume` when a retained identity exists).
     bundled_execution = source_sha256()
     installed_execution = installed_execution_source_sha256()
     if installed_execution is not None and installed_execution != bundled_execution:
