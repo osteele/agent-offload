@@ -116,6 +116,14 @@ def read_record(identity: str) -> dict:
     return object_json((state_root() / task_id(identity) / "task.json").read_text(), SCHEMA)
 
 
+def task_title(brief: str) -> str:
+    """Use the first non-blank brief line as a readable Weft description."""
+    first = next((line.strip() for line in brief.splitlines() if line.strip()), "")
+    title = re.sub(r"^#+\s+", "", first)
+    title = re.sub(r"^Task:\s*", "", title, flags=re.IGNORECASE).strip()
+    return (title or first or "Untitled task")[:160]
+
+
 def submit(
     project: Path,
     brief: str,
@@ -186,7 +194,7 @@ def submit(
             "id": identity,
             "project": str(project),
             "host": host,
-            "title": brief.splitlines()[0][:160],
+            "title": task_title(brief),
             "created_at": time.time(),
             "status": "submitting",
             "job_id": None,
@@ -342,8 +350,6 @@ def send(record: dict, directory: Path) -> dict:
                 "inventory",
                 "--tag",
                 "agent-offload-task",
-                "--project",
-                "agent-offload",
                 "--idempotency-key",
                 idempotency_key(record),
                 "--output",

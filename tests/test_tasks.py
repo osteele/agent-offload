@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shlex
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -13,7 +15,24 @@ from agent_offload.task_protocol import (
     safe_path,
     validate_changes,
 )
-from agent_offload.tasks import apply_changes, locked, read_record, submit
+from agent_offload.tasks import apply_changes, locked, read_record, submit, task_title
+
+
+@pytest.mark.parametrize(
+    "brief,expected",
+    [
+        ("Fix hello\nMore detail", "Fix hello"),
+        ("# Task: Fix hello", "Fix hello"),
+        ("## task:   Fix hello", "Fix hello"),
+        ("  \n\n  # Task: Fix hello  \nDetails", "Fix hello"),
+        ("a" * 161, "a" * 160),
+        ("#", "#"),
+        ("  \n\t ", "Untitled task"),
+        ("# Task:  ", "# Task:"),
+    ],
+)
+def test_task_title(brief, expected):
+    assert task_title(brief) == expected
 
 
 def test_worker_census_failure_is_retrievable(tmp_path, monkeypatch):
@@ -294,6 +313,39 @@ def test_baseline_requires_weft_source_exclusions(tmp_path, monkeypatch):
             check=[],
             identity="uninspected",
         )
+
+
+def test_submission_uses_repository_project_and_clean_title(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "hello.py").write_text("hello")
+    arguments = tmp_path / "weft-argv"
+    fake_tools(
+        tmp_path,
+        monkeypatch,
+        files=["hello.py"],
+        excludes=[".git"],
+        run=f"printf '%s\\n' \"$@\" > {shlex.quote(str(arguments))}\nexit 1",
+    )
+    with pytest.raises(TaskError, match="resume this identity"):
+        submit(
+            project,
+            "\n# Task: Fix hello\nUpdate hello.py",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity="readable",
+        )
+    argv = arguments.read_text().splitlines()
+    assert argv[0] == "run"
+    assert "--project" not in argv
+    pairs = list(pairwise(argv))
+    assert ("--tag", "inventory") in pairs
+    assert ("--tag", "agent-offload-task") in pairs
+    assert argv[argv.index("-m") + 1] == "Fix hello"
+    assert read_record("readable")["title"] == "Fix hello"
 
 
 def test_submission_timeout_retains_identity_and_request(tmp_path, monkeypatch):
