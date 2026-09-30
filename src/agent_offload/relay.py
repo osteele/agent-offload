@@ -19,14 +19,17 @@ itself.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 import queue
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -72,11 +75,12 @@ RELAY_SOURCE_FILES = (
     "relay_runtime/lifeline.ts",
     "relay_runtime/package.json",
     "relay_runtime/relay_bridge.ts",
+    "relay_runtime/remote_argv.ts",
 )
 
 
-def relay_source_sha256() -> str:
-    package_root = Path(__file__).resolve().parent
+def relay_source_sha256(root: Path | None = None) -> str:
+    package_root = root if root is not None else Path(__file__).resolve().parent
     digest = hashlib.sha256()
     for relative in RELAY_SOURCE_FILES:
         encoded_path = relative.encode()
@@ -210,13 +214,37 @@ def shutil_which(name: str) -> str | None:
 
 
 def _ensure_runtime(runtime_dir: Path) -> Path:
+    package_root = runtime_dir.parent
     bridge = runtime_dir / BRIDGE_FILENAME
     if not bridge.is_file():
         raise RelayError(f"relay bridge missing: {bridge}")
-    package_dir = (
-        runtime_dir / "node_modules" / RUNTIME_PACKAGE.split("/")[0] / RUNTIME_PACKAGE.split("/")[1]
+    expected = relay_source_sha256(package_root)
+    cache_parent = (
+        Path(os.environ.get("AGENT_OFFLOAD_STATE", Path.home() / ".local/state/agent-offload"))
+        / "relay-runtime"
     )
-    if not package_dir.is_dir():
+    cached_root = cache_parent / expected
+    package_parts = RUNTIME_PACKAGE.split("/")
+
+    def cached_bridge() -> Path:
+        actual = relay_source_sha256(cached_root)
+        if actual != expected:
+            raise RelayError(f"relay runtime source mismatch: package {expected}, cache {actual}")
+        cached_runtime = cached_root / "relay_runtime"
+        if not (cached_runtime / "node_modules" / Path(*package_parts)).is_dir():
+            raise RelayError(f"relay runtime dependencies missing: {cached_runtime}")
+        return cached_runtime / BRIDGE_FILENAME
+
+    if cached_root.exists():
+        return cached_bridge()
+
+    cache_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{expected}.", dir=cache_parent))
+    try:
+        for relative in RELAY_SOURCE_FILES:
+            target = temporary / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(package_root / relative, target)
         bun = _require_bun()
         print(
             "relay: installing pinned bridge runtime (bun install --frozen-lockfile)",
@@ -224,7 +252,7 @@ def _ensure_runtime(runtime_dir: Path) -> Path:
         )
         completed = subprocess.run(
             [bun, "install", "--frozen-lockfile"],
-            cwd=runtime_dir,
+            cwd=temporary / "relay_runtime",
             capture_output=True,
             text=True,
             timeout=300,
@@ -234,7 +262,19 @@ def _ensure_runtime(runtime_dir: Path) -> Path:
             raise RelayError(
                 "bridge runtime install failed: " + (completed.stderr or completed.stdout)[-400:]
             )
-    return bridge
+        staged = relay_source_sha256(temporary)
+        if staged != expected:
+            raise RelayError(f"relay runtime source mismatch: package {expected}, cache {staged}")
+        # Rename only a fully installed tree. A competing publisher may win first.
+        try:
+            os.replace(temporary, cached_root)
+        except OSError as error:
+            if error.errno not in (errno.EEXIST, errno.ENOTEMPTY) or not cached_root.is_dir():
+                raise
+        return cached_bridge()
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
 
 
 def _terminate_group(process: subprocess.Popen[str]) -> None:
@@ -303,9 +343,9 @@ def run_relay(
     if not project_root.is_dir():
         raise RelayError(f"project is not a directory: {project_root}")
     bun = _require_bun()
+    relay_source_before = relay_source_sha256()
     runtime_dir = Path(__file__).resolve().parent / "relay_runtime"
     bridge = _ensure_runtime(runtime_dir)
-    relay_source_before = relay_source_sha256()
 
     context_blocks = _local_context(project_root)
     system_prompt = "\n\n".join(

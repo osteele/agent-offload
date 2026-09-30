@@ -104,7 +104,9 @@ runtime runs on a remote SSH host (default `agent@studio`) through OMP's
 maintained RPC client, while its three tools — `review_read`, `review_glob`,
 `review_grep` — execute **on this machine, against the live project root**.
 The purpose is moving agent-process memory off the laptop without giving up
-grounded access to the working tree.
+grounded access to the working tree. The Bun relay runtime is cached under
+`$AGENT_OFFLOAD_STATE/relay-runtime/<relay-source-digest>/` (default state root:
+`~/.local/state/agent-offload`), outside the installed package.
 
 ```sh
 agent-offload relay /path/to/project --prompt "Map the auth flow" --timeout 600

@@ -28,6 +28,7 @@ import {
 	type ToolOutput,
 } from "./confinement.js";
 import { failedTurnMessage } from "./event_failure.js";
+import { buildRemoteArgv, REMOTE_DISABLE_FLAGS, shellQuote } from "./remote_argv.js";
 
 const HOST_TOOLS = ["review_read", "review_glob", "review_grep"] as const;
 const RELAY_PROVIDER = "anthropic";
@@ -36,19 +37,6 @@ const BRIDGE_SCHEMA = "agent-offload.relay-bridge/v1";
 const REQUEST_SCHEMA = "agent-offload.relay-request/v1";
 const SDK_VERSION = "18.2.10";
 const SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
-
-/** Remote surfaces the relay agent must never reach. Enforced twice: as omp
- * CLI flags and through a config overlay written to the remote scratch. */
-const REMOTE_DISABLE_FLAGS = [
-	"--no-tools",
-	"--no-lsp",
-	"--no-extensions",
-	"--no-skills",
-	"--no-rules",
-	"--no-session",
-	"--no-pty",
-	"--no-title",
-] as const;
 
 const REMOTE_DISABLE_CONFIG = `goal:
   enabled: false
@@ -145,10 +133,6 @@ function sshCapture(host: string, remoteCommand: string, signal: AbortSignal): P
 			},
 		);
 	});
-}
-
-function shellQuote(value: string): string {
-	return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 function buildHostTools(request: RelayRequest) {
@@ -353,15 +337,6 @@ async function main(): Promise<number> {
 			return 4;
 		}
 
-		const buildRemoteArgv = (agentArgs: string[]): string => {
-			const parts = [...agentArgs];
-			for (const flag of REMOTE_DISABLE_FLAGS) {
-				if (!parts.includes(flag)) parts.push(flag);
-			}
-			const remote = ["exec", ompBin, ...parts];
-			return `cd ${shellQuote(scratch)} && ${remote.map(shellQuote).join(" ")}`;
-		};
-
 		const hostTools = buildHostTools(request);
 		const rpc = new RpcClient({
 			customTools: hostTools,
@@ -373,7 +348,7 @@ async function main(): Promise<number> {
 				"relay-disable-overlay.yml",
 			],
 			command: (agentArgs: string[]) => {
-				lastRemoteArgv = buildRemoteArgv(agentArgs);
+				lastRemoteArgv = buildRemoteArgv(scratch, ompBin, agentArgs);
 				return ["ssh", ...SSH_OPTS, request.host_target, lastRemoteArgv];
 			},
 		});

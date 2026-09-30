@@ -30,11 +30,22 @@ class ProtocolError(ValueError):
     """A remote artifact does not satisfy the agent-offload protocol."""
 
 
-def package_source_sha256() -> str:
-    package_root = Path(__file__).resolve().parent
+def source_sha256(package_root: Path) -> str:
+    """Hash package Python source, excluding hidden paths and installed node_modules.
+
+    Relay dependency installs must not change the worker's source identity.
+    """
     digest = hashlib.sha256()
     for path in sorted(
-        package_root.rglob("*.py"), key=lambda item: item.relative_to(package_root).as_posix()
+        (
+            path
+            for path in package_root.rglob("*.py")
+            if all(
+                part != "node_modules" and not part.startswith(".")
+                for part in path.relative_to(package_root).parts
+            )
+        ),
+        key=lambda item: item.relative_to(package_root).as_posix(),
     ):
         relative = path.relative_to(package_root).as_posix().encode()
         payload = path.read_bytes()
@@ -43,6 +54,10 @@ def package_source_sha256() -> str:
         digest.update(len(payload).to_bytes(8, "big"))
         digest.update(payload)
     return digest.hexdigest()
+
+
+def package_source_sha256() -> str:
+    return source_sha256(Path(__file__).resolve().parent)
 
 
 #: Depth bound for the walk that locates an installed build's marker. The

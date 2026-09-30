@@ -591,8 +591,11 @@ rule StartRelay {
         )
     ensures: RemoteBlankRoomConfigured(session)
     @guidance
+        -- The relay runtime is materialized outside the installed package
+        -- under the state root, keyed by its relay source digest.
         -- The remote runtime is stripped twice: harness flags in the remote
         -- argv and a disable overlay written to a fresh scratch directory.
+        -- The remote shell removes that exact scratch directory on exit.
         -- The remote side discovers no project context of its own; it
         -- receives only the explicitly shipped project instructions and the
         -- prompt, both digested. The bridge reads one newline-terminated

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -215,6 +216,73 @@ def fake_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         lambda bun, bridge: [sys.executable, str(bridge)],
     )
     return script
+
+
+@pytest.fixture
+def runtime_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Path]:
+    package_root = tmp_path / "package"
+    source_root = Path(relay_module.__file__).resolve().parent
+    for relative in relay_module.RELAY_SOURCE_FILES:
+        target = package_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_root / relative, target)
+    state = tmp_path / "state"
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(state))
+    count = tmp_path / "installs"
+    monkeypatch.setenv("FAKE_INSTALL_COUNT", str(count))
+    installer = tmp_path / "fake-bun"
+    installer.write_text(
+        f"#!{sys.executable}\n"
+        "import os, pathlib, sys\n"
+        "count = pathlib.Path(os.environ['FAKE_INSTALL_COUNT'])\n"
+        "count.write_text(count.read_text() + 'x' if count.exists() else 'x')\n"
+        "if os.environ.get('FAKE_INSTALL_FAIL'): sys.exit(1)\n"
+        "pathlib.Path('node_modules/@oh-my-pi/pi-coding-agent').mkdir(parents=True)\n"
+    )
+    installer.chmod(0o755)
+    monkeypatch.setattr(relay_module, "_require_bun", lambda: str(installer))
+    return package_root / "relay_runtime", state, count
+
+
+def test_runtime_installs_outside_package_and_reuses_cache(
+    runtime_setup: tuple[Path, Path, Path],
+) -> None:
+    runtime_dir, state, count = runtime_setup
+    bridge = relay_module._ensure_runtime(runtime_dir)
+    digest = relay_module.relay_source_sha256(runtime_dir.parent)
+    assert bridge == state / "relay-runtime" / digest / "relay_runtime" / "relay_bridge.ts"
+    assert bridge.is_file()
+    assert not (runtime_dir / "node_modules").exists()
+    assert count.read_text() == "x"
+    assert relay_module._ensure_runtime(runtime_dir) == bridge
+    assert count.read_text() == "x"
+
+
+def test_runtime_refuses_changed_cached_source(
+    runtime_setup: tuple[Path, Path, Path],
+) -> None:
+    runtime_dir, _, count = runtime_setup
+    bridge = relay_module._ensure_runtime(runtime_dir)
+    expected = relay_module.relay_source_sha256(runtime_dir.parent)
+    bridge.write_text("tampered")
+    actual = relay_module.relay_source_sha256(bridge.parents[1])
+    with pytest.raises(relay_module.RelayError, match=f"package {expected}, cache {actual}"):
+        relay_module._ensure_runtime(runtime_dir)
+    assert count.read_text() == "x"
+
+
+def test_failed_install_does_not_publish_cache(
+    runtime_setup: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_dir, state, count = runtime_setup
+    monkeypatch.setenv("FAKE_INSTALL_FAIL", "1")
+    digest = relay_module.relay_source_sha256(runtime_dir.parent)
+    with pytest.raises(relay_module.RelayError, match="bridge runtime install failed"):
+        relay_module._ensure_runtime(runtime_dir)
+    assert not (state / "relay-runtime" / digest).exists()
+    assert list((state / "relay-runtime").iterdir()) == []
+    assert not (runtime_dir / "node_modules").exists()
+    assert count.read_text() == "x"
 
 
 def _relay_namespace(**overrides: object) -> argparse.Namespace:
