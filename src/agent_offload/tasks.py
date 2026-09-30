@@ -403,9 +403,28 @@ def check_baseline_unchanged(record: dict) -> None:
         raise TaskError("project changed since submission; inspect Weft before resuming")
 
 
+def check_submitter_unchanged(record: dict) -> None:
+    changed = []
+    for name, key, current in (
+        ("agent-offload", "offload_sha256", package_source_sha256()),
+        ("agent-execution", "execution_sha256", source_sha256()),
+    ):
+        retained = record["request"][key]
+        if retained != current:
+            changed.append(
+                f"{name} digest changed (retained {retained[:12]}, current {current[:12]})"
+            )
+    if changed:
+        raise TaskError(
+            f"{'; '.join(changed)}; a retained request cannot be resumed after the submitting "
+            "code changed. Submit a new task for the same brief"
+        )
+
+
 def resubmit(record: dict, directory: Path) -> dict:
     """Submit the retained request again after its job failed without a result."""
     check_baseline_unchanged(record)
+    check_submitter_unchanged(record)
     record.update(
         prior_job_ids=[*record.get("prior_job_ids", []), record["job_id"]],
         attempt=record.get("attempt", 1) + 1,
@@ -425,8 +444,10 @@ def unpublished_failure(record: dict, observed: dict, error: ResultUnavailable) 
     return (
         f"job {record['job_id']} failed with exit code {observed.get('exit_code')} "
         f"without publishing a task result ({error}). Job log tail:\n{log}\n"
-        f"If the worker reports a version mismatch, update the host with `{HOST_SYNC}`. "
-        f"`agent-offload task resume {record['id']}` resubmits the retained request."
+        "If the worker reports a version mismatch and the host was stale, update it with "
+        f"`{HOST_SYNC}` and resume with `agent-offload task resume {record['id']}`. "
+        "If the submitting machine's agent-offload or agent-execution changed since "
+        "submission, submit a new task instead; resume will refuse the resubmission."
     )
 
 

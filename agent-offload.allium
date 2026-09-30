@@ -341,6 +341,7 @@ rule ResumeTask {
     requires: task.job = null or task.job?.status in {failed, dead, killed}
     requires: task.job = null or not task.job?.status in {canceled, cancelled}
     requires: baseline_unchanged(task)
+    requires: task.job = null or submitter_unchanged(task)
 
     ensures:
         if task.job = null:
@@ -357,7 +358,12 @@ rule ResumeTask {
         -- idempotency identity, so Weft cannot accept a second job for it. A
         -- terminal job without a result resumes under a fresh attempt-scoped
         -- identity, keeping the task's identity while listing the earlier
-        -- job in prior_job_ids.
+        -- job in prior_job_ids. A terminal job without a result is resubmitted
+        -- only if the submitting machine's agent-offload and agent-execution
+        -- digests still equal the retained request's; otherwise the caller
+        -- submits a new task. An unresolved submission resumes regardless of
+        -- submitting code changes, to recover the accepted job under the
+        -- same identity.
 }
 
 rule CancelTask {

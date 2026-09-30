@@ -229,6 +229,7 @@ def test_failed_job_without_result_reports_definite_status(task_factory, tmp_pat
     assert "without publishing a task result" in row["error"]
     assert "installed source digest does not match" in row["error"]
     assert f"agent-offload task resume {record['id']}" in row["error"]
+    assert "submit a new task instead" in row["error"]
 
 
 @pytest.mark.parametrize(
@@ -261,6 +262,64 @@ def test_resume_resubmits_failed_job_under_new_attempt_key(task_factory, tmp_pat
     submitted = next(call for call in calls if call[0] == "run")
     assert submitted[submitted.index("--idempotency-key") + 1] == "retry-2"
     assert submitted[submitted.index("--output") + 1] == result_path("retry")
+
+
+def change_retained_digest(record, field):
+    record["request"][field] = "0" * 64
+    directory = tasks.state_root() / record["id"]
+    payload = directory / "request.json"
+    tasks.save(payload, record["request"])
+    record["request_sha256"] = digest(payload.read_bytes())
+    tasks.save(directory / "task.json", record)
+
+
+@pytest.mark.parametrize(
+    "fields,names",
+    [
+        (("offload_sha256",), ("agent-offload",)),
+        (("execution_sha256",), ("agent-execution",)),
+        (("offload_sha256", "execution_sha256"), ("agent-offload", "agent-execution")),
+    ],
+)
+def test_resume_refuses_failed_job_when_submitter_changed(
+    task_factory, tmp_path, capsys, fields, names
+):
+    record, _ = task_factory("stale-submitter")
+    unpublished_failure(tmp_path, record)
+    for field in fields:
+        change_retained_digest(record, field)
+
+    assert tasks.handler(argparse.Namespace(action="resume", id=record["id"])) == 1
+    error = capsys.readouterr().err
+    for name, field in zip(names, fields, strict=True):
+        current = package_source_sha256() if field == "offload_sha256" else source_sha256()
+        assert f"{name} digest changed (retained {'0' * 12}, current {current[:12]})" in error
+    assert "a retained request cannot be resumed after the submitting code changed" in error
+    assert "Submit a new task for the same brief" in error
+    retained = tasks.read_record(record["id"])
+    assert retained == record
+    assert retained["job_id"] == record["job_id"]
+    assert retained.get("attempt") == record.get("attempt")
+    assert retained.get("prior_job_ids") == record.get("prior_job_ids")
+    calls = [json.loads(line) for line in (tmp_path / "weft-calls").read_text().splitlines()]
+    assert not any(call[0] == "run" for call in calls)
+
+
+def test_resume_unresolved_submission_when_submitter_changed(task_factory, tmp_path, capsys):
+    record, _ = task_factory("unresolved-submitter")
+    record.update(job_id=None, status="submission_unknown")
+    change_retained_digest(record, "offload_sha256")
+
+    assert tasks.handler(argparse.Namespace(action="resume", id=record["id"])) == 0
+    row = json.loads(capsys.readouterr().out)
+    assert row["job_id"] == "wj-retry"
+    assert row["status"] == "queued"
+    retained = tasks.read_record(record["id"])
+    assert retained["job_id"] == "wj-retry"
+    assert retained.get("attempt", 1) == 1
+    calls = [json.loads(line) for line in (tmp_path / "weft-calls").read_text().splitlines()]
+    submitted = next(call for call in calls if call[0] == "run")
+    assert submitted[submitted.index("--idempotency-key") + 1] == record["id"]
 
 
 def test_resume_refuses_failed_job_when_baseline_changed(task_factory, tmp_path, capsys):
