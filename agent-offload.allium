@@ -595,8 +595,9 @@ rule StartRelay {
         -- argv and a disable overlay written to a fresh scratch directory.
         -- The remote side discovers no project context of its own; it
         -- receives only the explicitly shipped project instructions and the
-        -- prompt, both digested. The local process group owns the remote
-        -- tree; it dies with the local command.
+        -- prompt, both digested. The bridge reads one newline-terminated
+        -- request; stdin stays open as its parent lifeline. The local process
+        -- group owns the remote tree; it dies with the local command.
 }
 
 rule ServeConfinedToolCall {
@@ -677,6 +678,17 @@ rule CancelRelaySession {
     ensures: session.failure = "cancelled locally"
     ensures: remote_process_tree_terminated(session)
     ensures: RelayRecordWritten(session)
+}
+
+rule LoseRelayParent {
+    when: RelayParentExited(session)
+
+    requires: session.status = running
+    ensures: session.status = cancelled
+    ensures: session.failure = "relay parent exited"
+    ensures: remote_process_tree_terminated(session)
+    @guidance
+        -- The record writer is gone, so no relay record is written.
 }
 
 -- Historical lane

@@ -114,7 +114,8 @@ agent-offload relay . --prompt-file brief.txt --json
 Trust boundary, by contrast with `run`:
 
 - **Attached.** The command stays in the foreground; the remote process tree
-  dies with it. `--detach` is refused, there is no job id and no resume.
+  dies with it. Closing the terminal or killing the command cancels the relay
+  and stops the remote agent. `--detach` is refused, there is no job id and no resume.
 - **Not durable, not snapshot-backed.** No source snapshot leaves the laptop.
   The remote side sees project instructions and the prompt only, both sent
   explicitly with digests recorded. Because the tree is live, two reads can

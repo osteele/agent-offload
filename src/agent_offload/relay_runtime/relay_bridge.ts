@@ -3,7 +3,8 @@
  * RPC client while every tool call executes locally against the live
  * project root.
  *
- * stdin  — one versioned request JSON object (agent-offload.relay-request/v1).
+ * stdin  — one newline-terminated request (agent-offload.relay-request/v1),
+ *          kept open as the attached parent's lifeline.
  * stdout — NDJSON envelope frames (agent-offload.relay-bridge/v1) and
  *          nothing else; any stray SDK output here makes the conductor
  *          refuse the stream, which is the intended failure direction.
@@ -14,9 +15,9 @@
  * exits nonzero instead of degrading to a remotely-executed fallback.
  */
 import { defineRpcClientTool, RpcClient } from "@oh-my-pi/pi-coding-agent";
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readRequestLine, watchLifeline } from "./lifeline.js";
 import {
 	assertToolArgs,
 	ConfinementError,
@@ -81,6 +82,8 @@ function sha256(text: string): string {
 	return createHash("sha256").update(text).digest("hex");
 }
 
+// A dead parent may close stdout while the bridge is cancelling.
+process.stdout.on("error", () => {});
 let writeChain: Promise<void> = Promise.resolve();
 
 function writeFrame(frame: Record<string, unknown>): Promise<void> {
@@ -102,8 +105,9 @@ function diagnostic(message: string): void {
 	process.stderr.write(`relay-bridge: ${message}\n`);
 }
 
-function readRequest(): RelayRequest {
-	const raw = JSON.parse(readFileSync(0, "utf8")) as Record<string, unknown>;
+function readRequest(parsed: unknown): RelayRequest {
+	if (!parsed || typeof parsed !== "object") throw new Error("request must be an object");
+	const raw = parsed as Record<string, unknown>;
 	if (raw.schema_version !== REQUEST_SCHEMA) {
 		throw new Error(`request.schema_version must be ${REQUEST_SCHEMA}`);
 	}
@@ -130,17 +134,17 @@ function readRequest(): RelayRequest {
 }
 
 /** Run a short command through the SSH target and return its stdout. */
-function sshCapture(host: string, remoteCommand: string): string {
-	const result = spawnSync("ssh", [...SSH_OPTS, host, remoteCommand], {
-		encoding: "utf8",
-		timeout: 30_000,
-	});
-	if (result.status !== 0) {
-		throw new Error(
-			`ssh preflight failed (${result.status}): ${(result.stderr || result.stdout).slice(0, 400)}`,
+function sshCapture(host: string, remoteCommand: string, signal: AbortSignal): Promise<string> {
+	return new Promise((resolve, reject) => {
+		execFile(
+			"ssh", [...SSH_OPTS, host, remoteCommand],
+			{ encoding: "utf8", timeout: 30_000, signal },
+			(error, stdout, stderr) => {
+				if (error) reject(new Error(`ssh preflight failed: ${(stderr || error.message).slice(0, 400)}`));
+				else resolve(stdout.trim());
+			},
 		);
-	}
-	return result.stdout.trim();
+	});
 }
 
 function shellQuote(value: string): string {
@@ -257,159 +261,245 @@ function buildHostTools(request: RelayRequest) {
 }
 
 async function main(): Promise<number> {
-	const request = readRequest();
+	const parsed = await readRequestLine(process.stdin);
+	let request: RelayRequest;
+	try {
+		request = readRequest(parsed);
+	} catch (error) {
+		watchLifeline(process.stdin, () => {})();
+		throw error;
+	}
 	const startedAt = Date.now() / 1000;
 	const events: unknown[] = [];
 	let failure: string | null = null;
 	let cancelled = false;
 	let lastRemoteArgv = "";
-
-	const onSignal = () => {
-		cancelled = true;
+	let client: RpcClient | null = null;
+	const preflightAbort = new AbortController();
+	let stopPromise: Promise<void> | null = null;
+	let rejectCancellation: ((reason: Error) => void) | null = null;
+	const cancellation = new Promise<never>((_resolve, reject) => {
+		rejectCancellation = reject;
+	});
+	void cancellation.catch(() => {});
+	const stopOnce = (): Promise<void> => {
+		if (client === null) return Promise.resolve();
+		if (stopPromise === null) {
+			stopPromise = client.stop().catch(() => {});
+		}
+		return stopPromise;
 	};
+	const cancel = (reason: string) => {
+		if (cancelled) return;
+		cancelled = true;
+		failure = reason;
+		preflightAbort.abort();
+		void stopOnce();
+		rejectCancellation?.(new Error(reason));
+	};
+	const onSignal = () => cancel("cancelled locally");
+	const disposeLifeline = watchLifeline(process.stdin, () => cancel("relay parent exited"));
 	process.on("SIGINT", onSignal);
 	process.on("SIGTERM", onSignal);
-
-	// Preflight before anything that could start an agent: locate omp by the
-	// remote shell's own PATH, capture host identity, and prepare a scratch
-	// directory that contains no project context for the agent to discover.
-	const ompBin = sshCapture(request.host_target, "command -v omp");
-	const ompVersion = sshCapture(request.host_target, "omp --version");
-	const hostIdentity = sshCapture(request.host_target, "uname -a");
-	const scratch = sshCapture(
-		request.host_target,
-		'd=$(mktemp -d "${TMPDIR:-/tmp}/agent-offload-relay.XXXXXX") && printf "%s" "$d"',
-	);
-	sshCapture(
-		request.host_target,
-		`cat > ${shellQuote(`${scratch}/relay-disable-overlay.yml`)} <<'RELAYEOF'\n${REMOTE_DISABLE_CONFIG}RELAYEOF`,
-	);
-
-	const buildRemoteArgv = (agentArgs: string[]): string => {
-		const parts = [...agentArgs];
-		for (const flag of REMOTE_DISABLE_FLAGS) {
-			if (!parts.includes(flag)) parts.push(flag);
-		}
-		const remote = ["exec", ompBin, ...parts];
-		return `cd ${shellQuote(scratch)} && ${remote.map(shellQuote).join(" ")}`;
-	};
-
-	const hostTools = buildHostTools(request);
-	const client = new RpcClient({
-		customTools: hostTools,
-		provider: request.provider,
-		model: request.model,
-		args: [
-			...REMOTE_DISABLE_FLAGS,
-			"--config",
-			"relay-disable-overlay.yml",
-		],
-		command: (agentArgs: string[]) => {
-			lastRemoteArgv = buildRemoteArgv(agentArgs);
-			return ["ssh", ...SSH_OPTS, request.host_target, lastRemoteArgv];
-		},
-	});
-	let rejectTurnFailure: ((reason?: unknown) => void) | null = null;
-	let observedTurnFailure: string | null = null;
-	const turnFailure = new Promise<never>((_resolve, reject) => {
-		rejectTurnFailure = reject;
-	});
-	void turnFailure.catch(() => {});
-
+	process.on("SIGHUP", onSignal);
 	try {
-		await client.start();
-		const registered = await client.setCustomTools(hostTools);
-		if ([...registered].sort().join(",") !== [...HOST_TOOLS].sort().join(",")) {
-			throw new Error(
-				`fail-closed: server registered host tools [${registered.join(", ")}]; expected exactly [${HOST_TOOLS.join(", ")}]`,
-			);
-		}
-		await writeFrame({
-			frame: "ready",
-			schema_version: BRIDGE_SCHEMA,
-			sdk_version: SDK_VERSION,
-			omp_version: ompVersion,
-			host_identity: hostIdentity,
-			remote_argv: lastRemoteArgv,
-			registered_tools: registered,
-		});
-		const unsubscribe = client.onEvent((event) => {
-			events.push(event);
-			const failureMessage = failedTurnMessage(event);
-			if (failureMessage) observedTurnFailure = failureMessage;
-			if (failureMessage && rejectTurnFailure) {
-				const reject = rejectTurnFailure;
-				rejectTurnFailure = null;
-				reject(new Error(failureMessage));
-			}
-			void writeFrame({
-				frame: "event",
-				schema_version: BRIDGE_SCHEMA,
-				event,
-			}).catch(() => {});
-		});
-		let prompt = request.prompt;
-		if (request.system_prompt) {
-			prompt = `<project-context>\n${request.system_prompt}\n</project-context>\n\n${prompt}`;
-		}
+		return await runBridge();
+	} finally {
+		disposeLifeline();
+		process.off("SIGINT", onSignal);
+		process.off("SIGTERM", onSignal);
+		process.off("SIGHUP", onSignal);
+	}
+
+	async function runBridge(): Promise<number> {
+		// Preflight before anything that could start an agent: locate omp by the
+		// remote shell's own PATH, capture host identity, and prepare a scratch
+		// directory that contains no project context for the agent to discover.
+		let ompBin = "";
+		let ompVersion = "";
+		let hostIdentity = "";
+		let scratch = "";
 		try {
-			await client.prompt(prompt);
-			await Promise.race([client.waitForIdle(request.timeout_seconds * 1000), turnFailure]);
-			if (observedTurnFailure) throw new Error(observedTurnFailure);
+			ompBin = await sshCapture(request.host_target, "command -v omp", preflightAbort.signal);
+			ompVersion = await sshCapture(request.host_target, "omp --version", preflightAbort.signal);
+			hostIdentity = await sshCapture(request.host_target, "uname -a", preflightAbort.signal);
+			scratch = await sshCapture(
+				request.host_target,
+				'd=$(mktemp -d "${TMPDIR:-/tmp}/agent-offload-relay.XXXXXX") && printf "%s" "$d"',
+				preflightAbort.signal,
+			);
+			await sshCapture(
+				request.host_target,
+				`cat > ${shellQuote(`${scratch}/relay-disable-overlay.yml`)} <<'RELAYEOF'\n${REMOTE_DISABLE_CONFIG}RELAYEOF`,
+				preflightAbort.signal,
+			);
 		} catch (error) {
-			failure = cancelled
-				? "cancelled locally"
-				: `prompt failed: ${(error as Error).message}`;
+			if (!cancelled) throw error;
+			await writeFrame({
+				frame: "result", schema_version: BRIDGE_SCHEMA,
+				result: {
+					sdk_version: SDK_VERSION, omp_version: ompVersion,
+					host_target: request.host_target, host_identity: hostIdentity,
+					remote_argv: lastRemoteArgv, remote_scratch: scratch,
+					registered_tools: [], session_id: null, session_file: null,
+					model: null, started_at: startedAt, ended_at: Date.now() / 1000,
+					failure, cancelled, events, stats: null,
+					prompt_sha256: sha256(request.system_prompt
+						? `<project-context>\n${request.system_prompt}\n</project-context>\n\n${request.prompt}`
+						: request.prompt),
+					bounds: request.bounds, final_response: null,
+				},
+			}).catch(() => {});
+			return 4;
 		}
-		unsubscribe();
 
-		const state = await client.getState();
-		const stats = await client.getSessionStats().catch(() => null);
-		const finalResponse = await client.getLastAssistantText().catch(() => null);
+		const buildRemoteArgv = (agentArgs: string[]): string => {
+			const parts = [...agentArgs];
+			for (const flag of REMOTE_DISABLE_FLAGS) {
+				if (!parts.includes(flag)) parts.push(flag);
+			}
+			const remote = ["exec", ompBin, ...parts];
+			return `cd ${shellQuote(scratch)} && ${remote.map(shellQuote).join(" ")}`;
+		};
 
-		await writeFrame({
-			frame: "result",
-			schema_version: BRIDGE_SCHEMA,
-			result: {
+		const hostTools = buildHostTools(request);
+		const rpc = new RpcClient({
+			customTools: hostTools,
+			provider: request.provider,
+			model: request.model,
+			args: [
+				...REMOTE_DISABLE_FLAGS,
+				"--config",
+				"relay-disable-overlay.yml",
+			],
+			command: (agentArgs: string[]) => {
+				lastRemoteArgv = buildRemoteArgv(agentArgs);
+				return ["ssh", ...SSH_OPTS, request.host_target, lastRemoteArgv];
+			},
+		});
+		client = rpc;
+		let rejectTurnFailure: ((reason?: unknown) => void) | null = null;
+		let observedTurnFailure: string | null = null;
+		const turnFailure = new Promise<never>((_resolve, reject) => {
+			rejectTurnFailure = reject;
+		});
+		void turnFailure.catch(() => {});
+		const prompt = request.system_prompt
+			? `<project-context>\n${request.system_prompt}\n</project-context>\n\n${request.prompt}`
+			: request.prompt;
+		let registered: string[] = [];
+
+		try {
+			if (cancelled) throw new Error(failure ?? "cancelled locally");
+			await Promise.race([rpc.start(), cancellation]);
+			registered = await Promise.race([rpc.setCustomTools(hostTools), cancellation]);
+			if ([...registered].sort().join(",") !== [...HOST_TOOLS].sort().join(",")) {
+				throw new Error(
+					`fail-closed: server registered host tools [${registered.join(", ")}]; expected exactly [${HOST_TOOLS.join(", ")}]`,
+				);
+			}
+			await writeFrame({
+				frame: "ready",
+				schema_version: BRIDGE_SCHEMA,
 				sdk_version: SDK_VERSION,
 				omp_version: ompVersion,
-				host_target: request.host_target,
 				host_identity: hostIdentity,
 				remote_argv: lastRemoteArgv,
-				remote_scratch: scratch,
 				registered_tools: registered,
-				session_id: state.sessionId,
-				session_file: state.sessionFile ?? null,
-				model: state.model
-					? { provider: state.model.provider, id: state.model.id }
-					: null,
-				started_at: startedAt,
-				ended_at: Date.now() / 1000,
-				failure,
-				cancelled,
-				events,
-				stats,
-				prompt_sha256: sha256(prompt),
-				bounds: request.bounds,
-				final_response: finalResponse ?? null,
-			},
-		});
-		return failure === null ? 0 : 4;
-	} catch (error) {
-		await writeFrame({
-			frame: "error",
-			schema_version: BRIDGE_SCHEMA,
-			error: {
-				message: (error as Error).message,
-				stack: (error as Error).stack?.slice(-1500) ?? null,
-				remote_argv: lastRemoteArgv,
-				stderr_tail: client.getStderr().slice(-2000),
-			},
-		}).catch(() => {});
-		diagnostic(`fatal: ${(error as Error).message}`);
-		return 3;
-	} finally {
-		await client.stop().catch(() => {});
+			});
+			const unsubscribe = rpc.onEvent((event) => {
+				events.push(event);
+				const failureMessage = failedTurnMessage(event);
+				if (failureMessage) observedTurnFailure = failureMessage;
+				if (failureMessage && rejectTurnFailure) {
+					const reject = rejectTurnFailure;
+					rejectTurnFailure = null;
+					reject(new Error(failureMessage));
+				}
+				void writeFrame({
+					frame: "event",
+					schema_version: BRIDGE_SCHEMA,
+					event,
+				}).catch(() => {});
+			});
+			try {
+				await Promise.race([rpc.prompt(prompt), cancellation]);
+				await Promise.race([
+					rpc.waitForIdle(request.timeout_seconds * 1000), turnFailure, cancellation,
+				]);
+				if (observedTurnFailure) throw new Error(observedTurnFailure);
+			} catch (error) {
+				failure = cancelled ? failure : `prompt failed: ${(error as Error).message}`;
+			}
+			unsubscribe();
+
+			const state = cancelled ? null : await Promise.race([rpc.getState(), cancellation]).catch(() => null);
+			const stats = cancelled ? null : await Promise.race([rpc.getSessionStats(), cancellation]).catch(() => null);
+			const finalResponse = cancelled
+				? null : await Promise.race([rpc.getLastAssistantText(), cancellation]).catch(() => null);
+
+			await writeFrame({
+				frame: "result",
+				schema_version: BRIDGE_SCHEMA,
+				result: {
+					sdk_version: SDK_VERSION,
+					omp_version: ompVersion,
+					host_target: request.host_target,
+					host_identity: hostIdentity,
+					remote_argv: lastRemoteArgv,
+					remote_scratch: scratch,
+					registered_tools: registered,
+					session_id: state?.sessionId ?? null,
+					session_file: state?.sessionFile ?? null,
+					model: state?.model
+						? { provider: state.model.provider, id: state.model.id }
+						: null,
+					started_at: startedAt,
+					ended_at: Date.now() / 1000,
+					failure,
+					cancelled,
+					events,
+					stats,
+					prompt_sha256: sha256(prompt),
+					bounds: request.bounds,
+					final_response: finalResponse ?? null,
+				},
+			}).catch(() => {});
+			return failure === null ? 0 : 4;
+		} catch (error) {
+			if (cancelled) {
+				await writeFrame({
+					frame: "result",
+					schema_version: BRIDGE_SCHEMA,
+					result: {
+						sdk_version: SDK_VERSION, omp_version: ompVersion,
+						host_target: request.host_target, host_identity: hostIdentity,
+						remote_argv: lastRemoteArgv, remote_scratch: scratch,
+						registered_tools: registered, session_id: null, session_file: null,
+						model: null, started_at: startedAt, ended_at: Date.now() / 1000,
+						failure, cancelled, events, stats: null,
+						prompt_sha256: sha256(prompt), bounds: request.bounds,
+						final_response: null,
+					},
+				}).catch(() => {});
+				return 4;
+			}
+			await writeFrame({
+				frame: "error",
+				schema_version: BRIDGE_SCHEMA,
+				error: {
+					message: (error as Error).message,
+					stack: (error as Error).stack?.slice(-1500) ?? null,
+					remote_argv: lastRemoteArgv,
+					stderr_tail: rpc.getStderr().slice(-2000),
+				},
+			}).catch(() => {});
+			diagnostic(`fatal: ${(error as Error).message}`);
+			return 3;
+		} finally {
+			if (cancelled) void stopOnce();
+			else await stopOnce();
+		}
 	}
 }
 

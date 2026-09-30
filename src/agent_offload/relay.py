@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,7 @@ RELAY_SOURCE_FILES = (
     "relay_runtime/bun.lock",
     "relay_runtime/confinement.ts",
     "relay_runtime/event_failure.ts",
+    "relay_runtime/lifeline.ts",
     "relay_runtime/package.json",
     "relay_runtime/relay_bridge.ts",
 )
@@ -121,6 +123,24 @@ TRUST_EPILOG = """trust boundary:
 
 class RelayError(RuntimeError):
     """The relay could not run, or failed closed."""
+
+
+@contextmanager
+def _unwind_on_hangup():
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    previous = signal.getsignal(signal.SIGHUP)
+
+    def hangup(_signum: int, _frame: Any) -> None:
+        raise RelayError("relay hung up")
+
+    signal.signal(signal.SIGHUP, hangup)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGHUP, previous)
 
 
 @dataclass(frozen=True)
@@ -271,6 +291,7 @@ def validate_bridge_frame_kind(frame: dict[str, Any]) -> str:
     return validate_bridge_frame(frame)
 
 
+@_unwind_on_hangup()
 def run_relay(
     *,
     project_root: Path,
@@ -316,13 +337,7 @@ def run_relay(
         start_new_session=True,
     )
     assert process.stdin is not None
-    process.stdin.write(json.dumps(request))
-    process.stdin.close()
-
-    frames: queue.Queue[tuple[str, Any] | None] = queue.Queue()
-    reader = threading.Thread(target=_read_frames, args=(process, frames), daemon=True)
-    reader.start()
-
+    reader: threading.Thread | None = None
     deadline = time.monotonic() + timeout_seconds + RELAY_DEADLINE_GRACE_SECONDS
     event_count = 0
     bridge_result: dict[str, Any] | None = None
@@ -332,6 +347,11 @@ def run_relay(
     streamed_events: list[dict[str, Any]] = []
 
     try:
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        frames: queue.Queue[tuple[str, Any] | None] = queue.Queue()
+        reader = threading.Thread(target=_read_frames, args=(process, frames), daemon=True)
+        reader.start()
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -373,9 +393,14 @@ def run_relay(
                 bridge_error = str(payload["error"].get("message", "bridge error"))
                 break
     finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
         if process.poll() is None:
             _terminate_group(process)
-        reader.join(timeout=5)
+        if reader is not None:
+            reader.join(timeout=5)
     if bridge_error is not None:
         raise RelayError(f"relay bridge failed closed: {bridge_error}")
     if timed_out and bridge_result is None:

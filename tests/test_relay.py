@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -25,10 +28,24 @@ from agent_offload.relay_protocol import RESULT_SCHEMA, RelayProtocolError
 FAKE_BRIDGE = textwrap.dedent(
     """
     import hashlib
-    import json, os, signal, sys, time
+    import json, os, select, signal, sys, time
 
     scenario = os.environ["RELAY_FAKE_SCENARIO"]
-    request = json.loads(sys.stdin.read())
+    request_line = sys.stdin.readline()
+    request = json.loads(request_line)
+    if scenario == "lifeline":
+        with open(os.environ["RELAY_FAKE_STARTED_MARKER"], "w") as handle:
+            handle.write("started")
+        while sys.stdin.read(1):
+            pass
+        with open(os.environ["RELAY_FAKE_EOF_MARKER"], "w") as handle:
+            handle.write("eof")
+        sys.exit(0)
+    if scenario == "stdin_open":
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+        is_open = not readable or sys.stdin.read(1) != ""
+        with open(os.environ["RELAY_FAKE_OPEN_MARKER"], "w") as handle:
+            handle.write(str(request_line.endswith("\\n") and is_open))
     if os.environ.get("RELAY_FAKE_REQUEST_OUT"):
         with open(os.environ["RELAY_FAKE_REQUEST_OUT"], "w") as handle:
             json.dump(request, handle)
@@ -45,6 +62,9 @@ FAKE_BRIDGE = textwrap.dedent(
     signal.signal(signal.SIGTERM, terminate)
 
     if scenario == "sleep":
+        if os.environ.get("RELAY_FAKE_STARTED_MARKER"):
+            with open(os.environ["RELAY_FAKE_STARTED_MARKER"], "w") as handle:
+                handle.write("started")
         time.sleep(120)
         sys.exit(0)
 
@@ -187,6 +207,7 @@ def relay_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def fake_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     script = tmp_path / "fake_bridge.py"
     script.write_text(FAKE_BRIDGE)
+    monkeypatch.setattr(relay_module, "_require_bun", lambda: "fake-bun")
     monkeypatch.setattr(relay_module, "_ensure_runtime", lambda runtime_dir: script)
     monkeypatch.setattr(
         relay_module,
@@ -468,3 +489,82 @@ def test_timeout_terminates_bridge_process_group(
             timeout_seconds=0.5,
         )
     assert marker.read_text() == "terminated"
+
+
+def _wait_marker(
+    marker: Path, process: subprocess.Popen[bytes], *, allow_exit: bool = False
+) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if marker.exists():
+            return
+        if not allow_exit and process.poll() is not None:
+            pytest.fail(f"relay child exited before {marker.name}: {process.returncode}")
+        time.sleep(0.02)
+    pytest.fail(f"timed out waiting for {marker.name}")
+
+
+def _relay_child(relay_project: Path, fake_bridge: Path, scenario: str) -> subprocess.Popen[bytes]:
+    env = os.environ.copy()
+    source_root = str(Path(relay_module.__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [source_root, env.get("PYTHONPATH")]))
+    env.update(
+        RELAY_FAKE_SCENARIO=scenario,
+        RELAY_FAKE_STARTED_MARKER=str(_marker(relay_project, "started")),
+        RELAY_FAKE_TERMINATED_MARKER=str(_marker(relay_project, "terminated")),
+        RELAY_FAKE_EOF_MARKER=str(_marker(relay_project, "eof")),
+    )
+    code = """
+from pathlib import Path
+import sys
+from agent_offload import relay
+relay._require_bun = lambda: 'fake-bun'
+relay._ensure_runtime = lambda runtime_dir: Path(sys.argv[2])
+relay._bridge_command = lambda bun, bridge: [sys.executable, str(bridge)]
+relay.run_relay(project_root=Path(sys.argv[1]), prompt='review this',
+                host='agent@studio', timeout_seconds=60)
+"""
+    return subprocess.Popen(
+        [sys.executable, "-c", code, str(relay_project), str(fake_bridge)],
+        cwd=relay_project.parent,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def test_request_keeps_stdin_open_through_frames(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = _marker(relay_project, "open")
+    monkeypatch.setenv("RELAY_FAKE_OPEN_MARKER", str(marker))
+    _run_scenario(relay_project, monkeypatch, "stdin_open")
+    assert marker.read_text() == "True"
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="requires SIGHUP")
+def test_sighup_unwinds_and_terminates_bridge(relay_project: Path, fake_bridge: Path) -> None:
+    child = _relay_child(relay_project, fake_bridge, "sleep")
+    try:
+        _wait_marker(_marker(relay_project, "started"), child)
+        child.send_signal(signal.SIGHUP)
+        assert child.wait(timeout=10) != 0
+        assert _marker(relay_project, "terminated").read_text() == "terminated"
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+
+
+def test_sigkill_closes_bridge_lifeline(relay_project: Path, fake_bridge: Path) -> None:
+    child = _relay_child(relay_project, fake_bridge, "lifeline")
+    try:
+        _wait_marker(_marker(relay_project, "started"), child)
+        child.kill()
+        child.wait(timeout=10)
+        _wait_marker(_marker(relay_project, "eof"), child, allow_exit=True)
+        assert _marker(relay_project, "eof").read_text() == "eof"
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
