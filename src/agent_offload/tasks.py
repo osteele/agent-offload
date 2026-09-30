@@ -48,10 +48,11 @@ DEFAULT_SELECTOR = "openai-codex/gpt-6-sol"
 HOST_SYNC = "agent-host-sync --account agent apply --stage tools --tool agent-offload"
 EXECUTION_IDENTITY_SCHEMA = "agent-execution.worker-identity/v1"
 WORKSPACE_LANE = "agent-host-sync workspace run --dependency <path> ... <command>"
-# Seconds one `weft run` may take to return its submission receipt. Weft emits
-# the receipt only after syncing the chosen host, which alone can exceed this on
-# a loaded machine; `send` resolves such a timeout rather than failing on it.
+# Seconds one `weft run` may take to record the job. Submission passes
+# --no-sync, so the budget covers source pinning and recording, not the host
+# push; `send` resolves a timeout through `weft job lookup` rather than failing.
 SUBMIT_TIMEOUT = 180
+WEFT_LOOKUP_SCHEMA = "weft.job.lookup.v1"
 
 
 class ResultUnavailable(TaskError):
@@ -368,6 +369,7 @@ def send(record: dict, directory: Path) -> dict:
         f"coding-task={payload}",
         "--wall-time",
         f"{int(record['request']['timeout']) + 1020}s",
+        "--no-sync",
         "--json",
         "-m",
         record["title"],
@@ -378,12 +380,12 @@ def send(record: dict, directory: Path) -> dict:
         try:
             raw = run(submission, cwd=project, timeout=SUBMIT_TIMEOUT)
         except CommandTimeout:
-            # Weft records the job before it syncs the host and emits the
-            # receipt, so a submission that outlived the budget has usually
-            # created its job. The same idempotency key returns that job's
-            # receipt before any source pinning or sync, or submits it once if
-            # the first attempt was killed before recording it.
-            raw = run(submission, cwd=project, timeout=SUBMIT_TIMEOUT)
+            # The timeout killed weft run, so no submission under this key is
+            # still in flight and the lookup's answer is conclusive. A recorded
+            # job is bound; an unrecorded one is submitted once more.
+            raw = recorded_receipt(record, project)
+            if raw is None:
+                raw = run(submission, cwd=project, timeout=SUBMIT_TIMEOUT)
         receipt = WeftReceipt.parse(raw, idempotency_key=idempotency_key(record))
         if not receipt.job_id:
             raise TaskError("Weft did not accept the task")
@@ -402,6 +404,33 @@ def send(record: dict, directory: Path) -> dict:
         ) from error
     save(directory / "task.json", record)
     return summary(record)
+
+
+def recorded_receipt(record: dict, project: Path) -> str | None:
+    """The receipt of the job Weft recorded under the record's key, or None if none was.
+
+    A lookup that fails raises rather than returning None: an unreadable ledger
+    is not evidence that the job is absent.
+    """
+    key = idempotency_key(record)
+    raw = run(["weft", "job", "lookup", "--idempotency-key", key], cwd=project, timeout=60)
+    try:
+        found = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise TaskError("weft job lookup returned invalid JSON") from error
+    if (
+        not isinstance(found, dict)
+        or found.get("api_version") != WEFT_LOOKUP_SCHEMA
+        or found.get("idempotency_key") != key
+        or not isinstance(found.get("found"), bool)
+    ):
+        raise TaskError(f"weft job lookup did not return a {WEFT_LOOKUP_SCHEMA} answer for {key}")
+    if not found["found"]:
+        return None
+    receipt = found.get("receipt")
+    if not isinstance(receipt, dict):
+        raise TaskError("weft job lookup found the job but returned no receipt")
+    return json.dumps(receipt)
 
 
 def idempotency_key(record: dict) -> str:

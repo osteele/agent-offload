@@ -297,40 +297,64 @@ def test_baseline_omits_files_weft_snapshot_excludes(tmp_path, monkeypatch):
     assert sorted(read_record("snapshot")["request"]["baseline"]) == ["hello.py", "src/keep.py"]
 
 
-def deduplicated_receipt(key: str) -> str:
-    return json.dumps(
-        {
-            "api_version": "weft.run.receipt.v1",
-            "job_id": "wj77",
-            "placement_decision": "deduplicated",
-            "selected_host": "studio",
-            "source_pin": "pin",
-            "accepted_immediately": False,
-            "deduplicated": True,
-            "idempotency_key": key,
-        }
-    )
+def receipt(key: str, decision: str) -> dict:
+    return {
+        "api_version": "weft.run.receipt.v1",
+        "job_id": "wj77",
+        "placement_decision": decision,
+        "selected_host": "studio",
+        "source_pin": "pin",
+        "accepted_immediately": False,
+        "deduplicated": decision == "deduplicated",
+        "idempotency_key": key,
+    }
 
 
-def slow_then_deduplicated(tmp_path, monkeypatch, *, hangs: int) -> Path:
-    """Fake `weft run` that outlives the submit budget `hangs` times, then deduplicates.
+def fake_weft_submission(tmp_path, monkeypatch, *, runs: list[str], lookup: str) -> Path:
+    """Fake weft whose successive `weft run` calls follow `runs`, logging every call.
 
-    Weft records the job before its host sync; a killed submission leaves the
-    job behind, and the same idempotency key then returns its receipt.
+    Each run is "hang" (outlive the submit budget) or "queued" (print a receipt
+    for a job left to the daemon, as --no-sync does). `lookup` is "found",
+    "absent", "other-key" (an answer about a different key), or "fail" for
+    `weft job lookup`.
     """
     monkeypatch.setattr(tasks, "SUBMIT_TIMEOUT", 1)
-    calls = tmp_path / "weft-runs"
-    receipt = tmp_path / "receipt.json"
-    receipt.write_text(deduplicated_receipt("slow"))
+    calls = tmp_path / "weft-calls"
+    queued = tmp_path / "queued.json"
+    queued.write_text(json.dumps(receipt("slow", "queued")))
+    answers = {
+        "found": {"found": True, "receipt": receipt("slow", "deduplicated")},
+        "absent": {"found": False},
+    }
+    answer = tmp_path / "lookup.json"
+    if lookup in answers:
+        answer.write_text(
+            json.dumps(
+                {"api_version": "weft.job.lookup.v1", "idempotency_key": "slow", **answers[lookup]}
+            )
+        )
+    elif lookup == "other-key":
+        answer.write_text(
+            json.dumps(
+                {"api_version": "weft.job.lookup.v1", "idempotency_key": "x", "found": False}
+            )
+        )
+    lookup_step = (
+        "echo 'ledger unreadable' >&2; exit 1" if lookup == "fail" else f'/bin/cat "{answer}"'
+    )
+    run_steps = "".join(
+        f"  {index}) {'exec /bin/sleep 5' if step == 'hang' else f'/bin/cat {queued}'} ;;\n"
+        for index, step in enumerate(runs, start=1)
+    )
     fake_tools(
         tmp_path,
         monkeypatch,
         files=["hello.py"],
         excludes=[".git"],
         run=(
-            f'echo run >> "{calls}"\n'
-            f'if [ "$(/usr/bin/wc -l < "{calls}")" -le {hangs} ]; then exec /bin/sleep 5; fi\n'
-            f'/bin/cat "{receipt}"'
+            f'echo "$*" >> "{calls}"\n'
+            f'if [ "$1 $2" = "job lookup" ]; then {lookup_step}; exit 0; fi\n'
+            f'case "$(/usr/bin/grep -c "^run " "{calls}")" in\n{run_steps}esac'
         ),
     )
     return calls
@@ -351,27 +375,57 @@ def submit_slow(tmp_path: Path) -> dict:
     )
 
 
-def test_submit_resolves_a_timed_out_weft_run_by_its_idempotency_key(tmp_path, monkeypatch):
+def weft_calls(calls: Path) -> list[str]:
+    return [line.split()[0] + " " + line.split()[1] for line in calls.read_text().splitlines()]
+
+
+def test_submit_leaves_host_dispatch_to_weft_and_binds_the_queued_job(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
-    calls = slow_then_deduplicated(tmp_path, monkeypatch, hangs=1)
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["queued"], lookup="fail")
 
     submit_slow(tmp_path)
 
     record = read_record("slow")
-    assert record["status"] == "queued"
-    assert record["job_id"] == "wj77"
-    assert calls.read_text().count("run") == 2
+    assert (record["status"], record["job_id"]) == ("queued", "wj77")
+    assert "--no-sync" in calls.read_text().split()
 
 
-def test_submit_is_unresolved_when_the_reissued_weft_run_also_times_out(tmp_path, monkeypatch):
+def test_submit_binds_the_job_a_timed_out_weft_run_recorded(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
-    calls = slow_then_deduplicated(tmp_path, monkeypatch, hangs=2)
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["hang"], lookup="found")
+
+    submit_slow(tmp_path)
+
+    record = read_record("slow")
+    assert (record["status"], record["job_id"]) == ("queued", "wj77")
+    assert weft_calls(calls) == ["run -C", "job lookup"]
+
+
+def test_submit_resubmits_once_when_a_timed_out_weft_run_recorded_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["hang", "queued"], lookup="absent")
+
+    submit_slow(tmp_path)
+
+    record = read_record("slow")
+    assert (record["status"], record["job_id"]) == ("queued", "wj77")
+    assert weft_calls(calls) == ["run -C", "job lookup", "run -C"]
+
+
+@pytest.mark.parametrize("lookup", ["fail", "other-key"])
+def test_submit_is_unresolved_when_the_lookup_after_a_timeout_is_not_an_answer(
+    tmp_path, monkeypatch, lookup
+):
+    # Neither an unreadable ledger nor an answer about another key is evidence
+    # that the job is absent, so nothing is resubmitted.
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["hang", "queued"], lookup=lookup)
 
     with pytest.raises(TaskError, match="resume this identity"):
         submit_slow(tmp_path)
 
     assert read_record("slow")["status"] == "submission_unknown"
-    assert calls.read_text().count("run") == 2
+    assert weft_calls(calls) == ["run -C", "job lookup"]
 
 
 def test_baseline_requires_weft_source_exclusions(tmp_path, monkeypatch):

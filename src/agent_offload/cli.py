@@ -69,7 +69,7 @@ class WeftReceipt:
         if value.get("api_version") != WEFT_RECEIPT_SCHEMA:
             raise ProtocolError(f"unsupported Weft receipt: {value.get('api_version')!r}")
         decision = value.get("placement_decision")
-        if decision not in {"accepted_immediately", "deduplicated", "not_accepted"}:
+        if decision not in {"accepted_immediately", "deduplicated", "queued", "not_accepted"}:
             raise ProtocolError(f"invalid Weft placement decision: {decision!r}")
         accepted = value.get("accepted_immediately")
         deduplicated = value.get("deduplicated", False)
@@ -96,6 +96,9 @@ class WeftReceipt:
             raise ProtocolError("accepted_immediately receipt denies immediate acceptance")
         elif decision == "deduplicated" and not deduplicated:
             raise ProtocolError("deduplicated receipt lacks its deduplication flag")
+        elif decision == "queued" and (accepted or deduplicated):
+            # Weft recorded the job and left host dispatch to its daemon.
+            raise ProtocolError("queued receipt claims immediate acceptance or deduplication")
         return receipt
 
     def to_dict(self) -> dict[str, Any]:

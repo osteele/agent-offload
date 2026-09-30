@@ -85,6 +85,36 @@ def test_receipt_rejects_wrong_idempotency_key() -> None:
         cli.WeftReceipt.parse(payload, idempotency_key="task-1")
 
 
+def queued_receipt(**fields: object) -> str:
+    return json.dumps(
+        {
+            "api_version": "weft.run.receipt.v1",
+            "job_id": "wj1",
+            "placement_decision": "queued",
+            "selected_host": "studio",
+            "source_pin": "sha256:abc",
+            "accepted_immediately": False,
+            "deduplicated": False,
+            "idempotency_key": "task-1",
+            **fields,
+        }
+    )
+
+
+def test_receipt_accepts_a_job_left_to_the_weft_daemon() -> None:
+    receipt = cli.WeftReceipt.parse(queued_receipt(), idempotency_key="task-1")
+
+    assert (receipt.job_id, receipt.placement_decision) == ("wj1", "queued")
+
+
+@pytest.mark.parametrize(
+    "fields", [{"accepted_immediately": True}, {"deduplicated": True}, {"job_id": ""}]
+)
+def test_receipt_rejects_a_queued_receipt_that_contradicts_itself(fields: dict) -> None:
+    with pytest.raises(ValueError):
+        cli.WeftReceipt.parse(queued_receipt(**fields), idempotency_key="task-1")
+
+
 def test_remote_command_uses_report_only_worker_protocol() -> None:
     command = shlex.split(
         cli.remote_command(
