@@ -169,5 +169,7 @@ After a worker source change, reinstall the local command and redeploy:
 ```sh
 cd ~/code/agent-tools/agent-offload
 uv tool install --force --reinstall ../agent-execution
-uv tool install --force --reinstall --with ../agent-execution .
+just install
 ```
+
+`just install` builds a new release under `~/.local/share/agent-offload/releases/` with agent-execution bundled, checks that it starts, and only then repoints `releases/current`, which the `~/.local/bin` entry points resolve through. agent-execution is not a declared dependency, so a plain `uv tool install .` produces an environment in which every command exits with a message naming the missing package.

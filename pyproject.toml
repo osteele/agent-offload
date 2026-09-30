@@ -6,9 +6,9 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
-agent-offload = "agent_offload.cli:main"
-agent-offload-worker = "agent_offload.worker_cli:main"
-agent-offload-task-worker = "agent_offload.task_worker:main"
+agent-offload = "agent_offload.entry:cli"
+agent-offload-worker = "agent_offload.entry:worker"
+agent-offload-task-worker = "agent_offload.entry:task_worker"
 
 [dependency-groups]
 dev = [
