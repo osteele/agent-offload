@@ -303,6 +303,11 @@ rule SubmitTask {
         -- the job is sent, so an interrupted submission leaves a resumable
         -- identity. There is no local-execution fallback: a send that cannot
         -- be resolved leaves the task submission_unknown for explicit resume.
+        -- Weft records the job before its host sync and emits the receipt only
+        -- after it, so a send that outlives its budget is issued once more
+        -- under the same idempotency key, which returns the recorded job's
+        -- receipt without a second sync. Only a second timeout or failure
+        -- makes the send unresolved.
     @guidance
         -- A bundled-vs-installed worker digest mismatch refuses before
         -- queueing, with a reinstall hint. An unprobeable installation

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_offload import tasks
 from agent_offload.task_protocol import (
     TaskError,
     encode,
@@ -294,6 +295,83 @@ def test_baseline_omits_files_weft_snapshot_excludes(tmp_path, monkeypatch):
             identity="snapshot",
         )
     assert sorted(read_record("snapshot")["request"]["baseline"]) == ["hello.py", "src/keep.py"]
+
+
+def deduplicated_receipt(key: str) -> str:
+    return json.dumps(
+        {
+            "api_version": "weft.run.receipt.v1",
+            "job_id": "wj77",
+            "placement_decision": "deduplicated",
+            "selected_host": "studio",
+            "source_pin": "pin",
+            "accepted_immediately": False,
+            "deduplicated": True,
+            "idempotency_key": key,
+        }
+    )
+
+
+def slow_then_deduplicated(tmp_path, monkeypatch, *, hangs: int) -> Path:
+    """Fake `weft run` that outlives the submit budget `hangs` times, then deduplicates.
+
+    Weft records the job before its host sync; a killed submission leaves the
+    job behind, and the same idempotency key then returns its receipt.
+    """
+    monkeypatch.setattr(tasks, "SUBMIT_TIMEOUT", 1)
+    calls = tmp_path / "weft-runs"
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(deduplicated_receipt("slow"))
+    fake_tools(
+        tmp_path,
+        monkeypatch,
+        files=["hello.py"],
+        excludes=[".git"],
+        run=(
+            f'echo run >> "{calls}"\n'
+            f'if [ "$(/usr/bin/wc -l < "{calls}")" -le {hangs} ]; then exec /bin/sleep 5; fi\n'
+            f'/bin/cat "{receipt}"'
+        ),
+    )
+    return calls
+
+
+def submit_slow(tmp_path: Path) -> dict:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "hello.py").write_text("hello")
+    return submit(
+        project,
+        "Fix hello",
+        host="studio",
+        selector="openai-codex/gpt-6-astra",
+        timeout=60,
+        check=[],
+        identity="slow",
+    )
+
+
+def test_submit_resolves_a_timed_out_weft_run_by_its_idempotency_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = slow_then_deduplicated(tmp_path, monkeypatch, hangs=1)
+
+    submit_slow(tmp_path)
+
+    record = read_record("slow")
+    assert record["status"] == "queued"
+    assert record["job_id"] == "wj77"
+    assert calls.read_text().count("run") == 2
+
+
+def test_submit_is_unresolved_when_the_reissued_weft_run_also_times_out(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = slow_then_deduplicated(tmp_path, monkeypatch, hangs=2)
+
+    with pytest.raises(TaskError, match="resume this identity"):
+        submit_slow(tmp_path)
+
+    assert read_record("slow")["status"] == "submission_unknown"
+    assert calls.read_text().count("run") == 2
 
 
 def test_baseline_requires_weft_source_exclusions(tmp_path, monkeypatch):

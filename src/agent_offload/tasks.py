@@ -48,6 +48,10 @@ DEFAULT_SELECTOR = "openai-codex/gpt-6-sol"
 HOST_SYNC = "agent-host-sync --account agent apply --stage tools --tool agent-offload"
 EXECUTION_IDENTITY_SCHEMA = "agent-execution.worker-identity/v1"
 WORKSPACE_LANE = "agent-host-sync workspace run --dependency <path> ... <command>"
+# Seconds one `weft run` may take to return its submission receipt. Weft emits
+# the receipt only after syncing the chosen host, which alone can exceed this on
+# a loaded machine; `send` resolves such a timeout rather than failing on it.
+SUBMIT_TIMEOUT = 180
 
 
 class ResultUnavailable(TaskError):
@@ -61,12 +65,18 @@ def state_root() -> Path:
     )
 
 
+class CommandTimeout(TaskError):
+    """A command outlived its budget, so whatever it did before being killed is unknown."""
+
+
 def run(argv: list[str], *, cwd: Path | None = None, timeout: float = 60) -> str:
     try:
         result = subprocess.run(
             argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired as error:
+        raise CommandTimeout(f"could not execute {argv[0]}: {error}") from error
+    except OSError as error:
         raise TaskError(f"could not execute {argv[0]}: {error}") from error
     if result.returncode:
         raise TaskError(
@@ -333,41 +343,47 @@ def send(record: dict, directory: Path) -> dict:
             record["request_sha256"],
         ]
     )
+    submission = [
+        "weft",
+        "run",
+        "-C",
+        ".",
+        "--host",
+        record["host"],
+        "--agent",
+        "omp",
+        "--setup",
+        "none",
+        "--tag",
+        "inventory",
+        "--tag",
+        "agent-offload-task",
+        "--idempotency-key",
+        idempotency_key(record),
+        "--output",
+        result_path(record["id"]),
+        "--produces",
+        result_path(record["id"]),
+        "--payload",
+        f"coding-task={payload}",
+        "--wall-time",
+        f"{int(record['request']['timeout']) + 1020}s",
+        "--json",
+        "-m",
+        record["title"],
+        command,
+    ]
+    project = Path(record["project"])
     try:
-        raw = run(
-            [
-                "weft",
-                "run",
-                "-C",
-                ".",
-                "--host",
-                record["host"],
-                "--agent",
-                "omp",
-                "--setup",
-                "none",
-                "--tag",
-                "inventory",
-                "--tag",
-                "agent-offload-task",
-                "--idempotency-key",
-                idempotency_key(record),
-                "--output",
-                result_path(record["id"]),
-                "--produces",
-                result_path(record["id"]),
-                "--payload",
-                f"coding-task={payload}",
-                "--wall-time",
-                f"{int(record['request']['timeout']) + 1020}s",
-                "--json",
-                "-m",
-                record["title"],
-                command,
-            ],
-            cwd=Path(record["project"]),
-            timeout=180,
-        )
+        try:
+            raw = run(submission, cwd=project, timeout=SUBMIT_TIMEOUT)
+        except CommandTimeout:
+            # Weft records the job before it syncs the host and emits the
+            # receipt, so a submission that outlived the budget has usually
+            # created its job. The same idempotency key returns that job's
+            # receipt before any source pinning or sync, or submits it once if
+            # the first attempt was killed before recording it.
+            raw = run(submission, cwd=project, timeout=SUBMIT_TIMEOUT)
         receipt = WeftReceipt.parse(raw, idempotency_key=idempotency_key(record))
         if not receipt.job_id:
             raise TaskError("Weft did not accept the task")
