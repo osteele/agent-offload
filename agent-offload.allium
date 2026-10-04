@@ -175,6 +175,10 @@ entity TaskResult {
         status = validation_failed implies validation != null
     }
 
+    invariant ValidationOnlyWhenRequested {
+        task.check = null implies validation = null
+    }
+
     invariant ChangesWithinBounds {
         changes.count <= config.max_change_files
     }
@@ -280,6 +284,10 @@ rule SubmitTask {
         -- A check cannot run against dependencies outside the snapshot; a
         -- project without a check is accepted regardless.
     requires: requested_id = null or not Tasks.any(t => t.id = requested_id)
+    requires: not carries_in_root_symlink(project)
+        -- The worker's census refuses symlinks, and the snapshot keeps every
+        -- in-root link its exclusions do not drop; out-of-root links arrive
+        -- as their targets' content and are accepted.
 
     ensures:
         let task = Task.created(

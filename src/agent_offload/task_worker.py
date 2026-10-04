@@ -113,9 +113,18 @@ def execute(request: dict, root: Path) -> dict:
             }
         if validation["exit_code"] != 0:
             status = "validation_failed"
-        # Validation must test the exact source state represented by the proposal.
-        if manifest(root, walk_files(root)) != proposed_state:
-            raise TaskError("validation modified proposed source")
+        # Validation must test the exact source state represented by the
+        # proposal. A census that cannot even be taken, such as one finding a
+        # new oversized file, also means the check changed the tree.
+        try:
+            preserved = manifest(root, walk_files(root)) == proposed_state
+        except TaskError:
+            preserved = False
+        if not preserved:
+            status = "validation_failed"
+            validation["error"] = "; ".join(
+                filter(None, [validation.get("error"), "validation modified proposed source"])
+            )
     return {
         "schema_version": RESULT_SCHEMA,
         "id": request["id"],

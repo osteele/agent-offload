@@ -447,3 +447,28 @@ def test_worker_preserves_real_sdk_preflight_failure(tmp_path):
     assert result["worker"]["model_call_started"] is False
     evidence = tmp_path / ".agent-execution/results/sdk-contract.json"
     assert json.loads(evidence.read_text())["status"] == "preflight_failed"
+
+
+@pytest.mark.parametrize(
+    "outcome,validation,check,message",
+    [
+        ("validation_failed", None, True, "validation failure without requested validation"),
+        ("validation_failed", "kept", False, "validation that was not requested"),
+        ("completed", "kept", False, "validation that was not requested"),
+    ],
+    ids=["failure-without-outcome", "failure-without-check", "unrequested-validation"],
+)
+def test_retrieve_refuses_validation_evidence_that_disagrees_with_the_request(
+    task_factory, tmp_path, outcome, validation, check, message
+):
+    record, result = task_factory("validation-evidence", outcome)
+    if validation is None:
+        result["validation"] = None
+    if not check:
+        record["request"]["check"] = []
+    replies = tmp_path / "replies.json"
+    payloads = json.loads(replies.read_text())
+    payloads[record["job_id"]]["result"] = result
+    replies.write_text(json.dumps(payloads))
+    with pytest.raises(tasks.TaskError, match=message):
+        tasks.retrieve(record)

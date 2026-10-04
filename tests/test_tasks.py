@@ -559,13 +559,16 @@ def test_check_must_preserve_complete_proposal(tmp_path, monkeypatch, check_sour
 
     monkeypatch.setattr(task_worker, "execute_worker", write_proposal)
     monkeypatch.setattr(task_worker, "omp_final_text", lambda output: "Edited hello.py")
+    result = task_worker.execute(request, tmp_path)
+    assert result["changes"] == changes
     if refused:
-        with pytest.raises(TaskError, match="validation modified proposed source"):
-            task_worker.execute(request, tmp_path)
+        # The check exited 0, yet the result is a retrievable validation
+        # failure that keeps the writer's evidence and can never be applied.
+        assert result["status"] == "validation_failed"
+        assert result["validation"]["exit_code"] == 0
+        assert result["validation"]["error"] == "validation modified proposed source"
     else:
-        result = task_worker.execute(request, tmp_path)
         assert result["status"] == "completed"
-        assert result["changes"] == changes
 
 
 def test_selectors_report_the_accepted_writers(capsys):
@@ -778,3 +781,38 @@ def test_submit_ignores_commented_and_placeholder_pyproject_paths(tmp_path, monk
             check=["just", "check"],
             identity="placeholders",
         )
+
+
+def test_submit_refuses_in_root_symlinks_the_snapshot_carries(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    (project / "hello.py").write_text("hello")
+    (project / "node_modules").mkdir()
+    # Weft drops excluded links and snapshots out-of-root links as content.
+    (project / "node_modules" / "tool").symlink_to("../hello.py")
+    (project / "cache.lnk").symlink_to("hello.py")
+    (project / "outside").symlink_to(tmp_path)
+    (project / "escape.py").symlink_to("../elsewhere.py")
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=["*.lnk"], run="exit 1")
+
+    def attempt(identity: str) -> None:
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity=identity,
+        )
+
+    # Every link above is one the snapshot does not carry, so submission proceeds.
+    with pytest.raises(TaskError, match="resume this identity"):
+        attempt("unlinked")
+    (project / "alias.py").symlink_to("hello.py")
+    (project / "src" / "up").symlink_to("..")
+    with pytest.raises(TaskError, match=r"carries \(alias.py, src/up\)") as refused:
+        attempt("linked")
+    assert "escape.py" not in str(refused.value)
+    assert not (tmp_path / "state" / "tasks" / "linked" / "task.json").exists()

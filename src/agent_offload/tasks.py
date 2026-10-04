@@ -319,14 +319,43 @@ def snapshot_names(project: Path) -> list[str]:
         raise TaskError("weft sync inspect did not report the source exclusions")
     # Go spells a negated character class [^...]; fnmatch spells it [!...].
     patterns = [p.replace("[^", "[!") for p in excludes]
-    return [
-        name
-        for name in names
-        if not any(
-            part.lower() in EXCLUDED or any(fnmatchcase(part, p) for p in patterns)
-            for part in Path(name).parts
+
+    def excluded(part: str) -> bool:
+        return part.lower() in EXCLUDED or any(fnmatchcase(part, p) for p in patterns)
+
+    links = carried_symlinks(project, excluded)
+    if links:
+        shown = ", ".join(links[:5]) + (f", and {len(links) - 5} more" if len(links) > 5 else "")
+        raise TaskError(
+            f"project contains symlinks the Weft snapshot carries ({shown}); the task worker "
+            "refuses symlinks, so the task would fail remotely before the writer started. "
+            "Replace them with regular files or exclude them from the snapshot"
         )
-    ]
+    return [name for name in names if not any(excluded(part) for part in Path(name).parts)]
+
+
+def carried_symlinks(project: Path, excluded) -> list[str]:
+    """Symlinks that Weft's source snapshot keeps as symlinks.
+
+    rg does not list symlinks, so they never enter the baseline, but Weft
+    carries every in-root link that its exclusions do not drop, and the worker's
+    census refuses any symlink it finds. Weft replaces a link whose target is
+    absolute or leaves the tree with the target's content, as its
+    symlinkTargetWithinRoot does, so only in-root links are reported.
+    """
+    found = []
+    for directory, dirs, files in os.walk(project):
+        relative = Path(directory).relative_to(project)
+        for name in sorted([*dirs, *files]):
+            path = Path(directory) / name
+            if excluded(name) or not path.is_symlink():
+                continue
+            target = os.readlink(path)
+            joined = os.path.normpath(os.path.join(relative, target))
+            if not os.path.isabs(target) and joined != ".." and not joined.startswith("../"):
+                found.append((relative / name).as_posix())
+        dirs[:] = [d for d in dirs if not excluded(d)]
+    return found
 
 
 def send(record: dict, directory: Path) -> dict:
@@ -610,14 +639,23 @@ def retrieve(record: dict, *, include_diff: bool = True) -> dict:
         raise TaskError("invalid task outcome")
     if result["status"] == "completed" and worker.status != "completed":
         raise TaskError("task claims success for an unsuccessful worker")
-    if request["check"] and result["status"] == "completed":
-        validation = result.get("validation")
-        if (
+    validation = result.get("validation")
+    if not request["check"] and validation is not None:
+        raise TaskError("task reports validation that was not requested")
+    if result["status"] == "validation_failed" and (
+        not request["check"] or not isinstance(validation, dict)
+    ):
+        raise TaskError("task reports a validation failure without requested validation")
+    if (
+        request["check"]
+        and result["status"] == "completed"
+        and (
             not isinstance(validation, dict)
             or validation.get("command") != request["check"]
             or validation.get("exit_code") != 0
-        ):
-            raise TaskError("task lacks successful requested validation")
+        )
+    ):
+        raise TaskError("task lacks successful requested validation")
     changes = validate_changes(request, result.get("changes"))
     return {
         **result,
@@ -652,7 +690,8 @@ def apply_changes(root: Path, changes: list[dict], backup: Path) -> None:
                 temporary.chmod(change["after_mode"])
                 temporary.replace(path)
             replaced.append(change)
-    except OSError:
+    except (OSError, TaskError):
+        # TaskError covers a path that turned into a symlink after preflight.
         for change in reversed(replaced):
             path = safe_path(root, change["path"])
             if change["before"] is None:
