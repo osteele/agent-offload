@@ -130,7 +130,10 @@ Trust boundary, by contrast with `run`:
 - **Confined.** Tool paths are canonicalized and must resolve inside the
   project root; URL/device schemes, parent traversal, symlink escapes,
   binary and oversized inputs are refused. Reads, matches, files, tool-call
-  argument size, and wall time are bounded.
+  argument size, and wall time are bounded. Glob and grep do not descend into
+  version-control stores or installed dependencies (`.git`, `.jj`, `.hg`,
+  `.svn`, `node_modules`, `.venv`, `__pycache__`); `review_read` can still
+  read a file there by path.
 - **Remote side is a blank room.** Built-in tools, LSP, extensions, skills,
   rules, sessions, pty, workspace-tree scanning, goals, xdev, and secrets
   are disabled twice (omp flags and a config overlay written to a scratch

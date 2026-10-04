@@ -230,3 +230,28 @@ describe("glob semantics and served-path evidence", () => {
 		}
 	});
 });
+
+describe("walk scope", () => {
+	test("dependency and VCS directories do not spend the traversal bound", async () => {
+		const root = await makeRoot();
+		for (const dir of [".jj", "node_modules", ".venv"]) {
+			await mkdir(join(root, dir, "deep"), { recursive: true });
+			for (let i = 0; i < 20; i += 1) {
+				await writeFile(join(root, dir, "deep", `f${i}.md`), "needle");
+			}
+		}
+		const tiny: RelayBounds = { ...bounds, maxTraversedFiles: 10 };
+		try {
+			const globbed = await globBound(root, "**/*.md", tiny);
+			expect(globbed.details.served_paths.map((p) => p.path)).toEqual([join(root, "sub", "a.md")]);
+			expect(globbed.details.truncated).toBe(false);
+			const grepped = await grepBound(root, "needle", tiny);
+			expect(grepped.details.served_paths.map((p) => p.path)).toEqual([join(root, "sub", "a.md")]);
+			// An explicit read still reaches them.
+			const read = await readBound(root, "node_modules/deep/f0.md", tiny);
+			expect(read.content).toBe("needle");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+});

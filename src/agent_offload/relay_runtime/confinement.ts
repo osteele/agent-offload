@@ -221,15 +221,23 @@ async function readWithinBound(filePath: string, bounds: RelayBounds): Promise<U
 	return bytes.length > bounds.maxReadBytes ? null : bytes;
 }
 
-/** Bounded walk that never follows symlinks, never enters .git, and stops
- * after maxTraversed files — matching or not — so a nonmatching tree
- * terminates the call instead of funding an endless walk. */
+/** Directories glob and grep never enter: version-control stores and
+ * installed dependencies would spend the traversal bound before the
+ * project's own files. review_read still reaches files inside them. */
+const UNWALKED_DIRECTORIES = new Set([
+	".git", ".jj", ".hg", ".svn", "node_modules", ".venv", "__pycache__",
+]);
+
+/** Bounded walk that never follows symlinks, skips UNWALKED_DIRECTORIES,
+ * and stops after maxTraversed files — matching or not — so a nonmatching
+ * tree terminates the call instead of funding an endless walk. */
 async function walk(dir: string, state: WalkState, visit: FileVisitor): Promise<void> {
 	if (state.stop) return;
 	const entries = await readdir(dir, { withFileTypes: true });
 	for (const entry of entries) {
 		if (state.stop) return;
-		if (entry.isSymbolicLink() || entry.name === ".git") continue;
+		if (entry.isSymbolicLink()) continue;
+		if (entry.isDirectory() && UNWALKED_DIRECTORIES.has(entry.name)) continue;
 		const child = `${dir}/${entry.name}`;
 		if (entry.isDirectory()) {
 			await walk(child, state, visit);
