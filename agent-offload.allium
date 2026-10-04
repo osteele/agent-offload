@@ -684,6 +684,10 @@ rule FailRelaySession {
         -- its record then carries no model, since it claims no response. A
         -- model it does report must be the pinned selector.
     @guidance
+        -- A bridge that fails before its ready frame (preflight, runtime start,
+        -- or tool registration) reports an error and writes no relay record;
+        -- only a stream that reached ready can settle into a record.
+    @guidance
         -- Failure is fail-closed at every stage: a refused tool registration,
         -- an incomplete lifecycle, a served path outside the root, or a
         -- bridge that exits without a result is refused, and a remote
@@ -706,11 +710,10 @@ rule CancelRelaySession {
     ensures: session.status = cancelled
     ensures: session.failure = "cancelled locally"
     ensures: remote_process_tree_terminated(session)
-    ensures: RelayRecordWritten(session)
     @guidance
-        -- Implementation delta: an interrupt at the conductor terminates the
-        -- bridge's process group without reading the cancellation result the
-        -- bridge would emit, so no record is written.
+        -- No relay record is written. The conductor terminates the bridge's
+        -- process group on interrupt rather than waiting for a cancellation
+        -- result, and the command exits with an error.
 }
 
 rule LoseRelayParent {
@@ -1001,4 +1004,3 @@ surface HistoricalArchive {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Is a relay result record written when the bridge fails before the ready frame, or only for streams that reached a result?"

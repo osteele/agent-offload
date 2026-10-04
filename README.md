@@ -117,7 +117,10 @@ Trust boundary, by contrast with `run`:
 
 - **Attached.** The command stays in the foreground; the remote process tree
   dies with it. Closing the terminal or killing the command cancels the relay
-  and stops the remote agent. `--detach` is refused, there is no job id and no resume.
+  and stops the remote agent. `--detach` is refused, there is no job id and no resume. An
+  interrupted relay writes no result record, and neither does one whose
+  bridge fails before the remote agent reports ready; both exit with an
+  error instead.
 - **Not durable, not snapshot-backed.** No source snapshot leaves the laptop.
   The remote side sees project instructions and the prompt only, both sent
   explicitly with digests recorded. Because the tree is live, two reads can
