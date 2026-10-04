@@ -913,3 +913,70 @@ def test_walk_refuses_a_symlinked_directory(tmp_path):
     (tmp_path / "alias").symlink_to(tmp_path / "real")
     with pytest.raises(TaskError, match="symlink directory"):
         walk_files(tmp_path)
+
+
+@pytest.mark.parametrize("name", ["", "a//b", "/abs"])
+def test_safe_path_refuses_empty_unnormalized_and_absolute_names(tmp_path, name):
+    with pytest.raises(TaskError):
+        safe_path(tmp_path, name)
+
+
+def test_manifest_refuses_an_oversized_regular_file(tmp_path):
+    from agent_offload.task_protocol import MAX_FILE
+
+    (tmp_path / "ok.txt").write_bytes(b"x" * MAX_FILE)
+    (tmp_path / "big.txt").write_bytes(b"x" * (MAX_FILE + 1))
+    assert list(manifest(tmp_path, ["ok.txt"])) == ["ok.txt"]
+    with pytest.raises(TaskError, match="at most"):
+        manifest(tmp_path, ["big.txt"])
+
+
+@pytest.mark.parametrize("changes", [{"path": "a"}, ["hello.py"], [None]])
+def test_validate_changes_refuses_malformed_payloads(tmp_path, changes):
+    request, _ = proposal(tmp_path)
+    with pytest.raises(TaskError):
+        validate_changes(request, changes)
+
+
+def test_object_json_refuses_a_non_object():
+    from agent_offload.task_protocol import SCHEMA, object_json
+
+    with pytest.raises(TaskError):
+        object_json(json.dumps([{"schema_version": SCHEMA}]), SCHEMA)
+
+
+def test_linked_content_check_follows_nested_links_and_single_files(tmp_path, monkeypatch):
+    from agent_offload.task_protocol import MAX_FILE
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "hello.py").write_text("hello")
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / "small.txt").write_text("small")
+    (store / "big.bin").write_bytes(b"x" * (MAX_FILE + 1))
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "deep").symlink_to(store)
+    (project / "notes.txt").symlink_to(store / "small.txt")
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
+
+    def attempt(identity: str) -> None:
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity=identity,
+        )
+
+    # A small file behind an out-of-project link is accepted.
+    with pytest.raises(TaskError, match="resume this identity"):
+        attempt("small-link")
+    # A large file is found through a link inside the linked directory.
+    (project / "shared").symlink_to(shared)
+    with pytest.raises(TaskError, match=r"shared/deep/big\.bin"):
+        attempt("nested-link")

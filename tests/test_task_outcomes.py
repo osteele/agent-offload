@@ -589,3 +589,19 @@ def test_retrieve_renders_the_diff_and_status_omits_it(task_factory, capsys):
     record, _ = task_factory("diffed")
     assert tasks.retrieve(record)["diff"].startswith("--- a/hello.py\n+++ b/hello.py\n")
     assert tasks.retrieve(record, include_diff=False)["diff"] == ""
+
+
+def test_completed_result_is_bound_to_the_writer_cwd_and_policy(task_factory, tmp_path):
+    record, result = task_factory("transcript-cwd")
+    result["worker"]["worker_cwd"] = str(tmp_path / "elsewhere")
+    serve_result(tmp_path, record, result)
+    with pytest.raises(ValueError):
+        tasks.retrieve(record)
+
+    record, result = task_factory("transcript-policy")
+    evidence = result["worker"]["omp_evidence"]
+    for header in (evidence["header"], evidence["events"][0]):
+        header["tool_policy"] = "read-only-no-shell"
+    serve_result(tmp_path, record, result)
+    with pytest.raises(ValueError):
+        tasks.retrieve(record)
