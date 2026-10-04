@@ -62,6 +62,19 @@ FAKE_BRIDGE = textwrap.dedent(
 
     signal.signal(signal.SIGTERM, terminate)
 
+    if scenario == "slow_term":
+        def slow_terminate(signum, _handler):
+            with open(os.environ["RELAY_FAKE_TERMINATED_MARKER"], "w") as handle:
+                handle.write("terminated")
+            time.sleep(2)
+            sys.exit(130)
+
+        signal.signal(signal.SIGTERM, slow_terminate)
+        with open(os.environ["RELAY_FAKE_STARTED_MARKER"], "w") as handle:
+            handle.write("started")
+        time.sleep(120)
+        sys.exit(0)
+
     if scenario == "sleep":
         if os.environ.get("RELAY_FAKE_STARTED_MARKER"):
             with open(os.environ["RELAY_FAKE_STARTED_MARKER"], "w") as handle:
@@ -595,15 +608,17 @@ from agent_offload import relay
 relay._require_bun = lambda: 'fake-bun'
 relay._ensure_runtime = lambda runtime_dir: Path(sys.argv[2])
 relay._bridge_command = lambda bun, bridge: [sys.executable, str(bridge)]
-relay.run_relay(project_root=Path(sys.argv[1]), prompt='review this',
-                host='agent@studio', timeout_seconds=60)
+import argparse
+sys.exit(relay.cmd_relay(argparse.Namespace(
+    project=Path(sys.argv[1]), prompt='review this', prompt_file=None,
+    host='agent@studio', timeout=60.0, json=False, detach=False)))
 """
     return subprocess.Popen(
         [sys.executable, "-c", code, str(relay_project), str(fake_bridge)],
         cwd=relay_project.parent,
         env=env,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
 
 
@@ -716,3 +731,23 @@ def test_conductor_attests_exactly_the_flags_the_bridge_sets() -> None:
     block = re.search(r"REMOTE_DISABLE_FLAGS = \[(.*?)\] as const", source, re.DOTALL)
     assert block is not None
     assert tuple(re.findall(r'"(--[a-z-]+)"', block.group(1))) == relay_module.REMOTE_DISABLE_FLAGS
+
+
+def test_repeated_interrupt_still_terminates_the_bridge_and_exits_cleanly(
+    relay_project: Path, fake_bridge: Path
+) -> None:
+    child = _relay_child(relay_project, fake_bridge, "slow_term")
+    try:
+        _wait_marker(_marker(relay_project, "started"), child)
+        child.send_signal(signal.SIGINT)
+        _wait_marker(_marker(relay_project, "terminated"), child, allow_exit=True)
+        # A second Ctrl-C while the conductor waits for the bridge to exit.
+        child.send_signal(signal.SIGINT)
+        _, stderr = child.communicate(timeout=20)
+        assert child.returncode == 130
+        assert b"Traceback" not in stderr
+        assert b"relay interrupted" in stderr
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)

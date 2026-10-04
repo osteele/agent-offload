@@ -148,6 +148,24 @@ def _unwind_on_hangup():
         signal.signal(signal.SIGHUP, previous)
 
 
+@contextmanager
+def _deferred_interrupts():
+    """Hold off further Ctrl-C while tearing down the bridge.
+
+    The first interrupt is what starts teardown; a second one arriving while
+    the conductor waits for the bridge to exit would otherwise abandon the
+    group termination halfway.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 @dataclass(frozen=True)
 class RelayBounds:
     max_read_bytes: int = MAX_READ_BYTES
@@ -440,14 +458,15 @@ def run_relay(
                 bridge_error = str(payload["error"].get("message", "bridge error"))
                 break
     finally:
-        try:
-            process.stdin.close()
-        except OSError:
-            pass
-        if process.poll() is None:
-            _terminate_group(process)
-        if reader is not None:
-            reader.join(timeout=5)
+        with _deferred_interrupts():
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+            if process.poll() is None:
+                _terminate_group(process)
+            if reader is not None:
+                reader.join(timeout=5)
     if bridge_error is not None:
         raise RelayError(f"relay bridge failed closed: {bridge_error}")
     if timed_out and bridge_result is None:
@@ -572,6 +591,13 @@ def cmd_relay(args: argparse.Namespace) -> int:
     except RelayError as exc:
         print(f"agent-offload: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print(
+            "agent-offload: relay interrupted; the remote agent was stopped and no "
+            "result record was written",
+            file=sys.stderr,
+        )
+        return 130
     if args.json:
         print(json.dumps({"result_path": str(result_path), "result": record}, sort_keys=True))
         return 4 if record["failure"] else 0
