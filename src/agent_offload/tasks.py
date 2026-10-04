@@ -682,18 +682,27 @@ def apply_changes(root: Path, changes: list[dict], backup: Path) -> None:
             raise TaskError(f"local file changed since submission: {change['path']}")
     save(backup, {"changes": changes})
     replaced = []
+    created: list[Path] = []
     try:
         for change in changes:
             path = safe_path(root, change["path"])
             if change["after"] is None:
                 path.unlink()
             else:
-                path.parent.mkdir(parents=True, exist_ok=True)
+                missing = [p for p in path.parents if p.is_relative_to(root) and not p.exists()]
+                for directory in reversed(missing):
+                    directory.mkdir()
+                    created.append(directory)
                 with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-                    stream.write(decode(change["after"]))
                     temporary = Path(stream.name)
-                temporary.chmod(change["after_mode"])
-                temporary.replace(path)
+                    try:
+                        stream.write(decode(change["after"]))
+                        stream.close()
+                        temporary.chmod(change["after_mode"])
+                        temporary.replace(path)
+                    except OSError:
+                        temporary.unlink(missing_ok=True)
+                        raise
             replaced.append(change)
     except (OSError, TaskError):
         # TaskError covers a path that turned into a symlink after preflight.
@@ -704,6 +713,8 @@ def apply_changes(root: Path, changes: list[dict], backup: Path) -> None:
             else:
                 path.write_bytes(decode(change["before"]))
                 path.chmod(change["before_mode"])
+        for directory in reversed(created):
+            directory.rmdir()
         raise
 
 

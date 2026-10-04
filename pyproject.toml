@@ -12,6 +12,7 @@ agent-offload-task-worker = "agent_offload.entry:task_worker"
 
 [dependency-groups]
 dev = [
+  "hypothesis>=6.168.3",
   "pytest>=8.0",
   "ruff>=0.9",
 ]
