@@ -190,18 +190,26 @@ export async function readBound(
 }
 
 /** Translate a shell-style glob into a matcher over root-relative paths.
- * `**` spans directories, and `**\/` also matches no directory at all, so
- * `src/**\/*.ts` matches `src/a.ts`. `*` stays within one segment. */
-function globToMatcher(pattern: string): (relativePath: string) => boolean {
-	const source = pattern
-		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-		.replace(/\*\*\//g, "\u0001")
-		.replace(/\*\*/g, "\u0000")
-		.replace(/\*/g, "[^/]*")
-		.replace(/\u0000/g, ".*")
-		.replace(/\?/g, "[^/]")
-		.replace(/\u0001/g, "(?:.*/)?");
-	return (relativePath) => new RegExp(`^${source}$`).test(relativePath);
+ * A `**` segment spans any number of directories, including none, so
+ * `src/**\/*.ts` matches `src/a.ts`. Inside a segment, `**` is just `*`;
+ * `*` and `?` never cross a `/`. */
+export function globToMatcher(pattern: string): (relativePath: string) => boolean {
+	const segments = pattern.split("/");
+	let source = "";
+	segments.forEach((segment, index) => {
+		const last = index === segments.length - 1;
+		if (segment === "**") {
+			source += last ? ".*" : "(?:[^/]+/)*";
+			return;
+		}
+		source += segment
+			.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+			.replace(/\*+/g, "[^/]*")
+			.replace(/\?/g, "[^/]");
+		if (!last) source += "/";
+	});
+	const regex = new RegExp(`^${source}$`);
+	return (relativePath) => regex.test(relativePath);
 }
 
 interface WalkState {
