@@ -853,3 +853,63 @@ def test_submit_refuses_oversized_content_behind_out_of_root_links(tmp_path, mon
         attempt("oversized")
     assert "2 MiB" in str(refused.value)
     assert not (tmp_path / "state" / "tasks" / "oversized" / "task.json").exists()
+
+
+def test_decode_refuses_non_base64_and_oversized_content():
+    from agent_offload.task_protocol import MAX_FILE, decode
+
+    with pytest.raises(TaskError, match="base64"):
+        decode("not base64!")
+    with pytest.raises(TaskError, match="base64"):
+        decode("aGVsbG8=\n")
+    assert decode(encode(b"x" * MAX_FILE)) == b"x" * MAX_FILE
+    with pytest.raises(TaskError, match="file size limit"):
+        decode(encode(b"x" * (MAX_FILE + 1)))
+
+
+def test_change_paths_may_not_be_both_a_file_and_a_directory(tmp_path):
+    request, changes = proposal(tmp_path)
+    for first, second in (("hello.py", "hello.py/inner"), ("hello.py/inner", "hello.py")):
+        nested = {**changes[0], "path": first}
+        created = {"path": second, "before": None, "after": encode(b"x"), "before_mode": None}
+        created["after_mode"] = 0o644
+        with pytest.raises(TaskError):
+            validate_changes(request, [nested, created])
+
+
+def test_change_and_manifest_size_bounds_count_every_file(tmp_path, monkeypatch):
+    from agent_offload import task_protocol
+
+    for name in ("a.txt", "b.txt"):
+        (tmp_path / name).write_text("12345")
+    monkeypatch.setattr(task_protocol, "MAX_TOTAL", 10)
+    assert len(manifest(tmp_path, ["a.txt", "b.txt"])) == 2
+    monkeypatch.setattr(task_protocol, "MAX_TOTAL", 9)
+    with pytest.raises(TaskError, match="exceeds"):
+        manifest(tmp_path, ["a.txt", "b.txt"])
+    created = [
+        {
+            "path": name,
+            "before": None,
+            "after": encode(b"12345"),
+            "before_mode": None,
+            "after_mode": 0o644,
+        }
+        for name in ("c.txt", "d.txt")
+    ]
+    monkeypatch.setattr(task_protocol, "MAX_TOTAL", 10)
+    assert validate_changes({"baseline": {}}, created) == created
+    monkeypatch.setattr(task_protocol, "MAX_TOTAL", 9)
+    with pytest.raises(TaskError, match="bundle exceeds"):
+        validate_changes({"baseline": {}}, created)
+
+
+def test_walk_refuses_a_symlinked_directory(tmp_path):
+    from agent_offload.task_protocol import walk_files
+
+    (tmp_path / "real").mkdir()
+    (tmp_path / "real" / "a.txt").write_text("a")
+    assert walk_files(tmp_path) == ["real/a.txt"]
+    (tmp_path / "alias").symlink_to(tmp_path / "real")
+    with pytest.raises(TaskError, match="symlink directory"):
+        walk_files(tmp_path)

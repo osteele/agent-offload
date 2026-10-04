@@ -499,3 +499,93 @@ def test_canceled_job_is_reported_as_canceled_and_not_resubmitted(
     assert row["job_id"] == record["job_id"]
     calls = (tmp_path / "weft-calls").read_text().splitlines()
     assert not any(json.loads(call)[0] == "run" for call in calls)
+
+
+def serve_result(tmp_path, record, result):
+    replies = tmp_path / "replies.json"
+    payloads = json.loads(replies.read_text())
+    payloads[record["job_id"]]["result"] = result
+    replies.write_text(json.dumps(payloads))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("selector", "openai-codex/gpt-6-luna"),
+        ("brief", "A different brief"),
+    ],
+)
+def test_completed_result_is_bound_to_its_writer_transcript(task_factory, field, value):
+    # The transcript records the selector and prompt digest the writer ran
+    # with; a retained request that disagrees must refuse the result.
+    record, _ = task_factory(f"transcript-{field}")
+    record["request"][field] = value
+    with pytest.raises(ValueError):
+        tasks.retrieve(record)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("model_call_id", "another-task"),
+        ("worker_source_sha256", "0" * 64),
+        ("worker_protocol_version", 1),
+    ],
+)
+def test_each_worker_identity_field_alone_refuses_the_result(task_factory, tmp_path, field, value):
+    record, result = task_factory(f"identity-{field.replace('_', '-')}")
+    result["worker"][field] = value
+    serve_result(tmp_path, record, result)
+    with pytest.raises(ValueError):
+        tasks.retrieve(record)
+
+
+def test_success_claimed_for_a_failed_worker_is_refused(task_factory, tmp_path):
+    record, result = task_factory("claims-success")
+    result["worker"]["status"] = "harness_failed"
+    result["worker"]["failure"] = "harness exited 1"
+    serve_result(tmp_path, record, result)
+    with pytest.raises(ValueError):
+        tasks.retrieve(record)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"validation": {"command": ["other"], "exit_code": 0, "stdout": "", "stderr": ""}},
+        {"validation": "passed"},
+    ],
+    ids=["other-command", "not-a-record"],
+)
+def test_success_needs_the_requested_check_record(task_factory, tmp_path, change):
+    record, result = task_factory("check-record")
+    result.update(change)
+    serve_result(tmp_path, record, result)
+    with pytest.raises(tasks.TaskError, match="successful requested validation"):
+        tasks.retrieve(record)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"changes": [{"path": "hello.py"}]},
+        {"validation": {"command": [], "exit_code": 1}},
+        {"report": None},
+        {"status": "validation_failed"},
+    ],
+    ids=["changes", "validation", "report", "status"],
+)
+def test_a_setup_failure_without_worker_evidence_carries_nothing_else(
+    task_factory, tmp_path, change
+):
+    record, result = task_factory("setup-failure", "failed")
+    result.update(change)
+    serve_result(tmp_path, record, result)
+    with pytest.raises(tasks.TaskError, match="invalid task worker failure"):
+        tasks.retrieve(record)
+
+
+def test_retrieve_renders_the_diff_and_status_omits_it(task_factory, capsys):
+    record, _ = task_factory("diffed")
+    assert tasks.retrieve(record)["diff"].startswith("--- a/hello.py\n+++ b/hello.py\n")
+    assert tasks.retrieve(record, include_diff=False)["diff"] == ""

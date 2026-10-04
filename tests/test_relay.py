@@ -751,3 +751,65 @@ def test_repeated_interrupt_still_terminates_the_bridge_and_exits_cleanly(
         if child.poll() is None:
             child.kill()
         child.wait(timeout=10)
+
+
+def _start(call_id="c1", tool="review_read"):
+    return {"type": "tool_execution_start", "toolCallId": call_id, "toolName": tool}
+
+
+def _end(call_id="c1", **extra):
+    return {
+        "type": "tool_execution_end",
+        "toolCallId": call_id,
+        "result": {"content": [], **extra.pop("result", {})},
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    "events,message",
+    [
+        ([{"type": "tool_execution_start", "toolCallId": "c1"}], "malformed"),
+        ([{"type": "tool_execution_start", "toolName": "review_read"}], "malformed"),
+        ([_start(), {"type": "tool_execution_end", "result": {"content": []}}], "without started"),
+        ([_start(), _end("c2")], "without started"),
+        (
+            [_start(), {"type": "tool_execution_end", "toolCallId": "c1", "result": {}}],
+            "lacks content",
+        ),
+        ([_start(), {"type": "tool_execution_end", "toolCallId": "c1"}], "lacks content"),
+    ],
+    ids=["no-tool", "no-id", "end-no-id", "end-unknown", "no-content", "no-result"],
+)
+def test_each_malformed_lifecycle_event_alone_is_refused(events, message) -> None:
+    from agent_offload.relay_protocol import validate_complete_tool_lifecycle
+
+    with pytest.raises(RelayProtocolError, match=message):
+        validate_complete_tool_lifecycle(events)
+
+
+def test_lifecycle_records_errors_from_the_event_or_its_result() -> None:
+    from agent_offload.relay_protocol import validate_complete_tool_lifecycle
+
+    calls = validate_complete_tool_lifecycle(
+        [
+            _start("a"),
+            _end("a", isError=True),
+            _start("b"),
+            _end("b", result={"isError": True}),
+            _start("c"),
+            _end("c"),
+        ]
+    )
+    assert [call["is_error"] for call in calls] == [True, True, False]
+    with pytest.raises(RelayProtocolError, match="without results: a, b"):
+        validate_complete_tool_lifecycle([_start("b"), _start("a")])
+
+
+def test_error_frame_needs_its_error_record() -> None:
+    from agent_offload.relay_protocol import BRIDGE_SCHEMA, validate_bridge_frame
+
+    frame = {"frame": "error", "schema_version": BRIDGE_SCHEMA, "error": {"message": "x"}}
+    assert validate_bridge_frame(frame) == "error"
+    with pytest.raises(RelayProtocolError, match="error"):
+        validate_bridge_frame({**frame, "error": "x"})
