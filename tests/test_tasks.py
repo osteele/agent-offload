@@ -816,3 +816,40 @@ def test_submit_refuses_in_root_symlinks_the_snapshot_carries(tmp_path, monkeypa
         attempt("linked")
     assert "escape.py" not in str(refused.value)
     assert not (tmp_path / "state" / "tasks" / "linked" / "task.json").exists()
+
+
+def test_submit_refuses_oversized_content_behind_out_of_root_links(tmp_path, monkeypatch):
+    from agent_offload.task_protocol import MAX_FILE
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "hello.py").write_text("hello")
+    outside = tmp_path / "outside"
+    (outside / "nested").mkdir(parents=True)
+    (outside / "small.txt").write_text("small")
+    (outside / "nested" / "cache").mkdir()
+    (outside / "nested" / "cache" / "huge.bin").write_bytes(b"x" * (MAX_FILE + 1))
+    (project / "shared").symlink_to(outside)
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=["cache"], run="exit 1")
+
+    def attempt(identity: str) -> None:
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity=identity,
+        )
+
+    # The oversized file sits under an excluded directory, so Weft drops it.
+    with pytest.raises(TaskError, match="resume this identity"):
+        attempt("excluded")
+    (outside / "nested" / "big.bin").write_bytes(b"x" * (MAX_FILE + 1))
+    (project / "data.bin").symlink_to(outside / "nested" / "big.bin")
+    with pytest.raises(TaskError, match=r"data\.bin, shared/nested/big\.bin") as refused:
+        attempt("oversized")
+    assert "2 MiB" in str(refused.value)
+    assert not (tmp_path / "state" / "tasks" / "oversized" / "task.json").exists()

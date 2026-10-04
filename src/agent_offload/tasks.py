@@ -27,6 +27,7 @@ from .protocol import package_source_sha256
 from .task_protocol import (
     EXCLUDED,
     LIST_SCHEMA,
+    MAX_FILE,
     MAX_TOTAL,
     RESULT_SCHEMA,
     SCHEMA,
@@ -327,27 +328,40 @@ def snapshot_names(project: Path) -> list[str]:
     def excluded(part: str) -> bool:
         return part.lower() in EXCLUDED or any(fnmatchcase(part, p) for p in patterns)
 
-    links = carried_symlinks(project, excluded)
+    links, oversized = snapshot_link_problems(project, excluded)
     if links:
-        shown = ", ".join(links[:5]) + (f", and {len(links) - 5} more" if len(links) > 5 else "")
         raise TaskError(
-            f"project contains symlinks the Weft snapshot carries ({shown}); the task worker "
-            "refuses symlinks, so the task would fail remotely before the writer started. "
-            "Replace them with regular files or exclude them from the snapshot"
+            f"project contains symlinks the Weft snapshot carries ({listing(links)}); the task "
+            "worker refuses symlinks, so the task would fail remotely before the writer "
+            "started. Replace them with regular files or exclude them from the snapshot"
+        )
+    if oversized:
+        raise TaskError(
+            f"symlinks leaving the project reach files over the {MAX_FILE // 2**20} MiB task "
+            f"file limit ({listing(oversized)}); Weft copies their content into the snapshot "
+            "and the task worker refuses it, so the task would fail remotely before the writer "
+            "started. Exclude them from the snapshot"
         )
     return [name for name in names if not any(excluded(part) for part in Path(name).parts)]
 
 
-def carried_symlinks(project: Path, excluded) -> list[str]:
-    """Symlinks that Weft's source snapshot keeps as symlinks.
+def listing(names: list[str]) -> str:
+    return ", ".join(names[:5]) + (f", and {len(names) - 5} more" if len(names) > 5 else "")
 
-    rg does not list symlinks, so they never enter the baseline, but Weft
-    carries every in-root link that its exclusions do not drop, and the worker's
-    census refuses any symlink it finds. Weft replaces a link whose target is
-    absolute or leaves the tree with the target's content, as its
-    symlinkTargetWithinRoot does, so only in-root links are reported.
+
+def snapshot_link_problems(project: Path, excluded) -> tuple[list[str], list[str]]:
+    """Symlinks the task worker would refuse, as Weft's source snapshot carries them.
+
+    rg does not list symlinks, so they never enter the baseline. Weft keeps
+    every in-root link that its exclusions do not drop, and the worker's census
+    refuses any symlink it finds; those are the first list. Weft replaces a
+    link whose target is absolute or leaves the tree with the target's content,
+    as its symlinkTargetWithinRoot does, applying the same exclusions inside it
+    and following further links. The census refuses any file of that content
+    over the task file limit; those, by their snapshot paths, are the second.
     """
-    found = []
+    in_root: list[str] = []
+    oversized: list[str] = []
     for directory, dirs, files in os.walk(project):
         relative = Path(directory).relative_to(project)
         for name in sorted([*dirs, *files]):
@@ -356,9 +370,35 @@ def carried_symlinks(project: Path, excluded) -> list[str]:
                 continue
             target = os.readlink(path)
             joined = os.path.normpath(os.path.join(relative, target))
+            snapshot_name = (relative / name).as_posix()
             if not os.path.isabs(target) and joined != ".." and not joined.startswith("../"):
-                found.append((relative / name).as_posix())
+                in_root.append(snapshot_name)
+            else:
+                oversized.extend(oversized_content(path, snapshot_name, excluded))
         dirs[:] = [d for d in dirs if not excluded(d)]
+    return in_root, oversized
+
+
+def oversized_content(path: Path, snapshot_name: str, excluded) -> list[str]:
+    """Snapshot paths of files over the task file limit at or under path."""
+    if path.is_file():
+        return [snapshot_name] if path.stat().st_size > MAX_FILE else []
+    found = []
+    # Links inside the target are followed, so a link back to an ancestor
+    # would repeat forever; each real directory is walked once, as Weft does.
+    visited = set()
+    for directory, dirs, files in os.walk(path, followlinks=True):
+        visited.add(os.path.realpath(directory))
+        relative = Path(snapshot_name) / Path(directory).relative_to(path)
+        dirs[:] = sorted(
+            d
+            for d in dirs
+            if not excluded(d) and os.path.realpath(Path(directory) / d) not in visited
+        )
+        for name in sorted(files):
+            file = Path(directory) / name
+            if not excluded(name) and file.is_file() and file.stat().st_size > MAX_FILE:
+                found.append((relative / name).as_posix())
     return found
 
 

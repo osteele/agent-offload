@@ -288,6 +288,9 @@ rule SubmitTask {
         -- The worker's census refuses symlinks, and the snapshot keeps every
         -- in-root link its exclusions do not drop; out-of-root links arrive
         -- as their targets' content and are accepted.
+    requires: not carries_oversized_linked_content(project)
+        -- Content reached through out-of-root links enters the snapshot, so a
+        -- file there over config.max_file_bytes would fail the census.
 
     ensures:
         let task = Task.created(
