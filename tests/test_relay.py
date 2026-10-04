@@ -80,7 +80,9 @@ FAKE_BRIDGE = textwrap.dedent(
         sys.exit(3)
 
     flags = ("--no-tools --no-lsp --no-extensions --no-skills --no-rules "
-             "--no-session --no-pty")
+             "--no-session --no-pty --no-title")
+    if scenario == "no_title":
+        flags = flags.replace(" --no-title", "")
     if scenario == "lookalike":
         flags = ("--no-tools=false --no-lsp --no-extensions --no-skills "
                  "--no-rules --no-session --no-pty")
@@ -115,7 +117,7 @@ FAKE_BRIDGE = textwrap.dedent(
     served = "/etc/passwd" if scenario == "outside_root" else root + "/notes.txt"
     digest = "a" * 64
     events = []
-    if scenario in ("happy", "outside_root"):
+    if scenario in ("happy", "outside_root", "slow_result"):
         events = [
             {"type": "tool_execution_start", "toolCallId": "c1", "toolName": "review_read"},
             {"type": "tool_execution_end", "toolCallId": "c1",
@@ -188,6 +190,10 @@ FAKE_BRIDGE = textwrap.dedent(
         result["failure"] = 7
     if scenario == "bad_cancelled":
         result["cancelled"] = "no"
+    if scenario == "remote_failure":
+        # The remote side died, so the bridge could not read session state.
+        result.update(model=None, session_id=None, final_response=None,
+                      failure="prompt failed: remote turn failed: overloaded")
     frame({"frame": "result", "schema_version": "agent-offload.relay-bridge/v1",
            "result": result})
     """
@@ -636,3 +642,77 @@ def test_sigkill_closes_bridge_lifeline(relay_project: Path, fake_bridge: Path) 
         if child.poll() is None:
             child.kill()
         child.wait(timeout=10)
+
+
+def test_remote_failure_without_session_state_is_recorded_as_a_failure(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result_path, record = _run_scenario(relay_project, monkeypatch, "remote_failure")
+    assert record["failure"] == "prompt failed: remote turn failed: overloaded"
+    assert record["model"] is None
+    assert json.loads(result_path.read_text())["failure"] == record["failure"]
+
+
+def test_success_without_model_attestation_is_still_refused() -> None:
+    from agent_offload.relay_protocol import validate_relay_result
+
+    record = {
+        "schema_version": RESULT_SCHEMA,
+        "harness": "omp",
+        "host_target": "h",
+        "host_identity": "h",
+        "project_root": "/p",
+        "prompt_sha256": "a" * 64,
+        "relay_source_sha256": "b" * 64,
+        "started_at": 1,
+        "ended_at": 2,
+        "durability": "none-attached-live-local-tools",
+        "snapshot_equivalent": False,
+        "model": None,
+        "failure": None,
+        "cancelled": False,
+        "final_response": "done",
+        "registered_tools": ["review_read", "review_glob", "review_grep"],
+        "remote_events": [],
+    }
+    with pytest.raises(RelayProtocolError, match="result.model"):
+        validate_relay_result(record, project_root="/p")
+    record["model"] = {"provider": "anthropic", "id": "claude-opus-4-5"}
+    record["failure"] = "prompt failed"
+    with pytest.raises(RelayProtocolError, match="drifted"):
+        validate_relay_result(record, project_root="/p")
+
+
+def test_result_parsed_after_the_bridge_exits_is_not_lost(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The reader thread is still parsing the result frame when the conductor
+    # notices the bridge has exited; a large result stream parses slowly.
+    validate = relay_module.validate_bridge_frame_kind
+
+    def slow_result(frame):
+        if frame.get("frame") == "result":
+            time.sleep(6.5)
+        return validate(frame)
+
+    monkeypatch.setattr(relay_module, "validate_bridge_frame_kind", slow_result)
+    _, record = _run_scenario(relay_project, monkeypatch, "slow_result")
+    assert record["final_response"] == "done"
+
+
+def test_refuses_remote_argv_without_title_suppression(
+    relay_project: Path, fake_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(RelayProtocolError, match="--no-title"):
+        _run_scenario(relay_project, monkeypatch, "no_title")
+
+
+def test_conductor_attests_exactly_the_flags_the_bridge_sets() -> None:
+    import re
+
+    source = (
+        Path(relay_module.__file__).resolve().parent / "relay_runtime" / "remote_argv.ts"
+    ).read_text()
+    block = re.search(r"REMOTE_DISABLE_FLAGS = \[(.*?)\] as const", source, re.DOTALL)
+    assert block is not None
+    assert tuple(re.findall(r'"(--[a-z-]+)"', block.group(1))) == relay_module.REMOTE_DISABLE_FLAGS

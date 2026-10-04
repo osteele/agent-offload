@@ -221,23 +221,28 @@ def validate_relay_result(result: Mapping[str, Any], *, project_root: str) -> di
         )
     if result.get("snapshot_equivalent") is not False:
         raise RelayProtocolError("result.snapshot_equivalent must be false")
-    model = _require(result, "model", (dict,), "result")
-    _require(model, "provider", (str,), "result.model")
-    _require(model, "id", (str,), "result.model")
-    # Selector attestation: the evidence binds to the pinned grounded route,
-    # so SDK/server-side drift cannot hide inside an otherwise valid result.
-    if model["provider"] != RELAY_PROVIDER or model["id"] != RELAY_MODEL_ID:
-        raise RelayProtocolError(
-            "result model drifted from the pinned grounded selector "
-            f"{RELAY_PROVIDER}/{RELAY_MODEL_ID}: "
-            f"{model['provider']}/{model['id']}"
-        )
     failure = result.get("failure")
     if failure is not None and not isinstance(failure, str):
         raise RelayProtocolError("result.failure must be a string or null")
     cancelled = result.get("cancelled")
     if not isinstance(cancelled, bool):
         raise RelayProtocolError("result.cancelled must be a boolean")
+    # A failed or cancelled session may have lost the remote state that names
+    # the model; it claims no response, so it is recorded without one. A model
+    # that is reported must still be the pinned one.
+    model = result.get("model")
+    if model is not None or (failure is None and not cancelled):
+        model = _require(result, "model", (dict,), "result")
+        _require(model, "provider", (str,), "result.model")
+        _require(model, "id", (str,), "result.model")
+        # Selector attestation: the evidence binds to the pinned grounded route,
+        # so SDK/server-side drift cannot hide inside an otherwise valid result.
+        if model["provider"] != RELAY_PROVIDER or model["id"] != RELAY_MODEL_ID:
+            raise RelayProtocolError(
+                "result model drifted from the pinned grounded selector "
+                f"{RELAY_PROVIDER}/{RELAY_MODEL_ID}: "
+                f"{model['provider']}/{model['id']}"
+            )
     final_response = result.get("final_response")
     if final_response is not None and not isinstance(final_response, str):
         raise RelayProtocolError("result.final_response must be a string or null")

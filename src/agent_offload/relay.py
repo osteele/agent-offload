@@ -103,6 +103,7 @@ REMOTE_DISABLE_FLAGS = (
     "--no-rules",
     "--no-session",
     "--no-pty",
+    "--no-title",
 )
 
 TRUST_EPILOG = """trust boundary:
@@ -400,7 +401,13 @@ def run_relay(
             try:
                 kind, payload = frames.get(timeout=min(remaining, 5.0))
             except queue.Empty:
-                if process.poll() is not None and frames.empty():
+                if process.poll() is None:
+                    continue
+                # The bridge has exited, but the reader may still be parsing
+                # its last frames. It ends at EOF unless a surviving child
+                # holds the pipe open, so give it the remaining time to finish.
+                reader.join(timeout=max(0.0, min(deadline - time.monotonic(), 30.0)))
+                if frames.empty():
                     break
                 continue
             if kind is None:

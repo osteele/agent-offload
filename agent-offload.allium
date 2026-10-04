@@ -615,6 +615,8 @@ rule StartRelay {
         -- under the state root, keyed by its relay source digest.
         -- The remote runtime is stripped twice: harness flags in the remote
         -- argv and a disable overlay written to a fresh scratch directory.
+        -- The conductor attests the same eight flags the bridge sets,
+        -- title suppression included.
         -- The remote shell removes that exact scratch directory on exit.
         -- The remote side discovers no project context of its own; it
         -- receives only the explicitly shipped project instructions and the
@@ -678,6 +680,10 @@ rule FailRelaySession {
     ensures: session.status = failed
     ensures: remote_process_tree_terminated(session)
     @guidance
+        -- A failed session may have lost the remote state naming its model;
+        -- its record then carries no model, since it claims no response. A
+        -- model it does report must be the pinned selector.
+    @guidance
         -- Failure is fail-closed at every stage: a refused tool registration,
         -- an incomplete lifecycle, a served path outside the root, or a
         -- bridge that exits without a result is refused, and a remote
@@ -701,6 +707,10 @@ rule CancelRelaySession {
     ensures: session.failure = "cancelled locally"
     ensures: remote_process_tree_terminated(session)
     ensures: RelayRecordWritten(session)
+    @guidance
+        -- Implementation delta: an interrupt at the conductor terminates the
+        -- bridge's process group without reading the cancellation result the
+        -- bridge would emit, so no record is written.
 }
 
 rule LoseRelayParent {
@@ -991,5 +1001,4 @@ surface HistoricalArchive {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Is the title suppression flag part of the attested blank-room disable set? The bridge enforces eight disable flags, the conductor attests seven."
 open question "Is a relay result record written when the bridge fails before the ready frame, or only for streams that reached a result?"
