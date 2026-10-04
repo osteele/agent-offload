@@ -139,8 +139,9 @@ function truncateUtf8(text: string, maxBytes: number): { text: string; truncated
 		}
 	}
 	let cut = lo - 1;
-	// Never end on half a surrogate pair.
-	while (cut > 0 && /[\uD800-\uDFFF]/.test(text[cut - 1] ?? "")) {
+	// Never end on half a surrogate pair: drop a trailing high surrogate whose
+	// low half was cut off, but keep complete pairs before it.
+	if (cut > 0 && /[\uD800-\uDBFF]/.test(text[cut - 1] ?? "")) {
 		cut -= 1;
 	}
 	const lastNewline = text.lastIndexOf("\n", cut);
