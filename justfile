@@ -7,6 +7,9 @@ check:
     uv run ruff check src tests
     uv run ruff format --check src tests
     uv run --with-editable ../agent-execution python -m pytest
+    # Install the locked toolchain first so a fresh or stale checkout (a
+    # remote workspace, say) typechecks with the pinned tsc, not one on PATH.
+    bun install --frozen-lockfile --cwd src/agent_offload/relay_runtime
     bun test src/agent_offload/relay_runtime
     bun run --cwd src/agent_offload/relay_runtime typecheck
 
