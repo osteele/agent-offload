@@ -435,3 +435,34 @@ describe("walk contents and bounds", () => {
 		});
 	});
 });
+
+describe("grep scope", () => {
+	test("grep honors the traversal bound", async () => {
+		await withRoot(async (root) => {
+			await mkdir(join(root, "many"));
+			for (let i = 0; i < 30; i += 1) {
+				await writeFile(join(root, "many", `f${i}.txt`), "nothing");
+			}
+			const out = await grepBound(root, "needle", { ...bounds, maxTraversedFiles: 10 });
+			expect(out.details.truncated).toBe(true);
+		});
+	});
+
+	test("grep skips a binary file even when it contains the pattern", async () => {
+		await withRoot(async (root) => {
+			await writeFile(join(root, "blob.bin"), new Uint8Array([0x6e, 0x65, 0x65, 0x64, 0x6c, 0x65, 0]));
+			const out = await grepBound(root, "needle", bounds);
+			expect(out.details.skipped).toEqual([join(root, "blob.bin")]);
+			expect(out.details.served_paths.map((p) => p.path)).toEqual([join(root, "sub", "a.md")]);
+		});
+	});
+
+	test("a matched line is clipped to 400 characters", async () => {
+		await withRoot(async (root) => {
+			await rm(join(root, "sub"), { recursive: true });
+			await writeFile(join(root, "long.txt"), `needle${"x".repeat(1000)}`);
+			const out = await grepBound(root, "needle", bounds);
+			expect(out.content).toBe(`${join(root, "long.txt")}:1: needle${"x".repeat(394)}`);
+		});
+	});
+});

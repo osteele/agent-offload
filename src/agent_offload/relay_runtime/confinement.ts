@@ -386,6 +386,8 @@ export async function grepBound(
 			}
 		}
 	});
+	// A walk cut short by the traversal bound did not search every file.
+	if (state.stop) truncated = true;
 	const content = matches.length > 0 ? matches.join("\n") : truncated
 		? "bound reached before any match"
 		: `no matches for ${JSON.stringify(pattern)}`;
