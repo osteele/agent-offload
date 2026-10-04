@@ -190,14 +190,17 @@ export async function readBound(
 }
 
 /** Translate a shell-style glob into a matcher over root-relative paths.
- * `**` spans directories, `*` stays within one segment. */
+ * `**` spans directories, and `**\/` also matches no directory at all, so
+ * `src/**\/*.ts` matches `src/a.ts`. `*` stays within one segment. */
 function globToMatcher(pattern: string): (relativePath: string) => boolean {
 	const source = pattern
 		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+		.replace(/\*\*\//g, "\u0001")
 		.replace(/\*\*/g, "\u0000")
 		.replace(/\*/g, "[^/]*")
 		.replace(/\u0000/g, ".*")
-		.replace(/\?/g, "[^/]");
+		.replace(/\?/g, "[^/]")
+		.replace(/\u0001/g, "(?:.*/)?");
 	return (relativePath) => new RegExp(`^${source}$`).test(relativePath);
 }
 
@@ -208,6 +211,15 @@ interface WalkState {
 }
 
 type FileVisitor = (filePath: string) => Promise<void>;
+
+/** Read a walked file only when it is within the read bound; null otherwise.
+ * The size is checked before reading, so one large file in the tree cannot
+ * pull its whole content into this process. */
+async function readWithinBound(filePath: string, bounds: RelayBounds): Promise<Uint8Array | null> {
+	if ((await stat(filePath)).size > bounds.maxReadBytes) return null;
+	const bytes = await readFile(filePath);
+	return bytes.length > bounds.maxReadBytes ? null : bytes;
+}
 
 /** Bounded walk that never follows symlinks, never enters .git, and stops
  * after maxTraversed files — matching or not — so a nonmatching tree
@@ -257,8 +269,8 @@ export async function globBound(
 		}
 		const relative = filePath.slice(rootReal.length + 1);
 		if (!glob(relative)) return;
-		const bytes = await readFile(filePath);
-		if (bytes.length > bounds.maxReadBytes || !isTextual(bytes)) {
+		const bytes = await readWithinBound(filePath, bounds);
+		if (bytes === null || !isTextual(bytes)) {
 			skipped.push(filePath);
 			return;
 		}
@@ -311,8 +323,8 @@ export async function grepBound(
 			state.stop = true;
 			return;
 		}
-		const bytes = await readFile(filePath);
-		if (bytes.length > bounds.maxReadBytes || !isTextual(bytes)) {
+		const bytes = await readWithinBound(filePath, bounds);
+		if (bytes === null || !isTextual(bytes)) {
 			skipped.push(filePath);
 			return;
 		}
@@ -335,6 +347,7 @@ export async function grepBound(
 			if (outBytes + hitBytes > bounds.maxToolResultBytes) {
 				truncated = true;
 				state.stop = true;
+				if (fileHits > 0) served[served.length - 1].truncated = true;
 				return;
 			}
 			matches.push(hit);
@@ -350,6 +363,8 @@ export async function grepBound(
 			}
 			if (matches.length >= bounds.maxGrepMatches) {
 				truncated = true;
+				const more = lines.slice(index + 1).some((rest) => rest.includes(pattern));
+				if (more) served[served.length - 1].truncated = true;
 				return;
 			}
 		}

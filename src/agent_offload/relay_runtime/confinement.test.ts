@@ -7,7 +7,7 @@
  * bounds must hold for glob and grep.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -171,6 +171,60 @@ describe("traversal and output byte bounds", () => {
 		try {
 			const out = await grepBound(root, "needle", tiny);
 			expect(Buffer.byteLength(out.content)).toBeLessThanOrEqual(1024);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("glob semantics and served-path evidence", () => {
+	test("a directory-spanning glob also matches files with no intermediate directory", async () => {
+		const root = await makeRoot();
+		try {
+			const top = await globBound(root, "**/*.txt", bounds);
+			expect(top.details.served_paths.map((p) => p.path)).toEqual([join(root, "notes.txt")]);
+			const nested = await globBound(root, "sub/**/*.md", bounds);
+			expect(nested.details.served_paths.map((p) => p.path)).toEqual([join(root, "sub", "a.md")]);
+			const exact = await globBound(root, "*.md", bounds);
+			expect(exact.details.served_paths).toHaveLength(0);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("glob and grep skip an oversized file without reading it", async () => {
+		const root = await makeRoot();
+		const big = join(root, "big.txt");
+		await writeFile(big, `needle ${"x".repeat(64)}`);
+		// Unreadable, so a read before the size check fails the call.
+		await chmod(big, 0o000);
+		const tiny: RelayBounds = { ...bounds, maxReadBytes: 32 };
+		try {
+			const globbed = await globBound(root, "*.txt", tiny);
+			expect(globbed.details.skipped).toEqual([big]);
+			const grepped = await grepBound(root, "needle", tiny);
+			expect(grepped.details.skipped).toContain(big);
+			expect(grepped.details.served_paths.map((p) => p.path)).toEqual([join(root, "sub", "a.md")]);
+		} finally {
+			await chmod(big, 0o644);
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("grep marks a served file truncated when the bound cuts its matches", async () => {
+		const root = await makeRoot();
+		await rm(join(root, "sub"), { recursive: true });
+		await writeFile(join(root, "many.txt"), "needle 1\nneedle 2\nneedle 3\n");
+		try {
+			const cut = await grepBound(root, "needle", { ...bounds, maxGrepMatches: 2 });
+			expect(cut.details.served_paths.map((p) => p.truncated)).toEqual([true]);
+			const whole = await grepBound(root, "needle", { ...bounds, maxGrepMatches: 3 });
+			expect(whole.details.served_paths.map((p) => p.truncated)).toEqual([false]);
+			const bytes = await grepBound(root, "needle", {
+				...bounds,
+				maxToolResultBytes: Buffer.byteLength(`${join(root, "many.txt")}:1: needle 1\n`) + 4,
+			});
+			expect(bytes.details.served_paths.map((p) => p.truncated)).toEqual([true]);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
