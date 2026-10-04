@@ -52,6 +52,10 @@ WORKSPACE_LANE = "agent-host-sync workspace run --dependency <path> ... <command
 # --no-sync, so the budget covers source pinning and recording, not the host
 # push; `send` resolves a timeout through `weft job lookup` rather than failing.
 SUBMIT_TIMEOUT = 180
+# Weft statuses of a job that ended without completing. A job that ends this
+# way and publishes no result is resumable; a canceled job is not, because the
+# consumer asked for it to stop.
+UNFINISHED_JOB_STATUSES = {"failed", "dead", "killed"}
 WEFT_LOOKUP_SCHEMA = "weft.job.lookup.v1"
 
 
@@ -516,7 +520,8 @@ def unpublished_failure(record: dict, observed: dict, error: ResultUnavailable) 
     except TaskError as log_error:
         log = f"(job log unavailable: {log_error})"
     return (
-        f"job {record['job_id']} failed with exit code {observed.get('exit_code')} "
+        f"job {record['job_id']} ended {observed['status']} with exit code "
+        f"{observed.get('exit_code')} "
         f"without publishing a task result ({error}). Job log tail:\n{log}\n"
         "If the worker reports a version mismatch and the host was stale, update it with "
         f"`{HOST_SYNC}` and resume with `agent-offload task resume {record['id']}`. "
@@ -563,7 +568,7 @@ def status(record: dict) -> dict:
             raise TaskError("Weft observation has no matching job identity/status")
         row["job_status"] = observed["status"]
         row["status"] = observed["status"]
-        if observed["status"] in {"completed", "failed"}:
+        if observed["status"] == "completed" or observed["status"] in UNFINISHED_JOB_STATUSES:
             try:
                 row["status"] = retrieve(record, include_diff=False)["status"]
             except ResultUnavailable as error:
@@ -574,7 +579,7 @@ def status(record: dict) -> dict:
                 )
                 # A completed job, or one whose result Weft reports as ready,
                 # should have a result; failing to read it is not a job failure.
-                if observed["status"] != "failed" or published:
+                if observed["status"] == "completed" or published:
                     raise
                 row.update(
                     status="failed_without_result",

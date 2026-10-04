@@ -472,3 +472,30 @@ def test_retrieve_refuses_validation_evidence_that_disagrees_with_the_request(
     replies.write_text(json.dumps(payloads))
     with pytest.raises(tasks.TaskError, match=message):
         tasks.retrieve(record)
+
+
+@pytest.mark.parametrize("job_status", ["dead", "killed"])
+def test_dead_or_killed_job_without_result_is_resumable(task_factory, tmp_path, capsys, job_status):
+    record, _ = task_factory(f"ended-{job_status}")
+    unpublished_failure(tmp_path, record, job_status=job_status)
+    assert tasks.handler(argparse.Namespace(action="status", id=record["id"])) == 0
+    row = json.loads(capsys.readouterr().out)
+    assert (row["status"], row["job_status"]) == ("failed_without_result", job_status)
+    assert f"ended {job_status}" in row["error"]
+    assert tasks.handler(argparse.Namespace(action="resume", id=record["id"])) == 0
+    resumed = json.loads(capsys.readouterr().out)
+    assert resumed["prior_job_ids"] == [record["job_id"]]
+
+
+@pytest.mark.parametrize("job_status", ["canceled", "cancelled"])
+def test_canceled_job_is_reported_as_canceled_and_not_resubmitted(
+    task_factory, tmp_path, capsys, job_status
+):
+    record, _ = task_factory(f"ended-{job_status}")
+    unpublished_failure(tmp_path, record, job_status=job_status)
+    assert tasks.handler(argparse.Namespace(action="resume", id=record["id"])) == 0
+    row = json.loads(capsys.readouterr().out)
+    assert row["status"] == job_status
+    assert row["job_id"] == record["job_id"]
+    calls = (tmp_path / "weft-calls").read_text().splitlines()
+    assert not any(json.loads(call)[0] == "run" for call in calls)

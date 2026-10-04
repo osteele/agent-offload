@@ -347,9 +347,6 @@ rule ResumeTask {
     -- Any terminal job state whose task never published a valid result is
     -- resumable as a new attempt, except a job the consumer explicitly
     -- canceled.
-    -- Implementation delta: the current code resubmits only after a Weft
-    -- `failed` observation (failed_without_result); killed and dead jobs
-    -- currently leave resume as a read-only no-op.
     requires: task.result = null
     requires: task.status != applied
     requires: task.job = null or task.job?.status in {failed, dead, killed}
@@ -428,11 +425,10 @@ rule MarkFailedJob {
     @guidance
         -- The diagnostic carries the job's exit code and the tail of the job
         -- log, with a hint to update the worker host and resume.
-        -- Implementation delta: the current code maps only `failed` jobs
-        -- through this rule. Weft's `dead` and `killed` statuses pass through
-        -- `task status` unmapped, as do `canceled` and `cancelled`, and a
-        -- failed job whose publication reports ready but whose result cannot
-        -- be read resolves to `unknown` rather than
+        -- Weft's `canceled` and `cancelled` statuses pass through `task
+        -- status` unmapped.
+        -- Implementation delta: a failed job whose publication reports ready
+        -- but whose result cannot be read resolves to `unknown` rather than
         -- `failed_without_result`.
 }
 
