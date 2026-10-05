@@ -17,3 +17,13 @@ decision-records skill; a full record needs Oliver's explicit confirmation.
   not established, and at least two agent-offload sessions exist). Enforcement
   sites are `tasks.py` submit preflight and retrieval,
   and `task_worker.py` worker start.
+- **2026-10-05** — In the context of a repository whose snapshot holds a file
+  over the 2 MiB task file limit, facing a submit that refused the whole
+  project over a file no task would edit (ao11), we decided to carry such a
+  file read-only — outside the editable baseline, censused by size and mode,
+  refused if a worker alters it or a result returns it as an edit — and
+  neglected a task-scoped exclusion flag or project-level task config, to keep
+  one plain submit command working on a project holding a corpus or fixture
+  without a second exclusion surface beside `.weft.toml`, accepting that an
+  oversized file is silently unavailable for editing and that its integrity is
+  judged by stat rather than by content.

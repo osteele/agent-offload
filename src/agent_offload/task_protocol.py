@@ -90,6 +90,41 @@ def manifest(root: Path, names: list[str]) -> dict[str, dict[str, object]]:
     return result
 
 
+def split_carried(root: Path, names: list[str]) -> tuple[list[str], list[str]]:
+    """Separate editable snapshot files from those over the task file limit.
+
+    A project is not disqualified by a large file it does not edit. The
+    protocol moves whole file contents, so a file over the limit cannot be an
+    edit, but the snapshot still carries it and a check can still read it.
+    """
+    editable, carried = [], []
+    for name in sorted(set(names)):
+        info = safe_path(root, name).stat()
+        oversized = stat.S_ISREG(info.st_mode) and info.st_size > MAX_FILE
+        (carried if oversized else editable).append(name)
+    return editable, carried
+
+
+def census(root: Path, names: list[str]) -> dict[str, dict[str, int]]:
+    """Size and mode of the carried files, which are present but not editable.
+
+    These files are unbounded in size, so the census stats them rather than
+    reading them: it answers whether a carried file is still the one the
+    snapshot delivered, not what it contains.
+    """
+    result = {}
+    for name in sorted(set(names)):
+        path = safe_path(root, name)
+        try:
+            info = path.stat()
+        except OSError as error:
+            raise TaskError(f"carried file is missing: {name}") from error
+        if not stat.S_ISREG(info.st_mode):
+            raise TaskError(f"carried file must be regular: {name}")
+        result[name] = {"size": info.st_size, "mode": stat.S_IMODE(info.st_mode)}
+    return result
+
+
 def walk_files(root: Path) -> list[str]:
     names = []
     for directory, dirs, files in os.walk(root, followlinks=False):
@@ -132,6 +167,9 @@ def object_json(text: str, schema: str) -> dict:
 def validate_changes(request: dict, changes: object) -> list[dict]:
     if not isinstance(changes, list) or len(changes) > 10000:
         raise TaskError("invalid task change list")
+    # A request retained before carried files were admitted has no carried set,
+    # and could have none: submit refused any project holding one outright.
+    carried = request.get("carried", {})
     seen: set[str] = set()
     total = 0
     for change in changes:
@@ -145,6 +183,8 @@ def validate_changes(request: dict, changes: object) -> list[dict]:
         if any(folded.startswith(other + "/") or other.startswith(folded + "/") for other in seen):
             raise TaskError("change paths overlap as a file and directory")
         seen.add(folded)
+        if name in carried:
+            raise TaskError(f"change edits a file over the task file limit: {name}")
         baseline = request["baseline"].get(name)
         before = decode(change["before"]) if change.get("before") is not None else None
         after = decode(change["after"]) if change.get("after") is not None else None

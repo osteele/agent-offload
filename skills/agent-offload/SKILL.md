@@ -38,7 +38,7 @@ agent-offload task apply TASK_ID
 
 Apply the `delegated-work-verification` skill before accepting changes. Inspect the diff, report, and check evidence. Retrieval validates the retained request, worker identity, transcript, and change bundle. Application checks every affected local file against the submitted baseline before writing and retains rollback bytes in the task journal. Resolve local conflicts deliberately; do not overwrite them to force application.
 
-Tasks support ordinary UTF-8 files, at most 2 MiB each and 64 MiB total. Symlinks and protected metadata are rejected. Snapshot census failures return failed task artifacts; inspect their reports. Keep tasks requiring interaction, local credentials, or GUI state local.
+Edits are ordinary UTF-8 files, at most 2 MiB each and 64 MiB total. A larger project file is carried read-only: the writer and the check can read it, and the task fails if it comes back as an edit, so a repository holding a corpus or fixture still uses the task lane. Symlinks and protected metadata are rejected. Snapshot census failures return failed task artifacts; inspect their reports. Keep tasks requiring interaction, local credentials, or GUI state local.
 
 ## Cancel and deploy
 

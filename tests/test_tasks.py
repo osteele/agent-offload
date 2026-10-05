@@ -96,7 +96,7 @@ def test_worker_census_failure_is_retrievable(tmp_path, monkeypatch):
 def proposal(root: Path) -> tuple[dict, list[dict]]:
     (root / "hello.py").write_text("print('before')\n")
     (root / "hello.py").chmod(0o644)
-    request = {"baseline": manifest(root, ["hello.py"])}
+    request = {"baseline": manifest(root, ["hello.py"]), "carried": {}}
     changes = [
         {
             "path": "hello.py",
@@ -629,6 +629,110 @@ def test_check_must_preserve_complete_proposal(tmp_path, monkeypatch, check_sour
         assert result["validation"]["error"] == "validation modified proposed source"
     else:
         assert result["status"] == "completed"
+
+
+def test_a_file_over_the_limit_is_carried_instead_of_refusing_the_project(tmp_path, monkeypatch):
+    # A repository holding a corpus or fixture still uses the task lane: the
+    # large file leaves the editable baseline rather than the snapshot.
+    from agent_offload import task_protocol
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(task_protocol, "MAX_FILE", 16)
+    project = tmp_path / "project"
+    files = ["hello.py", "data/corpus.jsonl"]
+    for name, text in zip(files, ["print('hi')\n", "a" * 64]):
+        (project / name).parent.mkdir(parents=True, exist_ok=True)
+        (project / name).write_text(text)
+        (project / name).chmod(0o644)
+    fake_tools(tmp_path, monkeypatch, files=files, excludes=[], run="exit 1")
+    with pytest.raises(TaskError, match="resume this identity"):
+        submit(
+            project,
+            "Fix hello",
+            host="studio",
+            selector="openai-codex/gpt-6-astra",
+            timeout=60,
+            check=[],
+            identity="carried",
+        )
+    request = read_record("carried")["request"]
+    assert list(request["baseline"]) == ["hello.py"]
+    assert request["carried"] == {"data/corpus.jsonl": {"size": 64, "mode": 0o644}}
+
+
+def test_a_carried_file_is_readable_but_never_an_edit(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from agent_offload import task_protocol, task_worker
+
+    monkeypatch.setattr(task_protocol, "MAX_FILE", 16)
+    request, changes = proposal(tmp_path)
+    corpus = tmp_path / "corpus.jsonl"
+    corpus.write_text("a" * 64)
+    corpus.chmod(0o644)
+    request.update(
+        id="carried-worker",
+        brief="Edit hello.py",
+        selector="openai-codex/gpt-6-astra",
+        timeout=30,
+        execution_sha256="unused-by-simulated-writer",
+        request_sha256="unused-by-simulated-writer",
+        carried={"corpus.jsonl": {"size": 64, "mode": 0o644}},
+        # The check reads the carried file the snapshot delivered.
+        check=[sys.executable, "-c", "assert len(open('corpus.jsonl').read()) == 64"],
+    )
+
+    def write_proposal(**kwargs):
+        (tmp_path / "hello.py").write_text("print('after')\n")
+        return SimpleNamespace(status="completed", harness=SimpleNamespace(stdout=""), to_dict=dict)
+
+    monkeypatch.setattr(task_worker, "execute_worker", write_proposal)
+    monkeypatch.setattr(task_worker, "omp_final_text", lambda output: "Edited hello.py")
+    result = task_worker.execute(request, tmp_path)
+    assert (result["status"], result["changes"]) == ("completed", changes)
+
+    (tmp_path / "hello.py").write_text("print('before')\n")
+
+    def rewrite_corpus(**kwargs):
+        corpus.write_text("b" * 65)
+        return SimpleNamespace(status="completed", harness=SimpleNamespace(stdout=""), to_dict=dict)
+
+    monkeypatch.setattr(task_worker, "execute_worker", rewrite_corpus)
+    with pytest.raises(TaskError, match="over the task file limit: corpus.jsonl"):
+        task_worker.execute(request, tmp_path)
+
+
+def test_a_returned_edit_of_a_carried_file_is_refused(tmp_path):
+    request, changes = proposal(tmp_path)
+    request["carried"] = {"hello.py": {"size": 4096, "mode": 0o644}}
+    with pytest.raises(TaskError, match="over the task file limit: hello.py"):
+        validate_changes(request, changes)
+
+
+def test_resume_still_checks_a_retained_request_that_predates_carried_files(tmp_path):
+    # An unresolved submission retained before carried files existed resumes
+    # under its own idempotency identity; its baseline check is unchanged.
+    from agent_offload.task_protocol import census
+    from agent_offload.tasks import check_baseline_unchanged
+
+    (tmp_path / "hello.py").write_text("print('before')\n")
+    (tmp_path / "hello.py").chmod(0o644)
+    record = {"project": str(tmp_path), "request": {"baseline": manifest(tmp_path, ["hello.py"])}}
+    check_baseline_unchanged(record)
+    (tmp_path / "hello.py").write_text("print('changed')\n")
+    with pytest.raises(TaskError, match="project changed since submission"):
+        check_baseline_unchanged(record)
+
+    # A request that does carry one compares it too.
+    corpus = tmp_path / "corpus.jsonl"
+    corpus.write_text("a" * 64)
+    record["request"]["baseline"] = manifest(tmp_path, ["hello.py"])
+    record["request"]["carried"] = census(tmp_path, ["corpus.jsonl"])
+    check_baseline_unchanged(record)
+    corpus.write_text("a" * 65)
+    with pytest.raises(TaskError, match="project changed since submission"):
+        check_baseline_unchanged(record)
 
 
 def test_selectors_report_the_accepted_writers(capsys):

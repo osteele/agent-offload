@@ -18,6 +18,7 @@ from .task_protocol import (
     RESULT_SCHEMA,
     SCHEMA,
     TaskError,
+    census,
     digest,
     encode,
     file_bytes,
@@ -30,6 +31,12 @@ from .task_protocol import (
 )
 
 
+def source_state(root: Path, carried: dict) -> tuple[dict, dict]:
+    """Census of the editable files, paired with the stat of the carried ones."""
+    editable = [name for name in walk_files(root) if name not in carried]
+    return manifest(root, editable), census(root, list(carried))
+
+
 def _validation_output(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value[-100000:].decode("utf-8", errors="replace")
@@ -37,12 +44,16 @@ def _validation_output(value: str | bytes | None) -> str:
 
 
 def execute(request: dict, root: Path) -> dict:
-    baseline = request["baseline"]
-    if manifest(root, list(baseline)) != baseline:
+    baseline, carried = request["baseline"], request["carried"]
+    if (manifest(root, list(baseline)), census(root, list(carried))) != (baseline, carried):
         raise TaskError("remote snapshot differs from the submitted baseline")
     # Record all materialized ordinary files, including files outside the edit
     # manifest, so changes to unexpected files cannot masquerade as additions.
-    before = {name: file_bytes(safe_path(root, name)) for name in walk_files(root)}
+    # Carried files are read-only: the protocol moves whole file contents, and
+    # these exceed the per-file limit, so they are censused rather than read.
+    before = {
+        name: file_bytes(safe_path(root, name)) for name in walk_files(root) if name not in carried
+    }
     worker = execute_worker(
         provider="omp",
         model_call_id=request["id"],
@@ -64,7 +75,11 @@ def execute(request: dict, root: Path) -> dict:
         expect_source_sha256=request["execution_sha256"],
         cwd=root,
     )
-    after_names = set(walk_files(root))
+    observed = census(root, list(carried))
+    if observed != carried:
+        altered = sorted(name for name in carried if observed[name] != carried[name])
+        raise TaskError(f"worker changed a file over the task file limit: {', '.join(altered)}")
+    after_names = set(walk_files(root)) - set(carried)
     changes = []
     for name in sorted(set(before) | after_names):
         path = safe_path(root, name)
@@ -92,7 +107,7 @@ def execute(request: dict, root: Path) -> dict:
     )
     validation = None
     if status == "completed" and request["check"]:
-        proposed_state = manifest(root, walk_files(root))
+        proposed_state = source_state(root, carried)
         timeout = min(request["timeout"], 900)
         try:
             checked = run_worker_command(request["check"], root, timeout)
@@ -115,9 +130,10 @@ def execute(request: dict, root: Path) -> dict:
             status = "validation_failed"
         # Validation must test the exact source state represented by the
         # proposal. A census that cannot even be taken, such as one finding a
-        # new oversized file, also means the check changed the tree.
+        # new oversized file or losing a carried one, also means the check
+        # changed the tree.
         try:
-            preserved = manifest(root, walk_files(root)) == proposed_state
+            preserved = source_state(root, carried) == proposed_state
         except TaskError:
             preserved = False
         if not preserved:

@@ -22,6 +22,8 @@ Each task runs against a Weft source snapshot with `workspace-write-no-shell`. T
 
 Snapshot exclusions apply to baseline files, symlink checks, and content reached through external links. For example, `.weft.toml` with `[sync] exclude_dirs = ["/harness/src"]` excludes that root-relative path and its descendants while preserving `nested/harness/src`. Patterns without a leading `/` match path components at any depth.
 
+A project file over the 2 MiB task file limit is carried, not refused. It stays out of the editable baseline and travels in the snapshot, so the writer and the `--check` command can read it; the request records its size and permissions. A result that returns it as an edit is refused, and so is a worker that changed it, since the protocol moves whole file contents and cannot carry one that large. Resume compares those sizes and permissions alongside the baseline.
+
 Checks must preserve ordinary source files, including their permissions. A check that edits, creates, or deletes source files publishes `validation_failed` even if it exits successfully, with the writer's evidence and a diagnostic in the validation record. Excluded cache directories such as `__pycache__` and `.pytest_cache` may change.
 
 A timed-out check publishes `validation_failed` with captured output and a timeout diagnostic. The worker exits unsuccessfully after publishing the result, so it remains available for retrieval and cannot be applied.

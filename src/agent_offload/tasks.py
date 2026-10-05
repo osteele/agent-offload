@@ -33,6 +33,7 @@ from .task_protocol import (
     SCHEMA,
     SELECTORS_SCHEMA,
     TaskError,
+    census,
     decode,
     digest,
     file_bytes,
@@ -41,6 +42,7 @@ from .task_protocol import (
     render_diff,
     result_path,
     safe_path,
+    split_carried,
     task_id,
     validate_changes,
 )
@@ -191,7 +193,7 @@ def submit(
     with locked(identity) as directory:
         if (directory / "task.json").exists():
             raise TaskError(f"task {identity} already exists; inspect it or use task resume")
-        names = snapshot_names(project)
+        editable, carried = split_carried(project, snapshot_names(project))
         request = {
             "schema_version": SCHEMA,
             "id": identity,
@@ -199,7 +201,8 @@ def submit(
             "selector": selector,
             "timeout": timeout,
             "check": check,
-            "baseline": manifest(project, names),
+            "baseline": manifest(project, editable),
+            "carried": census(project, carried),
             "execution_sha256": source_sha256(),
             "offload_sha256": package_source_sha256(),
         }
@@ -523,10 +526,14 @@ def idempotency_key(record: dict) -> str:
 
 
 def check_baseline_unchanged(record: dict) -> None:
-    # A new source snapshot must not silently replace the retained baseline.
-    if (
-        manifest(Path(record["project"]), list(record["request"]["baseline"]))
-        != record["request"]["baseline"]
+    # A new source snapshot must not silently replace the retained baseline,
+    # nor the carried files the writer reads and the check builds against. A
+    # request retained before carried files were admitted has no carried set,
+    # and could have none: submit refused any project holding one outright.
+    project, request = Path(record["project"]), record["request"]
+    carried = request.get("carried", {})
+    if manifest(project, list(request["baseline"])) != request["baseline"] or (
+        census(project, list(carried)) != carried
     ):
         raise TaskError("project changed since submission; inspect Weft before resuming")
 

@@ -71,6 +71,7 @@ def task_factory(tmp_path, monkeypatch):
                 f"raise SystemExit({7 if outcome == 'validation_failed' else 0})",
             ],
             "baseline": manifest(project, ["hello.py"]),
+            "carried": {},
             "execution_sha256": source_sha256(),
             "offload_sha256": package_source_sha256(),
         }
@@ -437,6 +438,7 @@ def test_worker_preserves_real_sdk_preflight_failure(tmp_path):
             "timeout": 1,
             "check": [],
             "baseline": manifest(tmp_path, ["source.txt"]),
+            "carried": {},
             "execution_sha256": "0" * 64,
             "request_sha256": "0" * 64,
         },
