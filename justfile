@@ -42,3 +42,11 @@ install:
     done
     echo "installed $release"
     "{{bin_dir}}/agent-offload-worker" identity
+
+# Install on Studio through agent-host-sync; account is agent or osteele.
+deploy account="agent":
+    agent-host-sync --account {{account}} apply --stage tools --tool agent-offload
+
+# Show what deploying to Studio would change, without changing anything.
+deploy-status account="agent":
+    agent-host-sync --account {{account}} plan --stage tools --tool agent-offload
