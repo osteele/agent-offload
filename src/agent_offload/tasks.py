@@ -311,9 +311,9 @@ def snapshot_names(project: Path) -> list[str]:
     """Project files that Weft's source snapshot will carry to the worker.
 
     The worker requires every baseline file to exist in its snapshot, so a file
-    that Weft's source exclusions drop must not enter the baseline. Weft reports
-    the exclusions it applies; each is a Go glob matched against every path
-    component, as weft's shouldExclude does.
+    that Weft's source exclusions drop must not enter the baseline. Root-anchored
+    patterns match a path or its ancestors; other patterns match individual
+    path components, as Weft's shouldExclude does.
     """
     names = run(
         ["rg", "--files", "--hidden", "-g", "!.git", "-g", "!.jj"], cwd=project
@@ -324,9 +324,19 @@ def snapshot_names(project: Path) -> list[str]:
         raise TaskError("weft sync inspect did not report the source exclusions")
     # Go spells a negated character class [^...]; fnmatch spells it [!...].
     patterns = [p.replace("[^", "[!") for p in excludes]
+    anchored = [p[1:].split("/") for p in patterns if p.startswith("/")]
+    unanchored = [p for p in patterns if not p.startswith("/")]
 
-    def excluded(part: str) -> bool:
-        return part.lower() in EXCLUDED or any(fnmatchcase(part, p) for p in patterns)
+    def excluded(path: Path) -> bool:
+        parts = path.parts
+        return any(
+            part.lower() in EXCLUDED or any(fnmatchcase(part, p) for p in unanchored)
+            for part in parts
+        ) or any(
+            len(pattern) <= len(parts)
+            and all(fnmatchcase(part, p) for part, p in zip(parts, pattern))
+            for pattern in anchored
+        )
 
     links, oversized = snapshot_link_problems(project, excluded)
     if links:
@@ -342,7 +352,7 @@ def snapshot_names(project: Path) -> list[str]:
             "and the task worker refuses it, so the task would fail remotely before the writer "
             "started. Exclude them from the snapshot"
         )
-    return [name for name in names if not any(excluded(part) for part in Path(name).parts)]
+    return [name for name in names if not excluded(Path(name))]
 
 
 def listing(names: list[str]) -> str:
@@ -366,7 +376,7 @@ def snapshot_link_problems(project: Path, excluded) -> tuple[list[str], list[str
         relative = Path(directory).relative_to(project)
         for name in sorted([*dirs, *files]):
             path = Path(directory) / name
-            if excluded(name) or not path.is_symlink():
+            if excluded(relative / name) or not path.is_symlink():
                 continue
             target = os.readlink(path)
             joined = os.path.normpath(os.path.join(relative, target))
@@ -375,7 +385,7 @@ def snapshot_link_problems(project: Path, excluded) -> tuple[list[str], list[str
                 in_root.append(snapshot_name)
             else:
                 oversized.extend(oversized_content(path, snapshot_name, excluded))
-        dirs[:] = [d for d in dirs if not excluded(d)]
+        dirs[:] = [d for d in dirs if not excluded(relative / d)]
     return in_root, oversized
 
 
@@ -393,11 +403,11 @@ def oversized_content(path: Path, snapshot_name: str, excluded) -> list[str]:
         dirs[:] = sorted(
             d
             for d in dirs
-            if not excluded(d) and os.path.realpath(Path(directory) / d) not in visited
+            if not excluded(relative / d) and os.path.realpath(Path(directory) / d) not in visited
         )
         for name in sorted(files):
             file = Path(directory) / name
-            if not excluded(name) and file.is_file() and file.stat().st_size > MAX_FILE:
+            if not excluded(relative / name) and file.is_file() and file.stat().st_size > MAX_FILE:
                 found.append((relative / name).as_posix())
     return found
 

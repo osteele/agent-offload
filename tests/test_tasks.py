@@ -297,6 +297,66 @@ def test_baseline_omits_files_weft_snapshot_excludes(tmp_path, monkeypatch):
     assert sorted(read_record("snapshot")["request"]["baseline"]) == ["hello.py", "src/keep.py"]
 
 
+@pytest.mark.parametrize("pattern", ["/harness/src", "/harnes?/s[^a-q]c"])
+def test_snapshot_anchored_exclusions_preserve_other_paths(tmp_path, monkeypatch, pattern):
+    project = tmp_path / "project"
+    files = [
+        "harness/src/drop.py",
+        "harness/src/deep/drop.py",
+        "harness/src-extra/keep.py",
+        "harness/deep/src/keep.py",
+        "nested/harness/src/keep.py",
+        "src/keep.py",
+    ]
+    for name in files:
+        path = project / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name)
+    fake_tools(tmp_path, monkeypatch, files=files, excludes=[pattern], run="exit 1")
+    assert tasks.snapshot_names(project) == files[2:]
+
+
+@pytest.mark.parametrize("pattern", ["/harness/src", "/harness"])
+def test_snapshot_anchored_exclusion_skips_link_but_not_nested_namesake(
+    tmp_path, monkeypatch, pattern
+):
+    project = tmp_path / "project"
+    (project / "harness").mkdir(parents=True)
+    (project / "hello.py").write_text("hello")
+    (project / "harness" / "src").symlink_to("../hello.py")
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[pattern], run="exit 1")
+    assert tasks.snapshot_names(project) == ["hello.py"]
+
+    (project / "nested" / "harness").mkdir(parents=True)
+    (project / "nested" / "harness" / "src").symlink_to("../../hello.py")
+    with pytest.raises(TaskError, match=r"carries \(nested/harness/src\)"):
+        tasks.snapshot_names(project)
+
+
+@pytest.mark.parametrize(
+    "pattern", ["/shared/nested", "/shared/nested/big.bin", "/shared/*/big.bin"]
+)
+def test_snapshot_anchored_exclusion_filters_dereferenced_content(tmp_path, monkeypatch, pattern):
+    from agent_offload.task_protocol import MAX_FILE
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "hello.py").write_text("hello")
+    outside = tmp_path / "outside"
+    (outside / "nested").mkdir(parents=True)
+    big_file = outside / "nested" / "big.bin"
+    with big_file.open("wb") as stream:
+        stream.truncate(MAX_FILE + 1)
+    (project / "shared").symlink_to(outside)
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[pattern], run="exit 1")
+    assert tasks.snapshot_names(project) == ["hello.py"]
+
+    # The same content at a different snapshot path is still checked.
+    (project / "other").symlink_to(outside)
+    with pytest.raises(TaskError, match=r"\(other/nested/big.bin\)"):
+        tasks.snapshot_names(project)
+
+
 def receipt(key: str, decision: str) -> dict:
     return {
         "api_version": "weft.run.receipt.v1",
