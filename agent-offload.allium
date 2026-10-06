@@ -138,9 +138,18 @@ entity Task {
     selector: String
     check: List<String>?
     timeout: Duration
+    account: String
     baseline: BaselineManifest
     request_digest: String
     worker_source_digest: String
+    worker_build_id: String?
+    worker_bin_dir: String?
+        -- The immutable worker build provisioned for this dispatch on the
+        -- task's host and account. The job launches that build's task
+        -- worker by absolute path, never by PATH name, so a queued job runs
+        -- the build it was sent with and the host's build cleanup can see
+        -- the build is still needed. A record from before provisioning
+        -- existed has neither and is provisioned when resumed.
     attempt: Integer
     job: WeftJob?
     prior_job_ids: List<String>
@@ -249,6 +258,7 @@ config {
     admitted_selector: String = "openai-codex/gpt-6-luna"    -- durable lane writer
     historical_selector: String = "gpt-5.5"                  -- retired lane, validation only
     pinned_relay_selector: String = "anthropic/claude-opus-5-5"
+    default_worker_account: String = "agent"
 
     max_task_timeout: Duration = 120.minutes
     default_task_timeout: Duration = 30.minutes
@@ -276,7 +286,7 @@ config {
 -- Durable task lane: submission and resume
 
 rule SubmitTask {
-    when: SubmitTask(caller, project, brief, selector, check, timeout, requested_id?)
+    when: SubmitTask(caller, project, brief, selector, check, timeout, account?, requested_id?)
 
     requires: length(brief) > 0
     requires: writer_selector_admitted(selector)
@@ -301,20 +311,24 @@ rule SubmitTask {
             selector: selector,
             check: check,
             timeout: timeout,
+            account: account ?? config.default_worker_account,
             baseline: baseline_manifest(project),
             request_digest: digest_of(brief),
             worker_source_digest: bundled_worker_digest(),
+            worker_build_id: null,
+            worker_bin_dir: null,
             attempt: 1,
             job: null,
             prior_job_ids: [],
             status: submitting
         )
-    ensures: SubmissionSent(task)
+    ensures: WorkerProvisioningRequested(task)
     @guidance
         -- The retained request and the submitting record are durable before
-        -- the job is sent, so an interrupted submission leaves a resumable
-        -- identity. There is no local-execution fallback: a send that cannot
-        -- be resolved leaves the task submission_unknown for explicit resume.
+        -- the worker is provisioned and the job is sent, so an interrupted
+        -- or refused submission leaves a resumable identity. There is no
+        -- local-execution fallback: a send that cannot be resolved leaves the
+        -- task submission_unknown for explicit resume.
         -- The send records the job and leaves host dispatch to Weft's daemon,
         -- so its budget covers source pinning and recording only. A send
         -- that outlives the budget is resolved by looking the idempotency key
@@ -322,10 +336,43 @@ rule SubmitTask {
         -- sent once more. A failed or malformed lookup is not evidence of
         -- absence and makes the send unresolved, as does a second failure.
     @guidance
-        -- A bundled-vs-installed worker digest mismatch refuses before
+        -- Local preflight: a mismatch between the installed agent-execution
+        -- worker and the copy bundled into agent-offload refuses before
         -- queueing, with a reinstall hint. An unprobeable installation
         -- defers the refusal to the worker's own identity check. A caller
         -- chosen id that already exists is refused in favor of resume.
+}
+
+rule ProvisionWorker {
+    when: WorkerProvisioningRequested(task)
+
+    requires: provisioned_build_matches(task)
+        -- Provisioning builds an immutable, content-addressed worker for
+        -- the task's host and account without activating it: the host's
+        -- current build and PATH are untouched. The build is accepted only
+        -- when the identity its own worker reports carries an agent-offload
+        -- source digest equal to the request's offload digest and an
+        -- agent-execution source digest equal to the request's execution
+        -- digest.
+    ensures: task.worker_build_id = provisioned_build(task).id
+    ensures: task.worker_bin_dir = provisioned_build(task).bin_dir
+    ensures: SubmissionSent(task)
+}
+
+rule RefuseMismatchedWorker {
+    when: WorkerProvisioningRequested(task)
+
+    requires: not provisioned_build_matches(task)
+    ensures: ProvisioningRefusalReported(task)
+    @guidance
+        -- The refusal happens before any Weft job exists, and the task keeps
+        -- its identity with no job and no recorded build, so resume
+        -- provisions again. The diagnostic names which side differs
+        -- (agent-offload, agent-execution, or both) and the fix: the local
+        -- installed agent-offload was built from different bytes than the
+        -- checkouts the host build is made from, so reinstall it locally or
+        -- commit or revert the checkout edits, then resubmit. A failed or
+        -- malformed provisioning answer refuses the same way.
 }
 
 rule SubmissionAccepted {
@@ -357,12 +404,19 @@ rule ResumeTask {
     requires: task.job = null or not task.job?.status in {canceled, cancelled}
     requires: baseline_unchanged(task)
     requires: task.job = null or submitter_unchanged(task)
+    requires: task.job = null or provisioned_build_matches(task)
+        -- A resubmission provisions again before anything changes, so a
+        -- refusal leaves the failed attempt exactly as it was.
 
     ensures:
         if task.job = null:
-            task.status = queued
-            SubmissionSent(task)
+            if task.worker_build_id = null:
+                WorkerProvisioningRequested(task)
+            else:
+                SubmissionSent(task)
         else:
+            task.worker_build_id = provisioned_build(task).id
+            task.worker_bin_dir = provisioned_build(task).bin_dir
             task.prior_job_ids = task.prior_job_ids + task.job?.id
             task.attempt = task.attempt + 1
             task.job = null
@@ -379,6 +433,12 @@ rule ResumeTask {
         -- submits a new task. An unresolved submission resumes regardless of
         -- submitting code changes, to recover the accepted job under the
         -- same identity.
+    @guidance
+        -- An unresolved submission keeps its recorded build: Weft may
+        -- already hold a job under its idempotency key, so the resend must
+        -- repeat the same command. Only a record that never had a build is
+        -- provisioned. A resubmission provisions afresh, which repairs a
+        -- build that changed or was collected while the failed job queued.
 }
 
 rule CancelTask {
@@ -428,7 +488,10 @@ rule MarkFailedJob {
             DiagnosticEmitted(task, log_tail(task.job))
     @guidance
         -- The diagnostic carries the job's exit code and the tail of the job
-        -- log, with a hint to update the worker host and resume.
+        -- log. Submission provisions the matching worker, so a version
+        -- mismatch here means the pinned build changed or disappeared under
+        -- the queued job; the hint is to resume, which provisions again,
+        -- or to submit a new task if the submitting machine changed.
         -- Weft's `canceled` and `cancelled` statuses pass through `task
         -- status` unmapped.
         -- Implementation delta: a failed job whose publication reports ready
@@ -925,7 +988,7 @@ surface TaskControl {
         task.result?.validation
 
     provides:
-        SubmitTask(caller, project, brief, selector, check, timeout, requested_id?)
+        SubmitTask(caller, project, brief, selector, check, timeout, account?, requested_id?)
         ObserveTask(caller, task)
         ResumeTask(caller, task)
         CancelTask(caller, task)
