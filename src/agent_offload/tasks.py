@@ -48,7 +48,8 @@ from .task_protocol import (
 )
 
 DEFAULT_SELECTOR = "openai-codex/gpt-6-sol"
-HOST_SYNC = "agent-host-sync --account agent apply --stage tools --tool agent-offload"
+ENSURE_TIMEOUT = 900
+ENSURE_SCHEMA = "agent-host-sync.ensure/v1"
 EXECUTION_IDENTITY_SCHEMA = "agent-execution.worker-identity/v1"
 WORKSPACE_LANE = "agent-host-sync workspace run --dependency <path> ... <command>"
 # Seconds one `weft run` may take to record the job. Submission passes
@@ -150,6 +151,7 @@ def submit(
     selector: str,
     timeout: float,
     check: list[str],
+    account: str = "agent",
     identity: str | None = None,
 ) -> dict:
 
@@ -213,6 +215,7 @@ def submit(
             "id": identity,
             "project": str(project),
             "host": host,
+            "account": account,
             "title": task_title(brief),
             "created_at": time.time(),
             "status": "submitting",
@@ -222,7 +225,76 @@ def submit(
         }
         # The identity and immutable request survive an interrupted submission.
         save(directory / "task.json", record)
+        ensure_worker(record)
+        save(directory / "task.json", record)
         return send(record, directory)
+
+
+def ensure_worker(record: dict) -> None:
+    """Build the exact peer for this dispatch without changing the host's live tool."""
+    try:
+        raw = run(
+            [
+                "agent-host-sync",
+                "--host",
+                record["host"],
+                "--account",
+                record.get("account", "agent"),
+                "ensure",
+                "--tool",
+                "agent-offload",
+                "--json",
+            ],
+            timeout=ENSURE_TIMEOUT,
+        )
+    except TaskError as error:
+        detail = str(error).strip()
+        raise TaskError(f"agent-host-sync ensure failed: {detail[-2000:]}") from error
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise TaskError("agent-host-sync ensure returned invalid JSON") from error
+    if not isinstance(value, dict) or value.get("schema") != ENSURE_SCHEMA:
+        raise TaskError(f"agent-host-sync ensure did not return {ENSURE_SCHEMA}")
+    builds = value.get("builds")
+    peers = (
+        [item for item in builds if isinstance(item, dict) and item.get("tool") == "agent-offload"]
+        if isinstance(builds, list)
+        else []
+    )
+    if len(peers) != 1:
+        raise TaskError("agent-host-sync ensure must return exactly one agent-offload build")
+    peer = peers[0]
+    identity = peer.get("identity")
+    build_id, bin_dir = peer.get("build_id"), peer.get("bin_dir")
+    if (
+        not isinstance(identity, dict)
+        or not isinstance(identity.get("source_sha256"), str)
+        or not isinstance(identity.get("execution"), dict)
+        or not isinstance(identity["execution"].get("source_sha256"), str)
+        or not isinstance(build_id, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", build_id)
+        or not isinstance(bin_dir, str)
+        or not Path(bin_dir).is_absolute()
+    ):
+        raise TaskError("agent-host-sync ensure returned a malformed agent-offload build")
+    request = record["request"]
+    mismatches = []
+    if identity["source_sha256"] != request["offload_sha256"]:
+        mismatches.append("agent-offload")
+    if identity["execution"]["source_sha256"] != request["execution_sha256"]:
+        mismatches.append("agent-execution")
+    if mismatches:
+        sides = " and ".join(mismatches)
+        raise TaskError(
+            f"remote {sides} identity differs from the task dispatch. The local installed "
+            "agent-offload was built from different bytes than the agent-offload / "
+            "agent-execution checkouts that agent-host-sync deploys. Reinstall agent-offload "
+            "locally (`just install` in the agent-offload checkout), or commit/revert the "
+            "checkout edits, then resubmit."
+        )
+    record["bin_dir"] = bin_dir
+    record["build_id"] = build_id
 
 
 def installed_execution_source_sha256() -> str | None:
@@ -419,11 +491,14 @@ def send(record: dict, directory: Path) -> dict:
     from .cli import WeftReceipt
 
     payload = directory / "request.json"
+    if not record.get("bin_dir") or not record.get("build_id"):
+        ensure_worker(record)
+        save(directory / "task.json", record)
     if digest(payload.read_bytes()) != record["request_sha256"]:
         raise TaskError("retained request was modified")
     command = shlex.join(
         [
-            "agent-offload-task-worker",
+            str(Path(record["bin_dir"]) / "agent-offload-task-worker"),
             "--task-id",
             record["id"],
             "--request-sha256",
@@ -560,6 +635,7 @@ def resubmit(record: dict, directory: Path) -> dict:
     """Submit the retained request again after its job failed without a result."""
     check_baseline_unchanged(record)
     check_submitter_unchanged(record)
+    ensure_worker(record)
     record.update(
         prior_job_ids=[*record.get("prior_job_ids", []), record["job_id"]],
         attempt=record.get("attempt", 1) + 1,
@@ -580,10 +656,11 @@ def unpublished_failure(record: dict, observed: dict, error: ResultUnavailable) 
         f"job {record['job_id']} ended {observed['status']} with exit code "
         f"{observed.get('exit_code')} "
         f"without publishing a task result ({error}). Job log tail:\n{log}\n"
-        "If the worker reports a version mismatch and the host was stale, update it with "
-        f"`{HOST_SYNC}` and resume with `agent-offload task resume {record['id']}`. "
+        "Submission provisions the matching worker on the host, so a version mismatch here "
+        "means the pinned build changed or disappeared under the queued job; "
+        f"`agent-offload task resume {record['id']}` provisions it again and resubmits. "
         "If the submitting machine's agent-offload or agent-execution changed since "
-        "submission, submit a new task instead; resume will refuse the resubmission."
+        "submission, resume refuses the resubmission; submit a new task instead."
     )
 
 
@@ -799,6 +876,7 @@ def handler(args: argparse.Namespace) -> int:
                 selector=args.selector,
                 timeout=args.timeout,
                 check=shlex.split(args.check or ""),
+                account=args.account,
                 identity=args.id,
             )
         elif args.action == "list":
@@ -839,6 +917,10 @@ def handler(args: argparse.Namespace) -> int:
                         if value["status"] == "failed_without_result":
                             value = resubmit(record, directory)
                     else:
+                        # An unresolved submission may already be queued under
+                        # its idempotency key; resending must repeat the same
+                        # command, so the recorded build is kept. send provisions
+                        # one only for a record that never had one.
                         check_baseline_unchanged(record)
                         value = send(record, directory)
                 elif args.action == "cancel":
@@ -882,6 +964,7 @@ def build_task_parser(subparsers) -> None:
     brief.add_argument("--brief", type=Path)
     brief.add_argument("--prompt")
     submit_parser.add_argument("--host", default="studio")
+    submit_parser.add_argument("--account", default="agent")
     submit_parser.add_argument(
         "--selector", choices=sorted(OMP_WRITER_SELECTORS), default=DEFAULT_SELECTOR
     )

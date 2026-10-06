@@ -6,6 +6,7 @@ from itertools import pairwise
 from pathlib import Path
 
 import pytest
+from conftest import PINNED_BIN, PINNED_BUILD, REAL_ENSURE_WORKER
 
 from agent_offload import tasks
 from agent_offload.task_protocol import (
@@ -1144,3 +1145,136 @@ def test_linked_content_check_follows_nested_links_and_single_files(tmp_path, mo
     (project / "shared").symlink_to(shared)
     with pytest.raises(TaskError, match=r"shared/deep/big\.bin"):
         attempt("nested-link")
+
+
+def peer_record() -> dict:
+    from agent_execution.identity import source_sha256
+
+    from agent_offload.protocol import package_source_sha256
+
+    return {
+        "host": "studio",
+        "account": "osteele",
+        "request": {
+            "offload_sha256": package_source_sha256(),
+            "execution_sha256": source_sha256(),
+        },
+    }
+
+
+def ensure_answer(record: dict) -> dict:
+    return {
+        "schema": "agent-host-sync.ensure/v1",
+        "account": record["account"],
+        "host": "studio-osteele",
+        "builds": [
+            {
+                "tool": "agent-execution",
+                "build_id": "c" * 64,
+                "bin_dir": "/Users/osteele/builds/execution/bin",
+                "created": False,
+                "identity": {"source_sha256": record["request"]["execution_sha256"]},
+            },
+            {
+                "tool": "agent-offload",
+                "build_id": "a" * 64,
+                "bin_dir": "/Users/osteele/builds/offload/bin",
+                "created": True,
+                "identity": {
+                    "source_sha256": record["request"]["offload_sha256"],
+                    "execution": {"source_sha256": record["request"]["execution_sha256"]},
+                },
+            },
+        ],
+    }
+
+
+def test_ensure_worker_provisions_for_the_task_host_and_account(monkeypatch):
+    record = peer_record()
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs.get("timeout")))
+        return json.dumps(ensure_answer(record))
+
+    monkeypatch.setattr(tasks, "run", run)
+    REAL_ENSURE_WORKER(record)
+    argv, timeout = calls[0]
+    assert argv == [
+        "agent-host-sync",
+        "--host",
+        "studio",
+        "--account",
+        "osteele",
+        "ensure",
+        "--tool",
+        "agent-offload",
+        "--json",
+    ]
+    # A cold build takes minutes; the ordinary 60 s helper budget would kill it.
+    assert timeout >= 600
+    assert (record["bin_dir"], record["build_id"]) == (
+        "/Users/osteele/builds/offload/bin",
+        "a" * 64,
+    )
+
+
+@pytest.mark.parametrize("side", ["agent-offload", "agent-execution"])
+def test_ensure_worker_refuses_a_build_that_is_not_the_pinned_version(monkeypatch, side):
+    record = peer_record()
+    answer = ensure_answer(record)
+    identity = answer["builds"][1]["identity"]
+    if side == "agent-offload":
+        identity["source_sha256"] = "0" * 64
+    else:
+        identity["execution"]["source_sha256"] = "0" * 64
+    monkeypatch.setattr(tasks, "run", lambda *args, **kwargs: json.dumps(answer))
+    with pytest.raises(TaskError, match=f"remote {side} identity differs"):
+        REAL_ENSURE_WORKER(record)
+    assert "bin_dir" not in record
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "{",
+        json.dumps({"schema": "other", "builds": []}),
+        json.dumps({"schema": "agent-host-sync.ensure/v1", "builds": []}),
+        json.dumps(
+            {
+                "schema": "agent-host-sync.ensure/v1",
+                "builds": [{"tool": "agent-offload", "build_id": "a" * 64, "bin_dir": "relative"}],
+            }
+        ),
+    ],
+)
+def test_ensure_worker_refuses_malformed_answers(monkeypatch, answer):
+    record = peer_record()
+    monkeypatch.setattr(tasks, "run", lambda *args, **kwargs: answer)
+    with pytest.raises(TaskError, match="ensure"):
+        REAL_ENSURE_WORKER(record)
+    assert "bin_dir" not in record
+
+
+def test_ensure_worker_failure_carries_the_reason(monkeypatch):
+    def run(*args, **kwargs):
+        raise TaskError("agent-host-sync: build failed: uv resolution error")
+
+    monkeypatch.setattr(tasks, "run", run)
+    with pytest.raises(TaskError, match="ensure failed: .*uv resolution error"):
+        REAL_ENSURE_WORKER(peer_record())
+
+
+def test_submit_launches_the_pinned_build_by_absolute_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["queued"], lookup="fail")
+
+    submit_slow(tmp_path)
+
+    record = read_record("slow")
+    assert (record["bin_dir"], record["build_id"]) == (PINNED_BIN, PINNED_BUILD)
+    run = next(line for line in calls.read_text().splitlines() if line.startswith("run "))
+    # Only an absolute path into the build store pins the queued job to its
+    # build and lets host cleanup see that the build is still needed.
+    assert f"{PINNED_BIN}/agent-offload-task-worker" in run
+    assert " agent-offload-task-worker " not in f" {run} "
