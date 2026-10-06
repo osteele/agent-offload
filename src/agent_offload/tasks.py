@@ -24,6 +24,7 @@ from agent_execution.omp_execution import OMP_WRITER_SELECTORS, validate_omp_tra
 from agent_execution.worker import WORKER_PROTOCOL_VERSION, WorkerResult
 
 from .protocol import package_source_sha256
+from .readiness import require_writer
 from .task_protocol import (
     EXCLUDED,
     LIST_SCHEMA,
@@ -48,7 +49,8 @@ from .task_protocol import (
 )
 
 DEFAULT_SELECTOR = "openai-codex/gpt-6-sol"
-ENSURE_TIMEOUT = 900
+# Allow the updater's 45-minute source-lock wait plus time for a cold build.
+ENSURE_TIMEOUT = 3600
 ENSURE_SCHEMA = "agent-host-sync.ensure/v1"
 EXECUTION_IDENTITY_SCHEMA = "agent-execution.worker-identity/v1"
 WORKSPACE_LANE = "agent-host-sync workspace run --dependency <path> ... <command>"
@@ -491,11 +493,50 @@ def send(record: dict, directory: Path) -> dict:
     from .cli import WeftReceipt
 
     payload = directory / "request.json"
+    if digest(payload.read_bytes()) != record["request_sha256"]:
+        raise TaskError("retained request was modified")
+    # A send that reached `weft run` may already have been accepted, whether it
+    # ended unresolved or the process died before persisting the receipt.
+    # Reconcile the durable receipt before provisioning or checking today's
+    # credentials/model availability; never resend an accepted task merely
+    # because readiness has since changed. A failed or malformed lookup is not
+    # evidence of absence and leaves the submission unresolved.
+    if record.get("status") == "submission_unknown" or record.get("submission_started"):
+        try:
+            recovered = recorded_receipt(record, Path(record["project"]))
+        except TaskError as error:
+            raise TaskError(
+                f"submission for task {record['id']} remains unresolved: {error}; "
+                f"resume with: agent-offload task resume {record['id']}"
+            ) from error
+        if recovered is not None:
+            try:
+                receipt = WeftReceipt.parse(recovered, idempotency_key=idempotency_key(record))
+            except ValueError as error:
+                raise TaskError(
+                    f"submission receipt for task {record['id']} is corrupt: {error}"
+                ) from error
+            if not receipt.job_id:
+                raise TaskError(f"Weft did not accept task {record['id']}")
+            record.update(
+                job_id=receipt.job_id,
+                host=receipt.selected_host,
+                source_pin=receipt.source_pin,
+                status="queued",
+            )
+            record.pop("error", None)
+            save(directory / "task.json", record)
+            return summary(record)
     if not record.get("bin_dir") or not record.get("build_id"):
         ensure_worker(record)
         save(directory / "task.json", record)
-    if digest(payload.read_bytes()) != record["request_sha256"]:
-        raise TaskError("retained request was modified")
+    try:
+        require_writer(record)
+    except TaskError as error:
+        raise TaskError(
+            f"writer readiness failed for retained task {record['id']}: {error}; "
+            f"resume with: agent-offload task resume {record['id']}"
+        ) from error
     command = shlex.join(
         [
             str(Path(record["bin_dir"]) / "agent-offload-task-worker"),
@@ -537,6 +578,11 @@ def send(record: dict, directory: Path) -> dict:
         command,
     ]
     project = Path(record["project"])
+    # Durable before Weft can accept anything under this attempt's key, so a
+    # process killed after acceptance but before the receipt is saved still
+    # resumes by looking the key up rather than by probing readiness first.
+    record["submission_started"] = True
+    save(directory / "task.json", record)
     try:
         try:
             raw = run(submission, cwd=project, timeout=SUBMIT_TIMEOUT)
@@ -642,6 +688,9 @@ def resubmit(record: dict, directory: Path) -> dict:
         job_id=None,
         status="submitting",
     )
+    # The new attempt's key has not been sent yet; the earlier attempt's
+    # started marker must not make it look potentially accepted.
+    record.pop("submission_started", None)
     # A new attempt key lets Weft accept a second job; it survives interruption.
     save(directory / "task.json", record)
     return send(record, directory)
@@ -973,7 +1022,7 @@ def build_task_parser(subparsers) -> None:
     submit_parser.add_argument("--id", help="caller-generated idempotency identity")
     submit_parser.set_defaults(handler=handler)
     selectors_parser = actions.add_parser(
-        "selectors", help="list the writer selectors this installation accepts"
+        "selectors", help="list admitted writers; submit probes target-host readiness"
     )
     selectors_parser.add_argument("--json", action="store_true")
     selectors_parser.set_defaults(handler=handler)

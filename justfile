@@ -11,7 +11,7 @@ check:
     # remote workspace, say) typechecks with the pinned tsc, not one on PATH.
     bun install --frozen-lockfile --cwd src/agent_offload/relay_runtime
     bun test src/agent_offload/relay_runtime
-    bun run --cwd src/agent_offload/relay_runtime typecheck
+    bun run --shell=bun --cwd src/agent_offload/relay_runtime typecheck
 
 format:
     uv run ruff format src tests

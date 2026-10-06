@@ -15,6 +15,11 @@ def build_parser() -> argparse.ArgumentParser:
     identity = subparsers.add_parser("identity", help="print the installed worker identity")
     identity.set_defaults(handler=cmd_identity)
 
+    probe = subparsers.add_parser("probe-writers", help="observe OMP writer readiness")
+    probe.add_argument("--selector", action="append")
+    probe.add_argument("--timeout", type=float, default=30)
+    probe.set_defaults(handler=cmd_probe_writers)
+
     run = subparsers.add_parser("execute", help="execute one report-only agent task")
     run.add_argument("--task-id", required=True)
     run.add_argument("--provider", default=SUPPORTED_PROVIDER)
@@ -33,6 +38,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cmd_identity(_args: argparse.Namespace) -> int:
     print(json.dumps(worker_identity(), sort_keys=True))
+    return 0
+
+
+def cmd_probe_writers(args: argparse.Namespace) -> int:
+    from agent_execution.worker_cli import probe_writers
+
+    try:
+        result = probe_writers(selectors=args.selector, timeout=args.timeout)
+    except (OSError, ValueError) as error:
+        print(f"agent-offload-worker: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True))
     return 0
 
 

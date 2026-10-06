@@ -5,6 +5,7 @@
 --         relay, and the historical report lane.
 -- Includes:
 --   Task identity, idempotency, submission, resume, cancellation
+--   Task-lane writer readiness observation (catalog and credentials only)
 --   Task worker execution constraints, requested checks, result publication
 --   Result retrieval validation, change application, application journal
 --   Attached relay sessions, confined local tools, provenance, fail-closed evidence
@@ -803,12 +804,41 @@ rule RefuseRetiredNativeSubmission {
         -- provider escape hatch and no fallback to another lane.
 }
 
-rule ReportRetiredNativeStatus {
-    when: RunDoctor(caller)
+-- Task-lane writer readiness
 
-    ensures: ReadinessReportedAvailable(false)
+rule ReportTaskWriterReadiness {
+    when: RunDoctor(caller, host, account, provider?, selector?)
+
+    requires: selector != null or provider != "codex"
+    let requested = doctor_selection(provider, selector)
+        -- An exact selector is probed alone and overrides provider. An
+        -- explicit provider selects every admitted task writer for it. With
+        -- neither, only config.admitted_selector is probed.
+    ensures: ReadinessReported(
+        writers: requested,
+        available: requested.count > 0
+            and requested.all(w => writer_readiness_observed(host, account, w))
+    )
     @guidance
-        -- Readiness reports the retirement without probing the remote host.
+        -- One remote probe through the worker on the host and account
+        -- observes, for each requested exact selector, its presence in the
+        -- pinned OMP catalog and execution-eligible credentials, together
+        -- with the worker's reported identity. It never generates a model
+        -- response and makes no claim about live quota or generation. A
+        -- failed probe or malformed answer reports unavailable, and a
+        -- provider with no admitted writers reports unavailable without
+        -- probing. Nothing is queued.
+}
+
+rule RefuseNativeCodexReadiness {
+    when: RunDoctor(caller, host, account, provider?, selector?)
+
+    requires: selector = null and provider = "codex"
+    ensures: ReadinessReported(writers: [], available: false)
+    ensures: RetirementRefusalReported("native Codex execution is retired; use the grounded OMP Anthropic route or an OpenAI packet-only route")
+    @guidance
+        -- Native codex is reported as retired only when explicitly
+        -- requested, without probing the remote host.
 }
 
 ------------------------------------------------------------
@@ -819,6 +849,26 @@ invariant UniqueTaskIdentity {
     for a in Tasks:
         for b in Tasks:
             a != b implies a.id != b.id
+}
+
+invariant NewJobsRequireObservedWriterReadiness {
+    -- Every Weft job the task lane newly queues was sent only after a remote
+    -- observation, for task.account on the target host through the
+    -- provisioned worker build (task.worker_bin_dir), that the exact
+    -- task.selector is in the pinned OMP catalog with execution-eligible
+    -- credentials, and that the worker's reported identity matches the
+    -- dispatch. The observation is of catalog and credentials only, not of
+    -- live quota or generation. An unavailable writer leaves
+    -- the task with no job and a diagnostic naming its identity and resume.
+    -- Exempt: an accepted job recovered from Weft by the attempt's
+    -- idempotency key. A send that may have reached Weft (unresolved, or
+    -- interrupted after `weft run` began) is reconciled by that key before
+    -- any provisioning or readiness check, and a recorded job is bound
+    -- however readiness has since changed; a failed or malformed lookup is
+    -- not evidence of absence and leaves the submission unresolved.
+    for task in Tasks:
+        task.job != null and not recovered_by_idempotency_key(task)
+            implies writer_readiness_observed_before_send(task)
 }
 
 invariant NoUnvalidatedOutcome {
@@ -987,7 +1037,6 @@ surface HistoricalArchive {
         RetrieveHistoricalJob(caller, record, mark_processed)
         InspectWeftJob(caller, record.job)
         RequestNativeRun(caller, brief)
-        RunDoctor(caller)
 
     contracts:
         fulfils EvidenceContract
@@ -997,6 +1046,19 @@ surface HistoricalArchive {
         -- refused at every retrieval, by every later installation, forever;
         -- the artifacts stay available in Weft and the job is never marked
         -- processed.
+}
+
+surface WriterReadiness {
+    facing caller: Principal
+
+    provides:
+        RunDoctor(caller, host, account, provider?, selector?)
+
+    @guarantee ObservationOnly
+        -- Readiness reports the observed pinned catalog and execution-eligible
+        -- credentials of exact admitted task writers. It never generates a
+        -- model response, makes no live-quota claim, and never queues a job.
+        -- Native codex is only reported as retired when explicitly requested.
 }
 
 ------------------------------------------------------------

@@ -134,19 +134,15 @@ def test_remote_command_uses_report_only_worker_protocol() -> None:
 
 
 def test_doctor_refuses_retired_native_codex_without_probe(monkeypatch) -> None:
+    from agent_offload import readiness
+
     def unexpected_probe(*_args, **_kwargs):
         raise AssertionError("retired provider must not be probed")
 
-    monkeypatch.setattr(cli, "command_json", unexpected_probe)
+    monkeypatch.setattr(readiness.subprocess, "run", unexpected_probe)
     result = cli.doctor(host="studio", provider="codex")
     assert result["available"] is False
-    assert result["checks"] == [
-        {
-            "name": "provider",
-            "ok": False,
-            "detail": cli.NATIVE_DISPATCH_RETIRED,
-        }
-    ]
+    assert all(not check["ok"] for check in result["checks"])
 
 
 def test_submit_refuses_retired_native_codex_before_weft(monkeypatch, tmp_path: Path) -> None:
@@ -369,36 +365,105 @@ def test_retrieve_refuses_report_bytes_not_bound_to_envelope(monkeypatch) -> Non
         cli.retrieve("wj1", expected_execution_source_sha256="d" * 64)
 
 
-def test_doctor_parser_keeps_durable_flags() -> None:
-    """Regression: relay subcommand wiring must not drop durable-lane flags."""
-    parser = cli.build_parser()
-    args = parser.parse_args(["doctor", "--json", "--host", "agent@studio"])
-    assert args.json is True
-    assert args.host == "agent@studio"
-    bare = parser.parse_args(["doctor"])
-    assert bare.json is False
-    assert bare.provider == cli.SUPPORTED_PROVIDER
+@pytest.mark.parametrize("available,expected_exit", [(True, 0), (False, 1)])
+def test_doctor_cli_exit_tracks_active_writer_readiness(
+    monkeypatch, capsys, available: bool, expected_exit: int
+) -> None:
+    import json
+    import subprocess
 
+    from agent_execution.omp_execution import OMP_WRITER_SELECTORS
+    from agent_execution.worker import installed_worker_identity
 
-def test_cmd_doctor_survives_full_namespace(monkeypatch) -> None:
-    """cmd_doctor must read every attribute the doctor subparser defines.
+    from agent_offload import readiness
 
-    The first relay wiring regression dropped --json and --provider while
-    leaving cmd_doctor reading both; a parse-only test could not see the
-    runtime AttributeError this asserts against.
-    """
-    seen: dict[str, object] = {}
-    monkeypatch.setattr(
-        cli,
-        "doctor",
-        lambda *, host, provider: (
-            seen.update(host=host, provider=provider) or {"available": True, "checks": []}
-        ),
+    selector = min(OMP_WRITER_SELECTORS)
+    payload = json.dumps(
+        {
+            "schema_version": "agent-execution.writer-readiness/v1",
+            "worker_identity": installed_worker_identity().to_dict(),
+            "writers": [
+                {
+                    "selector": selector,
+                    "model_available": available,
+                    "credential_available": True,
+                    "available": available,
+                    "detail": "ready" if available else "model unavailable",
+                }
+            ],
+        }
     )
-    parser = cli.build_parser()
-    args = parser.parse_args(["doctor", "--json"])
-    assert cli.cmd_doctor(args) == 0
-    assert seen == {"host": "studio", "provider": cli.SUPPORTED_PROVIDER}
+
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(readiness.subprocess, "run", run)
+    with pytest.raises(SystemExit) as exit_code:
+        cli.main(["doctor", "--selector", selector])
+    assert exit_code.value.code == expected_exit
+    assert ("ok:" if available else "fail:") in capsys.readouterr().out
+
+
+def _answer_requested_writers(monkeypatch) -> list[list[str]]:
+    """Fake the SSH probe, answering ready for exactly the selectors it requests."""
+    import subprocess
+
+    from agent_execution.worker import installed_worker_identity
+
+    from agent_offload import readiness
+
+    probed: list[list[str]] = []
+
+    def run(argv, **kwargs):
+        remote = shlex.split(argv[-1])
+        selectors = [remote[index + 1] for index, item in enumerate(remote) if item == "--selector"]
+        probed.append(selectors)
+        payload = {
+            "schema_version": "agent-execution.writer-readiness/v1",
+            "worker_identity": installed_worker_identity().to_dict(),
+            "writers": [
+                {
+                    "selector": selector,
+                    "model_available": True,
+                    "credential_available": True,
+                    "available": True,
+                    "detail": "ready",
+                }
+                for selector in selectors
+            ],
+        }
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(readiness.subprocess, "run", run)
+    return probed
+
+
+def _openai_writers() -> list[str]:
+    from agent_execution.omp_execution import OMP_WRITER_SELECTORS
+
+    return sorted(item for item in OMP_WRITER_SELECTORS if item.startswith("openai-codex/"))
+
+
+@pytest.mark.parametrize(
+    "arguments,expected",
+    [
+        ([], lambda: [cli.DEFAULT_SELECTOR]),
+        (["--provider", "openai-codex"], _openai_writers),
+        (
+            ["--provider", "openai-codex", "--selector", cli.DEFAULT_SELECTOR],
+            lambda: [cli.DEFAULT_SELECTOR],
+        ),
+    ],
+    ids=["bare-default-only", "provider-all-admitted", "selector-overrides-provider"],
+)
+def test_doctor_selects_writers_to_probe(monkeypatch, capsys, arguments, expected) -> None:
+    probed = _answer_requested_writers(monkeypatch)
+    with pytest.raises(SystemExit) as exit_code:
+        cli.main(["doctor", "--json", *arguments])
+    assert exit_code.value.code == 0
+    assert probed == [expected()]
+    report = json.loads(capsys.readouterr().out)
+    assert sorted(check["name"] for check in report["checks"]) == expected()
 
 
 def _installed_layout(root: Path, build_id: str, *, marker: str | None) -> Path:

@@ -22,3 +22,5 @@ def pinned_worker(monkeypatch):
         record["build_id"] = PINNED_BUILD
 
     monkeypatch.setattr(tasks, "ensure_worker", ensure)
+    # Most task tests exercise snapshots and submission, not remote readiness.
+    monkeypatch.setattr(tasks, "require_writer", lambda record: None)

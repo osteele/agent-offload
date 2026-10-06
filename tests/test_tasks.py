@@ -374,8 +374,11 @@ def receipt(key: str, decision: str) -> dict:
 def fake_weft_submission(tmp_path, monkeypatch, *, runs: list[str], lookup: str) -> Path:
     """Fake weft whose successive `weft run` calls follow `runs`, logging every call.
 
-    Each run is "hang" (outlive the submit budget) or "queued" (print a receipt
-    for a job left to the daemon, as --no-sync does). `lookup` is "found",
+    Each run is "hang" (outlive the submit budget), "queued" (print a receipt
+    for a job left to the daemon, as --no-sync does), "unresolved" (fail after
+    Weft recorded the job, so the receipt is lost), or "interrupted" (interrupt
+    the submitting process with SIGINT while the command is still running, so
+    nothing after it persists). `lookup` is "found",
     "absent", "other-key" (an answer about a different key), or "fail" for
     `weft job lookup`.
     """
@@ -403,9 +406,14 @@ def fake_weft_submission(tmp_path, monkeypatch, *, runs: list[str], lookup: str)
     lookup_step = (
         "echo 'ledger unreadable' >&2; exit 1" if lookup == "fail" else f'/bin/cat "{answer}"'
     )
+    steps = {
+        "hang": "exec /bin/sleep 5",
+        "queued": f"/bin/cat {queued}",
+        "unresolved": "echo 'transport lost after acceptance' >&2; exit 1",
+        "interrupted": 'kill -INT "$PPID"; exec /bin/sleep 5',
+    }
     run_steps = "".join(
-        f"  {index}) {'exec /bin/sleep 5' if step == 'hang' else f'/bin/cat {queued}'} ;;\n"
-        for index, step in enumerate(runs, start=1)
+        f"  {index}) {steps[step]} ;;\n" for index, step in enumerate(runs, start=1)
     )
     fake_tools(
         tmp_path,
@@ -1278,3 +1286,130 @@ def test_submit_launches_the_pinned_build_by_absolute_path(tmp_path, monkeypatch
     # build and lets host cleanup see that the build is still needed.
     assert f"{PINNED_BIN}/agent-offload-task-worker" in run
     assert " agent-offload-task-worker " not in f" {run} "
+
+
+def fake_writer_readiness(tmp_path: Path):
+    """Fake ssh answering the remote worker's readiness probe for the slow task's writer.
+
+    Install after fake_tools (it shares the PATH directory). Returns a setter
+    for the observed catalog/credential state and the file logging each probe.
+    """
+    from agent_execution.identity import source_sha256
+
+    answer = tmp_path / "readiness.json"
+    probes = tmp_path / "ssh-calls"
+    ssh = tmp_path / "bin" / "ssh"
+    ssh.write_text(f'#!/bin/sh\necho probe >> "{probes}"\n/bin/cat "{answer}"\n')
+    ssh.chmod(0o755)
+
+    def observe(
+        *, model_available: bool = True, credential_available: bool = True, detail: str = "ready"
+    ) -> None:
+        answer.write_text(
+            json.dumps(
+                {
+                    "schema_version": "agent-execution.writer-readiness/v1",
+                    "worker_identity": {
+                        "schema_version": "agent-execution.worker-identity/v1",
+                        "source_sha256": source_sha256(),
+                    },
+                    "writers": [
+                        {
+                            "selector": "openai-codex/gpt-6-astra",
+                            "model_available": model_available,
+                            "credential_available": credential_available,
+                            "available": model_available and credential_available,
+                            "detail": detail,
+                        }
+                    ],
+                }
+            )
+        )
+
+    return observe, probes
+
+
+@pytest.mark.parametrize(
+    "missing,detail",
+    [
+        ("model_available", "Unavailable exact OMP model"),
+        ("credential_available", "No execution-eligible OMP credentials"),
+    ],
+    ids=["model", "credentials"],
+)
+def test_unavailable_writer_never_queues_and_resume_rechecks(
+    tmp_path, monkeypatch, capsys, missing, detail
+):
+    from agent_offload import cli
+    from agent_offload.readiness import require_writer
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(tasks, "require_writer", require_writer)
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["queued"], lookup="absent")
+    observe, _ = fake_writer_readiness(tmp_path)
+    observe(**{missing: False}, detail=detail)
+
+    with pytest.raises(TaskError, match=detail):
+        submit_slow(tmp_path)
+    assert not calls.exists()
+    assert read_record("slow")["job_id"] is None
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["task", "resume", "slow"])
+    assert refused.value.code == 1
+    assert not calls.exists()
+    diagnostic = capsys.readouterr().err
+    assert detail in diagnostic
+    assert "agent-offload task resume slow" in diagnostic
+
+    observe()
+    with pytest.raises(SystemExit) as resumed:
+        cli.main(["task", "resume", "slow"])
+    assert resumed.value.code == 0
+    assert read_record("slow")["job_id"] == "wj77"
+    assert weft_calls(calls) == ["run -C"]
+
+
+@pytest.mark.parametrize("interruption", ["unresolved", "interrupted"])
+def test_resume_recovers_an_accepted_submission_without_readiness_or_resend(
+    tmp_path, monkeypatch, interruption
+):
+    import signal
+
+    from agent_offload import cli
+    from agent_offload.readiness import require_writer
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(tasks, "require_writer", require_writer)
+    # Weft records the job, but its receipt never reaches the task record:
+    # either the transport fails gracefully or the submitter is interrupted
+    # while `weft run` is still running.
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=[interruption], lookup="found")
+    observe, probes = fake_writer_readiness(tmp_path)
+    observe()
+    if interruption == "unresolved":
+        with pytest.raises(TaskError):
+            submit_slow(tmp_path)
+    else:
+        # Python only translates SIGINT into KeyboardInterrupt when it owns the
+        # handler; a harness may have inherited SIGINT as ignored.
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                submit_slow(tmp_path)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+    assert read_record("slow")["job_id"] is None
+    assert len(probes.read_text().splitlines()) == 1
+
+    # The writer has since lost its credentials and the provisioning tool is
+    # absent from PATH; neither may matter to a job Weft already accepted.
+    observe(credential_available=False, detail="No execution-eligible OMP credentials")
+    monkeypatch.setattr(tasks, "ensure_worker", REAL_ENSURE_WORKER)
+    with pytest.raises(SystemExit) as resumed:
+        cli.main(["task", "resume", "slow"])
+    assert resumed.value.code == 0
+    record = read_record("slow")
+    assert (record["status"], record["job_id"]) == ("queued", "wj77")
+    assert len(probes.read_text().splitlines()) == 1
+    assert weft_calls(calls) == ["run -C", "job lookup"]

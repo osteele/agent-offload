@@ -48,6 +48,18 @@ def task_factory(tmp_path, monkeypatch):
         "        'selected_host': 'studio', 'source_pin': 'pin', 'idempotency_key': key}))\n"
         "    sys.exit(0)\n"
         f"with open({str(replies)!r}) as stream: data = json.load(stream)\n"
+        "if args[:2] == ['job', 'lookup']:\n"
+        "    key = args[args.index('--idempotency-key') + 1]\n"
+        "    job = next((job_id for job_id, entry in data.items()\n"
+        "        if isinstance(entry.get('result'), dict) and entry['result'].get('id') == key), None)\n"
+        "    answer = {'api_version': 'weft.job.lookup.v1', 'idempotency_key': key,\n"
+        "        'found': job is not None}\n"
+        "    if job is not None:\n"
+        "        answer['receipt'] = {'api_version': 'weft.run.receipt.v1', 'job_id': job,\n"
+        "            'placement_decision': 'accepted_immediately', 'accepted_immediately': True,\n"
+        "            'selected_host': 'studio', 'source_pin': 'pin', 'idempotency_key': key}\n"
+        "    print(json.dumps(answer))\n"
+        "    sys.exit(0)\n"
         "kind = {('job', 'inspect'): 'job', ('job', 'log'): 'log'}.get(tuple(args[:2]), 'result')\n"
         "entry = data[args[2]]\n"
         "if kind not in entry:\n"
@@ -308,19 +320,21 @@ def test_resume_refuses_failed_job_when_submitter_changed(
 
 def test_resume_unresolved_submission_when_submitter_changed(task_factory, tmp_path, capsys):
     record, _ = task_factory("unresolved-submitter")
+    accepted_job = record["job_id"]
     record.update(job_id=None, status="submission_unknown")
     change_retained_digest(record, "offload_sha256")
 
     assert tasks.handler(argparse.Namespace(action="resume", id=record["id"])) == 0
     row = json.loads(capsys.readouterr().out)
-    assert row["job_id"] == "wj-retry"
+    assert row["job_id"] == accepted_job
     assert row["status"] == "queued"
     retained = tasks.read_record(record["id"])
-    assert retained["job_id"] == "wj-retry"
+    assert retained["job_id"] == accepted_job
     assert retained.get("attempt", 1) == 1
     calls = [json.loads(line) for line in (tmp_path / "weft-calls").read_text().splitlines()]
-    submitted = next(call for call in calls if call[0] == "run")
-    assert submitted[submitted.index("--idempotency-key") + 1] == record["id"]
+    lookup = next(call for call in calls if call[:2] == ["job", "lookup"])
+    assert lookup[lookup.index("--idempotency-key") + 1] == record["id"]
+    assert not any(call[0] == "run" for call in calls)
 
 
 def test_resume_refuses_failed_job_when_baseline_changed(task_factory, tmp_path, capsys):

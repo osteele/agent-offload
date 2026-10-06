@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_execution.omp_execution import OMP_WRITER_SELECTORS
+
 from .protocol import (
     DOCTOR_SCHEMA,
     NATIVE_DISPATCH_RETIRED,
@@ -24,8 +26,10 @@ from .protocol import (
     load_json_object,
     validate_result,
 )
+from .readiness import probe_writers
 from .relay import build_relay_parser
-from .tasks import build_task_parser
+from .task_protocol import TaskError
+from .tasks import DEFAULT_SELECTOR, build_task_parser
 from .worker import failure_report
 
 WEFT_RECEIPT_SCHEMA = "weft.run.receipt.v1"
@@ -146,19 +150,49 @@ def command_json(arguments: Sequence[str], *, timeout: float = 60) -> dict[str, 
         raise OffloadError(str(exc)) from exc
 
 
-def doctor(*, host: str, provider: str) -> dict[str, Any]:
+def doctor(
+    *,
+    host: str,
+    provider: str | None = None,
+    selector: str | None = None,
+    account: str = "agent",
+) -> dict[str, Any]:
+    # An exact selector overrides any provider. Without either, only the
+    # default task writer is probed; an explicit provider probes every
+    # admitted writer for it, so one absent catalog entry fails that check.
+    if selector is not None:
+        requested = [selector]
+        provider = selector.split("/", 1)[0]
+    elif provider is None:
+        requested = [DEFAULT_SELECTOR]
+        provider = DEFAULT_SELECTOR.split("/", 1)[0]
+    else:
+        requested = sorted(
+            item for item in OMP_WRITER_SELECTORS if item.split("/", 1)[0] == provider
+        )
+    checks = []
+    try:
+        if not requested:
+            detail = (
+                NATIVE_DISPATCH_RETIRED
+                if provider == "codex"
+                else (f"no admitted OMP writers for provider {provider!r}")
+            )
+            raise TaskError(detail)
+        rows = probe_writers(host=host, account=account, selectors=requested)
+        checks = [
+            {"name": row["selector"], "ok": row["available"], "detail": row["detail"]}
+            for row in rows
+        ]
+    except TaskError as error:
+        checks = [{"name": "writer readiness", "ok": False, "detail": str(error)}]
     return {
         "schema_version": DOCTOR_SCHEMA,
         "host": host,
+        "account": account,
         "provider": provider,
-        "available": False,
-        "checks": [
-            {
-                "name": "provider",
-                "ok": False,
-                "detail": NATIVE_DISPATCH_RETIRED,
-            }
-        ],
+        "available": bool(checks) and all(check["ok"] for check in checks),
+        "checks": checks,
     }
 
 
@@ -457,7 +491,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = subparsers.add_parser("doctor", help="check remote agent readiness")
     doctor_parser.add_argument("--host", default="studio")
-    doctor_parser.add_argument("--provider", default=SUPPORTED_PROVIDER)
+    doctor_parser.add_argument("--account", default="agent")
+    doctor_parser.add_argument(
+        "--provider",
+        help="probe every admitted task writer for this provider (default: default writer only)",
+    )
+    doctor_parser.add_argument(
+        "--selector", help="probe one exact OMP writer selector; overrides --provider"
+    )
     doctor_parser.add_argument("--json", action="store_true")
     doctor_parser.set_defaults(handler=cmd_doctor)
 
@@ -497,7 +538,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    result = doctor(host=args.host, provider=args.provider)
+    result = doctor(
+        host=args.host, provider=args.provider, selector=args.selector, account=args.account
+    )
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:

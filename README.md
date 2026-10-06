@@ -16,6 +16,8 @@ agent-offload task cancel TASK_ID
 
 Submit returns a task identity and Weft job identity without waiting for the agent. Requests and accepted job bindings live under `~/.local/state/agent-offload/tasks` (override with `AGENT_OFFLOAD_STATE`). JSON responses use `agent-offload.task/v1`, `agent-offload.tasks/v1`, and `agent-offload.task-result/v1`. Consumers use this CLI rather than reading the registry. Agent Dispatch's **Remote coding** control uses the same API.
 
+Before queueing, provisioning may wait up to 45 minutes for another update to release the target account's sources. Agent-offload allows one hour for that wait and the worker build; the task's execution timeout applies separately.
+
 `task status` and `task list` expose Weft's observed lifecycle as `job_status`. For jobs that completed or ended `failed`, `dead`, or `killed`, `status` comes from the validated task result, including `failed` and `validation_failed`. If that result is unavailable or invalid, `status` is `unknown` with a diagnostic; job completion alone does not establish task success. A job that ended `failed`, `dead`, or `killed` without publishing a result, such as a worker that refused to start because its installed version does not match, has `status` `failed_without_result`; its diagnostic carries the exit code and the tail of the job log. A canceled job keeps Weft's `canceled` status, and resume does not resubmit it.
 
 Each task runs against a Weft source snapshot with `workspace-write-no-shell`. The retained baseline holds the files that snapshot carries: files matching the source exclusions Weft reports (`weft sync inspect --json`), such as `testdata/`, `bin/`, and `CLAUDE.md`, are left out of both. The snapshot carries only the project directory, so a `--check` run is refused when the project's `Package.swift` or `[tool.uv.sources]` path dependencies resolve outside it; without `--check` nothing builds remotely and such projects are accepted. Validate check-dependent projects in the workspace lane with `agent-host-sync workspace run --dependency <path> ...`. The worker refuses symlinks, so submit refuses a project containing a symlink that the snapshot carries: one whose target stays inside the project and that no source exclusion drops. Weft replaces a link pointing outside the project with its target's content, so such links are accepted unless that content holds a file over the 2 MiB task file limit. The agent can read and edit project files but cannot run shell commands. `--check` supplies an optional, caller-chosen validation command executed after the agent finishes; its arguments use shell quoting without shell expansion. A failing check prevents application. Without a check, the result's `validation` field is null. The default writer is `openai-codex/gpt-6-sol`; use `--selector openai-codex/gpt-6-luna` for cheaper bounded work. Reserve `openai-codex/gpt-6-astra` for explicit, rare largest-model escalations. `--selector` accepts the writer identities registered by agent-execution; `agent-offload task selectors --json` lists them with the default, under schema `agent-offload.task-selectors/v1`. The default agent timeout is 1800 seconds; `--timeout` accepts 1–7200 seconds.
@@ -69,8 +71,33 @@ reports the missing source baseline. The artifacts remain available in Weft,
 and the job is not marked processed. The current SDK installation and the
 result's own claimed digest cannot supply that baseline.
 
-`agent-offload doctor` reports native Codex execution as retired without probing
-Studio. `agent-offload run` refuses before creating a Weft job.
+`agent-offload doctor` reports what the remote task worker observes for exact
+writers: presence in its pinned OMP catalog and execution-eligible credentials.
+It does not run model generation or check live quota, so a writer it reports
+ready can still fail when the job generates. For example, check one exact
+writer on Studio:
+
+```sh
+agent-offload doctor --host studio --selector openai-codex/gpt-6-luna --json
+```
+
+Without options, doctor checks only the default task writer.
+`--provider NAME` checks every admitted task writer
+for that provider and fails if any one of them is unavailable. `--selector`
+checks exactly that writer and overrides `--provider`. `--account` selects a
+remote account (default: `agent`). Native `codex` remains retired and is
+reported as retired, without a probe, only when requested with `--provider
+codex`. The local `task selectors` list is an admitted roster, not evidence of
+remote availability.
+
+Task submit and resume observe the exact target writer on the provisioned build
+before creating a new Weft job. An unavailable writer leaves the retained task
+without a job, and the diagnostic names `agent-offload task resume TASK_ID`.
+Resume first reconciles any submission that may already have reached Weft (an
+unresolved one, or one interrupted after `weft run` started) by its idempotency
+key, binding an accepted job without provisioning or a new readiness check. A
+lookup that fails keeps the submission unresolved rather than sending again.
+`agent-offload run` refuses before creating a Weft job.
 
 ## Trust boundary
 
