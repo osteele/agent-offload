@@ -246,7 +246,7 @@ entity HistoricalResult {
 ------------------------------------------------------------
 
 config {
-    admitted_selector: String = "openai-codex/gpt-6-sol"     -- durable lane writer
+    admitted_selector: String = "openai-codex/gpt-6-luna"    -- durable lane writer
     historical_selector: String = "gpt-5.5"                  -- retired lane, validation only
     pinned_relay_selector: String = "anthropic/claude-opus-5-5"
 

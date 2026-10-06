@@ -48,7 +48,7 @@ from .task_protocol import (
     validate_changes,
 )
 
-DEFAULT_SELECTOR = "openai-codex/gpt-6-sol"
+DEFAULT_SELECTOR = "openai-codex/gpt-6-luna"
 # Allow the updater's 45-minute source-lock wait plus time for a cold build.
 ENSURE_TIMEOUT = 3600
 ENSURE_SCHEMA = "agent-host-sync.ensure/v1"
