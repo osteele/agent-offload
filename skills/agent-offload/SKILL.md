@@ -36,7 +36,7 @@ If submit or resume reports the writer unavailable, the task keeps its identity 
 
 Checks must preserve ordinary source files and their permissions. Edits, additions, and deletions made by a check fail the task, even with exit zero. Excluded caches such as `__pycache__` may change.
 
-The snapshot carries only the project directory. A `--check` run is refused when the project's `Package.swift` or `[tool.uv.sources]` path dependencies resolve outside it; without `--check` nothing builds remotely and such projects are accepted — run check-dependent projects in the workspace lane (`agent-host-sync workspace run --dependency <path> ...`). Submit also compares the agent-execution copy bundled into agent-offload against the installed `agent-execution-worker` and refuses a stale bundle with a reinstall hint, instead of queueing a task the worker would refuse.
+The snapshot carries only the project directory. A `--check` run is refused when the project's `Package.swift` or `[tool.uv.sources]` path dependencies resolve outside it; without `--check` nothing builds remotely and such projects are accepted — run check-dependent projects in the workspace lane (`agent-host-sync workspace run --dependency <path> ...`). The task runs agent-execution bundled inside its pinned offload build, independently of the `agent-execution-worker` on PATH. Both package digests must match the retained request at provisioning, execution, and retrieval.
 
 ## Retrieve and verify
 
@@ -48,6 +48,8 @@ agent-offload task apply TASK_ID
 
 Apply the `delegated-work-verification` skill before accepting changes. Inspect the diff, report, and check evidence. Retrieval validates the retained request, worker identity, transcript, and change bundle. Application checks every affected local file against the submitted baseline before writing and retains rollback bytes in the task journal. Resolve local conflicts deliberately; do not overwrite them to force application.
 
+Application marks the terminal Weft job processed after saving the applied state. If acknowledgment fails, repeat `task apply TASK_ID`; this retries acknowledgment without reapplying changes. `processed_at` in task responses records acknowledgment of the current job. Retrieval, diff, status, and list do not mark jobs processed.
+
 Edits are ordinary UTF-8 files, at most 2 MiB each and 64 MiB total. A larger project file is carried read-only: the writer and the check can read it, and the task fails if it comes back as an edit, so a repository holding a corpus or fixture still uses the task lane. Symlinks and protected metadata are rejected. Snapshot census failures return failed task artifacts; inspect their reports. Keep tasks requiring interaction, local credentials, or GUI state local.
 
 ## Cancel and deploy
@@ -57,7 +59,7 @@ agent-offload task cancel TASK_ID
 agent-host-sync --account agent apply --stage tools --tool agent-offload
 ```
 
-Cancellation uses `weft cancel JOB_ID`. Local and remote package source digests must match. The updater's exit code 4 means installation succeeded but existing sessions must restart; fresh Weft jobs use the updated executable.
+Cancellation requests `weft cancel JOB_ID` only for an active job, then marks it processed once Weft confirms a terminal state. Use `task cancel` on an already-terminal task to abandon its result explicitly. A failed attempt is also marked processed before resume queues its replacement; acknowledgment failure leaves the old identity available for retry. Local and remote task-build digests must match, independently of the review-owned worker on PATH. The updater's exit code 4 means installation succeeded but existing sessions must restart; fresh Weft jobs use the updated executable.
 
 ## Other lanes
 

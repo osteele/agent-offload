@@ -162,6 +162,8 @@ entity Task {
     status: submitting | submission_unknown | queued | running | completed | failed | validation_failed | failed_without_result | unknown | applied
 
     applied_at: Timestamp when status = applied
+    processed_at: Timestamp?
+        -- Acknowledgment of the current job only; cleared for a new attempt.
     backup: ApplicationBackup?
 
     result: TaskResult with task = this
@@ -336,11 +338,11 @@ rule SubmitTask {
         -- sent once more. A failed or malformed lookup is not evidence of
         -- absence and makes the send unresolved, as does a second failure.
     @guidance
-        -- Local preflight: a mismatch between the installed agent-execution
-        -- worker and the copy bundled into agent-offload refuses before
-        -- queueing, with a reinstall hint. An unprobeable installation
-        -- defers the refusal to the worker's own identity check. A caller
-        -- chosen id that already exists is refused in favor of resume.
+        -- The task executes the agent-execution bundled inside its pinned
+        -- offload build, not the separately installed worker on PATH.
+        -- Provisioning validates both package digests before queueing.
+        -- A caller-chosen id that already exists is refused in favor of resume.
+        -- An empty file census is a valid baseline; census errors still refuse.
 }
 
 rule ProvisionWorker {
@@ -405,6 +407,7 @@ rule ResumeTask {
     requires: baseline_unchanged(task)
     requires: task.job = null or submitter_unchanged(task)
     requires: task.job = null or provisioned_build_matches(task)
+    requires: task.job = null or weft_accepts_processed(task.job)
         -- A resubmission provisions again before anything changes, so a
         -- refusal leaves the failed attempt exactly as it was.
 
@@ -420,6 +423,7 @@ rule ResumeTask {
             task.prior_job_ids = task.prior_job_ids + task.job?.id
             task.attempt = task.attempt + 1
             task.job = null
+            task.processed_at = null
             task.status = submitting
             SubmissionSent(task)
     @guidance
@@ -433,6 +437,8 @@ rule ResumeTask {
         -- submits a new task. An unresolved submission resumes regardless of
         -- submitting code changes, to recover the accepted job under the
         -- same identity.
+        -- The dead attempt is acknowledged before its identity is archived.
+        -- A failed acknowledgment retains the old identity and queues nothing.
     @guidance
         -- An unresolved submission keeps its recorded build: Weft may
         -- already hold a job under its idempotency key, so the resend must
@@ -445,11 +451,17 @@ rule CancelTask {
     when: CancelTask(caller, task)
 
     requires: task.job != null
-    ensures: CancellationDelegated(task.job)
+    ensures:
+        if not task.job?.status in {completed, failed, dead, canceled, cancelled, killed}:
+            CancellationDelegated(task.job)
+    ensures: TaskJobAcknowledgmentRequested(task)
     @guidance
-        -- Cancellation operates on the accepted Weft job; task-local state
-        -- such as the baseline and any applied marker is untouched. A task
-        -- with no accepted job identity must resolve its submission first.
+        -- Cancellation operates on the accepted Weft job and preserves the
+        -- baseline and any applied marker. A task with no accepted job
+        -- identity must resolve its submission first.
+        -- An already-terminal job is disposed without another cancellation.
+        -- If cancellation is pending, acknowledgment refuses; repeating
+        -- cancel checks the terminal state again before marking processed.
 }
 
 -- Durable task lane: observation and evidence
@@ -517,7 +529,7 @@ rule ValidateRetrievedResult {
     ensures: TaskEvidenceValidated(task)
     @guidance
         -- Retrieval never marks the Weft job processed in this lane and
-        -- never mutates task state by itself; only application does.
+        -- never mutates task state by itself.
 }
 
 rule MaterializeTaskResult {
@@ -638,12 +650,37 @@ rule ApplyTaskResult {
             apply_change(task.project, change)
     ensures: task.applied_at = now
     ensures: task.status = applied
+    ensures: TaskJobAcknowledgmentRequested(task)
     @guidance
         -- The backup journal is written before the first write; a failure
         -- mid-application rolls back in reverse (created files deleted,
         -- prior bytes and modes restored). Application never commits or
-        -- deploys; a retried application after the project moved on faces
-        -- the per-file before-state check and refuses.
+        -- deploys. Its applied marker is durable before acknowledgment.
+        -- An acknowledgment failure leaves the applied changes intact.
+}
+
+rule RetryAppliedTaskAcknowledgment {
+    when: ApplyTaskResult(caller, task)
+
+    requires: task.status = applied
+    requires: task.processed_at = null
+    ensures: TaskJobAcknowledgmentRequested(task)
+    @guidance
+        -- This retry does not retrieve the result or touch project files.
+}
+
+rule AcknowledgeTaskJob {
+    when: TaskJobAcknowledgmentRequested(task)
+
+    requires: task.job != null
+    requires: task.processed_at = null
+    requires: task.job?.status in {completed, failed, dead, canceled, cancelled, killed}
+    requires: weft_accepts_processed(task.job)
+    ensures: task.processed_at = now
+    @guidance
+        -- Repeated acknowledgments are idempotent. Only the current job is
+        -- marked processed. Failed observation or acknowledgment remains
+        -- visible and retryable; passive observation never acknowledges.
 }
 
 -- Relay lane

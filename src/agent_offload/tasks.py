@@ -9,7 +9,6 @@ import math
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import tempfile
 import time
@@ -52,7 +51,6 @@ DEFAULT_SELECTOR = "openai-codex/gpt-6-luna"
 # Allow the updater's 45-minute source-lock wait plus time for a cold build.
 ENSURE_TIMEOUT = 3600
 ENSURE_SCHEMA = "agent-host-sync.ensure/v1"
-EXECUTION_IDENTITY_SCHEMA = "agent-execution.worker-identity/v1"
 WORKSPACE_LANE = "agent-host-sync workspace run --dependency <path> ... <command>"
 # Seconds one `weft run` may take to record the job. Submission passes
 # --no-sync, so the budget covers source pinning and recording, not the host
@@ -62,6 +60,7 @@ SUBMIT_TIMEOUT = 180
 # way and publishes no result is resumable; a canceled job is not, because the
 # consumer asked for it to stop.
 UNFINISHED_JOB_STATUSES = {"failed", "dead", "killed"}
+TERMINAL_JOB_STATUSES = {"completed", "failed", "dead", "canceled", "cancelled", "killed"}
 WEFT_LOOKUP_SCHEMA = "weft.job.lookup.v1"
 
 
@@ -80,7 +79,15 @@ class CommandTimeout(TaskError):
     """A command outlived its budget, so whatever it did before being killed is unknown."""
 
 
-def run(argv: list[str], *, cwd: Path | None = None, timeout: float = 60) -> str:
+def run(
+    argv: list[str], *, cwd: Path | None = None, timeout: float = 60, accept: tuple[int, ...] = ()
+) -> str:
+    """Run a command and return its stdout.
+
+    `accept` holds the documented nonzero exits a caller permits -- rg's
+    "no match" census result, say. Every other nonzero exit, and any failure
+    to start or to finish within budget, still raises.
+    """
     try:
         result = subprocess.run(
             argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
@@ -89,7 +96,7 @@ def run(argv: list[str], *, cwd: Path | None = None, timeout: float = 60) -> str
         raise CommandTimeout(f"could not execute {argv[0]}: {error}") from error
     except OSError as error:
         raise TaskError(f"could not execute {argv[0]}: {error}") from error
-    if result.returncode:
+    if result.returncode and result.returncode not in accept:
         raise TaskError(
             result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         )
@@ -176,24 +183,8 @@ def submit(
             "so the check would fail remotely after the writer has finished. Use "
             f"{WORKSPACE_LANE} for projects with external path dependencies"
         )
-    # Strict provenance pinning is the default, ratified 2026-09-26: a dispatch
-    # is bound to the exact tooling bytes that produced it, and a mismatch is
-    # refused rather than warned about. The rejected alternative -- warn-and-
-    # continue -- would convert the provenance guarantee behind task
-    # retrieve/apply into a best-effort label that every downstream consumer
-    # inherits. This preflight refusal stops the task before any Weft job
-    # exists; after `agent-host-sync`, submitting again is a plain `task
-    # submit` (or `task resume` when a retained identity exists).
-    bundled_execution = source_sha256()
-    installed_execution = installed_execution_source_sha256()
-    if installed_execution is not None and installed_execution != bundled_execution:
-        raise TaskError(
-            f"the installed agent-execution ({installed_execution[:12]}) differs from the "
-            f"copy bundled into this agent-offload ({bundled_execution[:12]}); the worker "
-            "would refuse the task after it queued. Reinstall agent-offload so it rebundles "
-            "the current agent-execution: `uv tool install --force --reinstall --with "
-            "../agent-execution .` in the agent-offload checkout"
-        )
+    # The immutable build returned by ensure_worker must match both bundled
+    # package digests. A separate execution worker on PATH does not run this task.
     with locked(identity) as directory:
         if (directory / "task.json").exists():
             raise TaskError(f"task {identity} already exists; inspect it or use task resume")
@@ -299,27 +290,6 @@ def ensure_worker(record: dict) -> None:
     record["build_id"] = build_id
 
 
-def installed_execution_source_sha256() -> str | None:
-    """Source digest reported by the installed agent-execution worker, if any.
-
-    agent-offload's tool environment bundles its own agent-execution copy
-    (``uv tool install --with ../agent-execution``), and reinstalling
-    agent-execution alone never refreshes that copy. The installed
-    ``agent-execution-worker`` reports the identity the remote worker compares
-    against. A missing or unreadable probe leaves the decision to the worker's
-    own refusal when the job starts.
-    """
-    executable = shutil.which("agent-execution-worker")
-    if not executable:
-        return None
-    try:
-        identity = object_json(run([executable, "identity"], timeout=15), EXECUTION_IDENTITY_SCHEMA)
-    except TaskError:
-        return None
-    observed = identity.get("source_sha256")
-    return observed if isinstance(observed, str) and len(observed) == 64 else None
-
-
 def swiftpm_path_dependencies(source: str) -> list[str]:
     """The ``path`` argument of every ``.package(...)`` dependency in a manifest."""
     # A commented-out dependency must not refuse a valid project.
@@ -392,8 +362,14 @@ def snapshot_names(project: Path) -> list[str]:
     patterns match a path or its ancestors; other patterns match individual
     path components, as Weft's shouldExclude does.
     """
+    # rg exits 1 when it lists nothing, its documented "no match" result, so
+    # an empty project is a valid census rather than a failure. Only that exit
+    # is permitted here: a missing rg or any other census failure still raises
+    # before a task record exists.
     names = run(
-        ["rg", "--files", "--hidden", "-g", "!.git", "-g", "!.jj"], cwd=project
+        ["rg", "--files", "--hidden", "-g", "!.git", "-g", "!.jj"],
+        cwd=project,
+        accept=(1,),
     ).splitlines()
     inspected = json.loads(run(["weft", "sync", "inspect", str(project), "--json"], cwd=project))
     excludes = inspected.get("excludes") if isinstance(inspected, dict) else None
@@ -682,6 +658,9 @@ def resubmit(record: dict, directory: Path) -> dict:
     check_baseline_unchanged(record)
     check_submitter_unchanged(record)
     ensure_worker(record)
+    # Dispose the old attempt before rotating its identity; a failed
+    # acknowledgment must not create a second submission.
+    acknowledge(record, directory)
     record.update(
         prior_job_ids=[*record.get("prior_job_ids", []), record["job_id"]],
         attempt=record.get("attempt", 1) + 1,
@@ -690,6 +669,7 @@ def resubmit(record: dict, directory: Path) -> dict:
     )
     # The new attempt's key has not been sent yet; the earlier attempt's
     # started marker must not make it look potentially accepted.
+    record.pop("processed_at", None)
     record.pop("submission_started", None)
     # A new attempt key lets Weft accept a second job; it survives interruption.
     save(directory / "task.json", record)
@@ -728,8 +708,42 @@ def summary(record: dict) -> dict:
             "error",
             "applied_at",
             "prior_job_ids",
+            "processed_at",
         )
     }
+
+
+def observe_job(record: dict) -> dict:
+    """Inspect the task's own Weft job and validate the returned identity."""
+    observed = json.loads(run(["weft", "job", "inspect", record["job_id"], "--json"], timeout=15))
+    if (
+        not isinstance(observed, dict)
+        or observed.get("id") != record["job_id"]
+        or not isinstance(observed.get("status"), str)
+    ):
+        raise TaskError("Weft observation has no matching job identity/status")
+    return observed
+
+
+def acknowledge(record: dict, directory: Path) -> None:
+    """Mark a terminal job processed, recording success only after Weft accepts it."""
+    if record.get("processed_at"):
+        return
+    observed = observe_job(record)
+    if observed["status"] not in TERMINAL_JOB_STATUSES:
+        raise TaskError(
+            f"job {record['job_id']} is {observed['status']!r}; only a job Weft "
+            "reports finished can be marked processed"
+        )
+    try:
+        run(["weft", "job", "mark-processed", record["job_id"]], timeout=15)
+    except TaskError as error:
+        raise TaskError(
+            f"weft job mark-processed failed for {record['job_id']}: {error}; "
+            "repeat this command to retry the acknowledgment"
+        ) from error
+    record["processed_at"] = time.time()
+    save(directory / "task.json", record)
 
 
 def status(record: dict) -> dict:
@@ -740,15 +754,7 @@ def status(record: dict) -> dict:
     if not record.get("job_id"):
         return row
     try:
-        observed = json.loads(
-            run(["weft", "job", "inspect", record["job_id"], "--json"], timeout=15)
-        )
-        if (
-            not isinstance(observed, dict)
-            or observed.get("id") != record["job_id"]
-            or not isinstance(observed.get("status"), str)
-        ):
-            raise TaskError("Weft observation has no matching job identity/status")
+        observed = observe_job(record)
         row["job_status"] = observed["status"]
         row["status"] = observed["status"]
         if observed["status"] == "completed" or observed["status"] in UNFINISHED_JOB_STATUSES:
@@ -975,16 +981,27 @@ def handler(args: argparse.Namespace) -> int:
                 elif args.action == "cancel":
                     if not record.get("job_id"):
                         raise TaskError("resolve submission before cancellation")
-                    run(["weft", "cancel", record["job_id"]])
+                    observed = observe_job(record)
+                    if observed["status"] not in TERMINAL_JOB_STATUSES:
+                        run(["weft", "cancel", record["job_id"]])
+                    # Cancellation may be asynchronous; acknowledge only after
+                    # a second observation confirms the job is terminal.
+                    acknowledge(record, directory)
                     value = status(record)
                 else:
-                    value = retrieve(record)
-                    if args.action == "diff":
-                        print(value["diff"])
-                        return 0
-                    if args.action == "apply":
-                        if record.get("applied_at"):
-                            raise TaskError("task was already applied")
+                    if args.action != "apply":
+                        value = retrieve(record)
+                        if args.action == "diff":
+                            print(value["diff"])
+                            return 0
+                    elif record.get("applied_at"):
+                        if record.get("processed_at"):
+                            raise TaskError("task was already applied and acknowledged")
+                        # Acknowledgment retries must not reapply edits.
+                        acknowledge(record, directory)
+                        value = summary(record)
+                    else:
+                        value = retrieve(record)
                         if value["status"] != "completed":
                             raise TaskError("only successful tasks can be applied")
                         project = Path(record["project"])
@@ -994,8 +1011,11 @@ def handler(args: argparse.Namespace) -> int:
                                 value["changes"],
                                 directory / "application-backup.json",
                             )
+                            # Preserve the application even if acknowledgment
+                            # fails or the process exits before it completes.
                             record.update(applied_at=time.time(), status="applied")
                             save(directory / "task.json", record)
+                        acknowledge(record, directory)
                         value = summary(record)
         print(json.dumps(value, sort_keys=True))
         return 0

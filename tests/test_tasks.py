@@ -811,41 +811,32 @@ def bare_project(tmp_path, monkeypatch) -> Path:
     return project
 
 
-def test_submit_refuses_a_stale_bundled_agent_execution(tmp_path, monkeypatch):
-    project = bare_project(tmp_path, monkeypatch)
-    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
-    identity_stub(tmp_path, "0" * 64)
-    with pytest.raises(TaskError, match="bundled into this agent-offload") as refusal:
-        submit(
-            project,
-            "Fix hello",
-            host="studio",
-            selector="openai-codex/gpt-6-astra",
-            timeout=60,
-            check=[],
-            identity="stale",
-        )
-    assert "uv tool install" in str(refusal.value)
-    assert not (tmp_path / "state" / "tasks" / "stale").exists()
-
-
-def test_submit_accepts_an_installed_agent_execution_matching_the_bundle(tmp_path, monkeypatch):
+def test_submit_uses_pinned_build_despite_unrelated_path_worker(tmp_path, monkeypatch):
     from agent_execution.identity import source_sha256
 
     project = bare_project(tmp_path, monkeypatch)
-    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
-    identity_stub(tmp_path, source_sha256())
-    # The weft stub refuses every run, so reaching it proves the probe passed.
-    with pytest.raises(TaskError, match="resume this identity"):
-        submit(
-            project,
-            "Fix hello",
-            host="studio",
-            selector="openai-codex/gpt-6-astra",
-            timeout=60,
-            check=[],
-            identity="matching",
-        )
+    accepted = json.dumps(receipt("isolated", "queued"))
+    fake_tools(
+        tmp_path,
+        monkeypatch,
+        files=["hello.py"],
+        excludes=[],
+        run=f"/bin/echo {shlex.quote(accepted)}",
+    )
+    identity_stub(tmp_path, "0" * 64)
+    submit(
+        project,
+        "Fix hello",
+        host="studio",
+        selector="openai-codex/gpt-6-astra",
+        timeout=60,
+        check=[],
+        identity="isolated",
+    )
+    record = read_record("isolated")
+    assert record["job_id"] == "wj77"
+    assert record["request"]["execution_sha256"] == source_sha256()
+    assert record["bin_dir"] == PINNED_BIN
 
 
 def test_submit_refuses_swiftpm_path_dependencies_outside_the_project(tmp_path, monkeypatch):
