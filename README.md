@@ -32,19 +32,19 @@ Checks must preserve ordinary source files, including their permissions. A check
 
 A timed-out check publishes `validation_failed` with captured output and a timeout diagnostic. The worker exits unsuccessfully after publishing the result, so it remains available for retrieval and cannot be applied.
 
-Worker setup and snapshot census failures publish a failed result with a diagnostic report and no changes. `task cancel` cancels an active Weft job; for an already-terminal job, it acknowledges the disposition without requesting another cancellation.
+Worker setup and snapshot census failures publish a failed result with a diagnostic report and no changes. `task cancel` cancels an active Weft job; for an already-terminal job, it acknowledges the disposition without requesting another cancellation. A retained task whose current attempt has never entered Weft submission can also be cancelled: it becomes `cancelled`, preserves its immutable request, and cannot be resumed. No Weft job is created or marked processed in that case. Missing submission-custody metadata does not authorize this local closure. A task whose submission may have reached Weft must first be reconciled with `task resume`; cancellation cannot discard an ambiguous submission.
 
 Retrieval validates task identity, retained request and worker digests, the writer's tool policy and transcript, and every changed file's baseline. Apply checks all destination files before writing any of them and refuses local conflicts, symlink paths, and protected agent or VCS metadata. Returned changes must be UTF-8 text; individual files are limited to 2 MiB and the source manifest to 10000 files and 64 MiB. Existing binary source files can be read but cannot be returned as edits. Application keeps a backup in the task journal and does not commit or deploy project changes.
 
 If Weft cannot download a result, the diagnostic names the task and job and includes an exact `task retrieve` retry command. Retry retrieval with that same task ID. For a completed job, or a failed job whose artifact is reported ready, task status stays `unknown` while the result is unreadable. `task resume` does not submit another attempt in this case. Check output is stored in the validated result artifact, so job logs cannot substitute for it.
 
-Successful application, confirmed cancellation or abandonment through `task cancel`, and resuming a failed attempt mark the disposed Weft job processed. Status, list, retrieval, and diff do not. The task response exposes `processed_at` for its current job. If acknowledgment fails after application, the applied marker and edits remain durable; repeat `task apply` to retry only the acknowledgment, without touching project files. A failed attempt's acknowledgment must succeed before resume queues a replacement. A job still running is not marked processed; repeat the disposition command after it finishes.
+Successful application, confirmed cancellation or abandonment through `task cancel`, and resuming a failed attempt mark the disposed Weft job processed. Status, list, retrieval, and diff do not. The task response exposes `processed_at` for its disposition: acknowledgment of an accepted job, or local closure before dispatch. If acknowledgment fails after application, the applied marker and edits remain durable; repeat `task apply` to retry only the acknowledgment, without touching project files. A failed attempt's acknowledgment must succeed before resume queues a replacement. A job still running is not marked processed; repeat the disposition command after it finishes.
 
 Tasks in the same registry serialize applications to a canonical project path. A competing application is refused until the current application finishes; retrying then checks its baseline against the updated files.
 
 Before creating a Weft job, `task submit` runs `agent-host-sync ensure` for the selected host and account (default `agent`). This mirrors the local checkouts and provisions an immutable content-addressed worker build; the task record retains its absolute `bin_dir` and build ID, and Weft launches that build's worker by absolute path. The ensured worker's agent-offload and bundled agent-execution digests must match the dispatch exactly. If they do not, submission stops before a job exists: the local installed agent-offload may have been built from different bytes than the checkouts being deployed. Reinstall it with `just install` in the agent-offload checkout, or commit/revert checkout edits, then resubmit. This provisioning does not update PATH or a host's current build. Older task records without a pinned path are provisioned when resumed.
 
-Submit passes `--no-sync`, so `weft run` returns once the job is recorded and Weft's daemon pushes it to the host on its next pass; a task can therefore wait about a minute before it starts. If `weft run` still exceeds its 180-second budget, submit asks `weft job lookup --idempotency-key` whether the job was recorded, binds it if so, and submits once more if not. A lookup that fails or answers for another key leaves the submission unresolved. If submission is interrupted or unresolved, use `agent-offload task resume TASK_ID`; it always resumes under the same idempotency identity, preventing a second job. A changed baseline still refuses resume. Resuming a `failed_without_result` task submits the retained request again as a new attempt with its own idempotency key; the task keeps its identity and lists the earlier jobs in `prior_job_ids`. Resume provisions the retained matching worker build before resending, repairing a build that changed or was collected while a job was queued. If the submitting machine's agent-offload or agent-execution has changed since submission, resume refuses a failed job's resubmission; submit a new task for the same brief. `--id` lets a caller choose the identity before starting the command. Submission failures retain that identity and never fall back to local execution. Cancellation operates on the accepted Weft job.
+Submit passes `--no-sync`, so `weft run` returns once the job is recorded and Weft's daemon pushes it to the host on its next pass; a task can therefore wait about a minute before it starts. If `weft run` still exceeds its 180-second budget, submit asks `weft job lookup --idempotency-key` whether the job was recorded, binds it if so, and submits once more if not. A lookup that fails or answers for another key leaves the submission unresolved. If submission is interrupted or unresolved, use `agent-offload task resume TASK_ID`; it always resumes under the same idempotency identity, preventing a second job. A changed baseline still refuses resume. Resuming a `failed_without_result` task submits the retained request again as a new attempt with its own idempotency key; the task keeps its identity and lists the earlier jobs in `prior_job_ids`. Resume provisions the retained matching worker build before resending, repairing a build that changed or was collected while a job was queued. If the submitting machine's agent-offload or agent-execution has changed since submission, resume refuses a failed job's resubmission; submit a new task for the same brief. `--id` lets a caller choose the identity before starting the command. Submission failures retain that identity and never fall back to local execution. Cancellation operates on the accepted Weft job, or closes a retained task that never crossed the dispatch boundary.
 
 Tasks execute agent-execution inside their pinned offload build. The separately installed `agent-execution-worker` may belong to a different agent-review release; changing that release does not change a task's execution code. Provisioning, worker execution, and result retrieval each enforce the task's exact package digests. Automatic provisioning leaves the host's live tool and PATH unchanged.
 
@@ -77,32 +77,44 @@ reports the missing source baseline. The artifacts remain available in Weft,
 and the job is not marked processed. The current SDK installation and the
 result's own claimed digest cannot supply that baseline.
 
-`agent-offload doctor` reports what the remote task worker observes for exact
-writers: presence in its pinned OMP catalog and execution-eligible credentials.
-It does not run model generation or check live quota, so a writer it reports
-ready can still fail when the job generates. For example, check one exact
-writer on Studio:
+`agent-offload doctor` emits `agent-offload.doctor/v2`: the raw Execution-owned
+`execution_status` envelope (including fact age/provenance) and an explicit
+`admission` decision under `offload-task/v1`. It requires current available
+capability, authentication, and transport; a current explicit quota refusal
+blocks admission, while unknown quota is not a promise of capacity. It does not
+claim generation success. Probe failures leave `execution_status` null and
+include a visible policy reason. There is no universal `available` flag. For
+example, check one exact writer on Studio:
 
 ```sh
 agent-offload doctor --host studio --selector openai-codex/gpt-6-luna --json
 ```
 
 Without options, doctor checks only the default task writer.
-`--provider NAME` checks every admitted task writer
-for that provider and fails if any one of them is unavailable. `--selector`
-checks exactly that writer and overrides `--provider`. `--account` selects a
-remote account (default: `agent`). Native `codex` remains retired and is
-reported as retired, without a probe, only when requested with `--provider
+`--provider NAME` selects every admitted task writer for that provider.
+`--selector` checks exactly that writer and overrides `--provider`. `--account`
+selects a remote account (default: `agent`). Native `codex` remains retired and
+is reported as retired, without a probe, only when requested with `--provider
 codex`. The local `task selectors` list is an admitted roster, not evidence of
 remote availability.
 
-Task submit and resume observe the exact target writer on the provisioned build
-before creating a new Weft job. An unavailable writer leaves the retained task
-without a job, and the diagnostic names `agent-offload task resume TASK_ID`.
+Task submit and resume request a fresh exact-subject status from Execution on
+the provisioned build before creating a new Weft job. Immediately before model
+launch, the pinned task executor probes again and applies the same admission
+policy. A refusal before an attempt first enters Weft submission leaves the task without a new job,
+and the diagnostic names `agent-offload task resume TASK_ID`. To abandon that
+task, use `agent-offload task cancel TASK_ID`. A refusal on the executor occurs
+after Weft accepted the job: it publishes a terminal `failed` result without
+running the model. `task resume` reports that result without resubmitting.
+Inspect it with `task retrieve`, fix the cause, and submit a new task identity.
 Resume first reconciles any submission that may already have reached Weft (an
 unresolved one, or one interrupted after `weft run` started) by its idempotency
 key, binding an accepted job without provisioning or a new readiness check. A
 lookup that fails keeps the submission unresolved rather than sending again.
+A not-found lookup does not release dispatch custody: an earlier in-flight
+request may still be accepted. If admission then refuses a resend, the task
+remains unresolved and cannot be cancelled locally. Resume can recover its job
+when acceptance becomes visible.
 `agent-offload run` refuses before creating a Weft job.
 
 ## Trust boundary

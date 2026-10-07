@@ -4,6 +4,8 @@ import argparse
 import json
 import sys
 
+from agent_execution.execution_status import add_status_parser
+
 from .protocol import SUPPORTED_MODE, SUPPORTED_PROVIDER, worker_identity
 from .worker import execute
 
@@ -14,11 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     identity = subparsers.add_parser("identity", help="print the installed worker identity")
     identity.set_defaults(handler=cmd_identity)
-
-    probe = subparsers.add_parser("probe-writers", help="observe OMP writer readiness")
-    probe.add_argument("--selector", action="append")
-    probe.add_argument("--timeout", type=float, default=30)
-    probe.set_defaults(handler=cmd_probe_writers)
+    add_status_parser(subparsers)
 
     run = subparsers.add_parser("execute", help="execute one report-only agent task")
     run.add_argument("--task-id", required=True)
@@ -38,18 +36,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cmd_identity(_args: argparse.Namespace) -> int:
     print(json.dumps(worker_identity(), sort_keys=True))
-    return 0
-
-
-def cmd_probe_writers(args: argparse.Namespace) -> int:
-    from agent_execution.worker_cli import probe_writers
-
-    try:
-        result = probe_writers(selectors=args.selector, timeout=args.timeout)
-    except (OSError, ValueError) as error:
-        print(f"agent-offload-worker: {error}", file=sys.stderr)
-        return 1
-    print(json.dumps(result, sort_keys=True))
     return 0
 
 
@@ -78,7 +64,17 @@ def cmd_execute(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "execution-status":
+        # The bundled Offload worker need not contain an agent-execution-worker,
+        # and the global worker belongs to Review, so status observations
+        # forward to this build's own Execution implementation. Its argument
+        # parser and JSON envelope are the authority; the argv is forwarded
+        # untouched and a nonzero status must not be swallowed into exit zero.
+        from agent_execution.worker_cli import main as execution_main
+
+        raise SystemExit(execution_main(arguments))
+    args = build_parser().parse_args(arguments)
     raise SystemExit(args.handler(args))
 
 

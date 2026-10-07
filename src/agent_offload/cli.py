@@ -26,7 +26,7 @@ from .protocol import (
     load_json_object,
     validate_result,
 )
-from .readiness import probe_writers
+from .readiness import POLICY, REPORTED_FACTS, admission, probe_status
 from .relay import build_relay_parser
 from .task_protocol import TaskError
 from .tasks import DEFAULT_SELECTOR, build_task_parser
@@ -157,9 +157,9 @@ def doctor(
     selector: str | None = None,
     account: str = "agent",
 ) -> dict[str, Any]:
-    # An exact selector overrides any provider. Without either, only the
-    # default task writer is probed; an explicit provider probes every
-    # admitted writer for it, so one absent catalog entry fails that check.
+    # Exact selector wins over provider; provider selects the full admitted
+    # roster, and no options select only the default task writer. Execution
+    # owns exact selector coverage validation for the returned envelope.
     if selector is not None:
         requested = [selector]
         provider = selector.split("/", 1)[0]
@@ -170,29 +170,28 @@ def doctor(
         requested = sorted(
             item for item in OMP_WRITER_SELECTORS if item.split("/", 1)[0] == provider
         )
-    checks = []
-    try:
-        if not requested:
-            detail = (
-                NATIVE_DISPATCH_RETIRED
-                if provider == "codex"
-                else (f"no admitted OMP writers for provider {provider!r}")
-            )
-            raise TaskError(detail)
-        rows = probe_writers(host=host, account=account, selectors=requested)
-        checks = [
-            {"name": row["selector"], "ok": row["available"], "detail": row["detail"]}
-            for row in rows
-        ]
-    except TaskError as error:
-        checks = [{"name": "writer readiness", "ok": False, "detail": str(error)}]
+    status = None
+    if not requested:
+        # Unsupported selection is not a transport failure: nothing was probed.
+        detail = (
+            NATIVE_DISPATCH_RETIRED
+            if provider == "codex"
+            else f"no admitted OMP writers for provider {provider!r}"
+        )
+        decision = {"policy": POLICY, "allowed": False, "reasons": [detail]}
+    else:
+        try:
+            status = probe_status(host=host, account=account, selectors=requested)
+            decision = admission(status, requested)
+        except TaskError as error:
+            decision = {"policy": POLICY, "allowed": False, "reasons": [str(error)]}
     return {
         "schema_version": DOCTOR_SCHEMA,
         "host": host,
         "account": account,
         "provider": provider,
-        "available": bool(checks) and all(check["ok"] for check in checks),
-        "checks": checks,
+        "execution_status": status,
+        "admission": decision,
     }
 
 
@@ -537,17 +536,53 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_execution_status(status: dict[str, Any]) -> None:
+    """Human view of the shared envelope: every fact with its own evidence."""
+    rows = status.get("rows")
+    if not isinstance(rows, list):
+        rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        subject = row.get("subject") if isinstance(row.get("subject"), dict) else {}
+        print(f"{subject.get('selector') or 'status'}:")
+        facts = row.get("facts") if isinstance(row.get("facts"), dict) else {}
+        for name in REPORTED_FACTS:
+            fact = facts.get(name)
+            if not isinstance(fact, dict):
+                print(f"  {name}: unknown (no observation)")
+                continue
+            age = fact.get("age_seconds")
+            age_text = f"age {age:g}s" if isinstance(age, (int, float)) else "no observation"
+            freshness = "stale" if fact.get("stale") else "current"
+            line = f"  {name}: {fact.get('state')} ({age_text}, {freshness})"
+            detail = fact.get("detail")
+            if isinstance(detail, str) and detail.strip():
+                line += f": {detail.strip()}"
+            print(line)
+    diagnostics = status.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        diagnostics = []
+    for diagnostic in diagnostics:
+        print(f"diagnostic: {diagnostic}")
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     result = doctor(
         host=args.host, provider=args.provider, selector=args.selector, account=args.account
     )
+    decision = result["admission"]
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
-        for check in result["checks"]:
-            marker = "ok" if check["ok"] else "fail"
-            print(f"{marker}: {check['name']}: {check['detail']}")
-    return 0 if result["available"] else 1
+        if result["execution_status"] is None:
+            print("execution status: none")
+        else:
+            print_execution_status(result["execution_status"])
+        for reason in decision["reasons"]:
+            print(f"reason: {reason}")
+        print(f"{'admit' if decision['allowed'] else 'refuse'}: {decision['policy']}")
+    return 0 if decision["allowed"] else 1
 
 
 def main(argv: list[str] | None = None) -> None:

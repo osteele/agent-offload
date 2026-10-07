@@ -54,6 +54,32 @@ def execute(request: dict, root: Path) -> dict:
     before = {
         name: file_bytes(safe_path(root, name)) for name in walk_files(root) if name not in carried
     }
+    # The submit-time remote observation is advisory by launch time. Immediately
+    # before generation, re-observe the exact subject on this pinned executor
+    # and re-apply the task policy, so credentials, capability, transport, or an
+    # explicit quota refusal that changed after submission cannot slip through
+    # the submit/launch window.
+    from agent_execution.execution_status import probe_status
+
+    from .readiness import admission
+
+    try:
+        status = probe_status(
+            harness="omp",
+            surface="offload-task",
+            selectors=[request["selector"]],
+            transport="weft",
+            requester_host=request.get("requester_host"),
+            requester_user=request.get("requester_user"),
+            expected_execution_sha256=request["execution_sha256"],
+        )
+    except (OSError, ValueError) as error:
+        raise TaskError(
+            f"task admission refused: fresh status observation failed: {error}"
+        ) from error
+    decision = admission(status, [request["selector"]])
+    if not decision["allowed"]:
+        raise TaskError("task admission refused: " + "; ".join(decision["reasons"]))
     worker = execute_worker(
         provider="omp",
         model_call_id=request["id"],
@@ -73,6 +99,9 @@ def execute(request: dict, root: Path) -> dict:
         ctx_timeout=30,
         expect_protocol=WORKER_PROTOCOL_VERSION,
         expect_source_sha256=request["execution_sha256"],
+        execution_transport="weft",
+        requester_host=request.get("requester_host"),
+        requester_user=request.get("requester_user"),
         cwd=root,
     )
     observed = census(root, list(carried))

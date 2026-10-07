@@ -134,15 +134,16 @@ def test_remote_command_uses_report_only_worker_protocol() -> None:
 
 
 def test_doctor_refuses_retired_native_codex_without_probe(monkeypatch) -> None:
-    from agent_offload import readiness
-
     def unexpected_probe(*_args, **_kwargs):
         raise AssertionError("retired provider must not be probed")
 
-    monkeypatch.setattr(readiness.subprocess, "run", unexpected_probe)
+    monkeypatch.setattr(cli, "probe_status", unexpected_probe)
     result = cli.doctor(host="studio", provider="codex")
-    assert result["available"] is False
-    assert all(not check["ok"] for check in result["checks"])
+    assert result["schema_version"] == "agent-offload.doctor/v2"
+    assert result["execution_status"] is None
+    assert result["admission"]["allowed"] is False
+    assert "native Codex execution is retired" in result["admission"]["reasons"][0]
+    assert "available" not in result
 
 
 def test_submit_refuses_retired_native_codex_before_weft(monkeypatch, tmp_path: Path) -> None:
@@ -369,72 +370,33 @@ def test_retrieve_refuses_report_bytes_not_bound_to_envelope(monkeypatch) -> Non
 def test_doctor_cli_exit_tracks_active_writer_readiness(
     monkeypatch, capsys, available: bool, expected_exit: int
 ) -> None:
-    import json
-    import subprocess
-
     from agent_execution.omp_execution import OMP_WRITER_SELECTORS
-    from agent_execution.worker import installed_worker_identity
-
-    from agent_offload import readiness
 
     selector = min(OMP_WRITER_SELECTORS)
-    payload = json.dumps(
-        {
-            "schema_version": "agent-execution.writer-readiness/v1",
-            "worker_identity": installed_worker_identity().to_dict(),
-            "writers": [
-                {
-                    "selector": selector,
-                    "model_available": available,
-                    "credential_available": True,
-                    "available": available,
-                    "detail": "ready" if available else "model unavailable",
-                }
-            ],
-        }
-    )
+    state = "available" if available else "unavailable"
+    from conftest import status_envelope
 
-    def run(argv, **kwargs):
-        return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
-
-    monkeypatch.setattr(readiness.subprocess, "run", run)
+    status = status_envelope([selector], overrides={"capability": {"state": state}})
+    monkeypatch.setattr(cli, "probe_status", lambda **_kwargs: status)
     with pytest.raises(SystemExit) as exit_code:
         cli.main(["doctor", "--selector", selector])
     assert exit_code.value.code == expected_exit
-    assert ("ok:" if available else "fail:") in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert ("admit:" if available else "refuse:") in output
 
 
 def _answer_requested_writers(monkeypatch) -> list[list[str]]:
-    """Fake the SSH probe, answering ready for exactly the selectors it requests."""
-    import subprocess
-
-    from agent_execution.worker import installed_worker_identity
-
-    from agent_offload import readiness
-
+    """Fake Execution's fresh exact-selector observation."""
     probed: list[list[str]] = []
 
-    def run(argv, **kwargs):
-        remote = shlex.split(argv[-1])
-        selectors = [remote[index + 1] for index, item in enumerate(remote) if item == "--selector"]
+    def probe(**kwargs):
+        selectors = kwargs["selectors"]
         probed.append(selectors)
-        payload = {
-            "schema_version": "agent-execution.writer-readiness/v1",
-            "worker_identity": installed_worker_identity().to_dict(),
-            "writers": [
-                {
-                    "selector": selector,
-                    "model_available": True,
-                    "credential_available": True,
-                    "available": True,
-                    "detail": "ready",
-                }
-                for selector in selectors
-            ],
-        }
-        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+        from conftest import status_envelope
 
-    monkeypatch.setattr(readiness.subprocess, "run", run)
+        return status_envelope(selectors)
+
+    monkeypatch.setattr(cli, "probe_status", probe)
     return probed
 
 
@@ -463,7 +425,12 @@ def test_doctor_selects_writers_to_probe(monkeypatch, capsys, arguments, expecte
     assert exit_code.value.code == 0
     assert probed == [expected()]
     report = json.loads(capsys.readouterr().out)
-    assert sorted(check["name"] for check in report["checks"]) == expected()
+    assert report["schema_version"] == "agent-offload.doctor/v2"
+    assert report["admission"]["allowed"] is True
+    assert (
+        sorted(row["subject"]["selector"] for row in report["execution_status"]["rows"])
+        == expected()
+    )
 
 
 def _installed_layout(root: Path, build_id: str, *, marker: str | None) -> Path:

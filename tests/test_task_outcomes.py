@@ -206,6 +206,63 @@ def test_monitoring_uses_validated_task_outcome(task_factory, capsys, outcome):
     assert rows[0]["job_status"] == "completed"
 
 
+def test_executor_admission_refusal_is_terminal_without_resubmission(
+    task_factory, tmp_path, monkeypatch, capsys
+):
+    from agent_execution import execution_status
+    from conftest import status_envelope
+
+    from agent_offload import task_worker
+
+    record, _ = task_factory("launch-refused")
+    request_bytes = json.dumps(record["request"]).encode()
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "coding-task").write_bytes(request_bytes)
+    monkeypatch.setenv("WEFT_PAYLOAD_DIR", str(payload))
+    monkeypatch.chdir(record["project"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["worker", "--request-sha256", record["request_sha256"], "--task-id", record["id"]],
+    )
+    monkeypatch.setattr(
+        execution_status,
+        "probe_status",
+        lambda **kwargs: status_envelope(
+            kwargs["selectors"], overrides={"authentication": {"state": "unavailable"}}
+        ),
+    )
+
+    def unexpected_generation(**kwargs):
+        raise AssertionError("admission refusal must not start the model")
+
+    monkeypatch.setattr(task_worker, "execute_worker", unexpected_generation)
+    with pytest.raises(SystemExit) as stopped:
+        task_worker.main()
+    assert stopped.value.code == 1
+    capsys.readouterr()
+    result = json.loads(Path(result_path(record["id"])).read_text())
+    assert result["status"] == "failed"
+    assert result["worker"] is None
+    assert result["changes"] == []
+    replies = tmp_path / "replies.json"
+    payloads = json.loads(replies.read_text())
+    payloads[record["job_id"]] = {
+        "job": {"id": record["job_id"], "status": "failed"},
+        "result": result,
+    }
+    replies.write_text(json.dumps(payloads))
+    for action in ("status", "resume"):
+        assert tasks.handler(argparse.Namespace(action=action, id=record["id"])) == 0
+        observed = json.loads(capsys.readouterr().out)
+        assert (observed["status"], observed["job_id"]) == ("failed", record["job_id"])
+    calls = [json.loads(line) for line in (tmp_path / "weft-calls").read_text().splitlines()]
+    assert all(command[0] != "run" for command in calls)
+    assert not (tmp_path / "processed-jobs").exists()
+    assert tasks.read_record(record["id"])["request"] == record["request"]
+
+
 def test_unverifiable_completion_does_not_hide_healthy_tasks(task_factory, tmp_path, capsys):
     broken, _ = task_factory("broken")
     task_factory("healthy")
@@ -326,6 +383,45 @@ def test_resume_resubmits_failed_job_under_new_attempt_key(task_factory, tmp_pat
     submitted = next(call for call in calls if call[0] == "run")
     assert submitted[submitted.index("--idempotency-key") + 1] == "retry-2"
     assert submitted[submitted.index("--output") + 1] == result_path("retry")
+
+
+def test_retry_admission_refusal_can_be_cancelled_without_another_submission(
+    task_factory, tmp_path, monkeypatch, capsys
+):
+    from conftest import status_envelope
+
+    from agent_offload import cli, readiness
+
+    record, _ = task_factory("retry-refused")
+    unpublished_failure(tmp_path, record)
+    monkeypatch.setattr(tasks, "require_writer", readiness.require_writer)
+    monkeypatch.setattr(
+        readiness,
+        "probe_remote_status",
+        lambda **kwargs: status_envelope(
+            [record["request"]["selector"]],
+            overrides={"authentication": {"state": "unavailable", "detail": "Revoked"}},
+        ),
+    )
+    with pytest.raises(SystemExit) as resumed:
+        cli.main(["task", "resume", record["id"]])
+    assert resumed.value.code == 1
+    retry = tasks.read_record(record["id"])
+    assert retry["attempt"] == 2
+    assert retry["job_id"] is None
+    assert retry["request"] == record["request"]
+    assert (tmp_path / "processed-jobs").read_text().splitlines() == [record["job_id"]]
+
+    with pytest.raises(SystemExit) as cancelled:
+        cli.main(["task", "cancel", record["id"]])
+    assert cancelled.value.code == 0
+    closed = tasks.read_record(record["id"])
+    assert closed["status"] == "cancelled"
+    assert closed["submission_started"] is False
+    assert closed["prior_job_ids"] == [record["job_id"]]
+    assert closed["request"] == record["request"]
+    calls = [json.loads(line) for line in (tmp_path / "weft-calls").read_text().splitlines()]
+    assert not any(call[0] == "run" for call in calls)
 
 
 def change_retained_digest(record, field):

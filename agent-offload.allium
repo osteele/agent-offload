@@ -5,7 +5,7 @@
 --         relay, and the historical report lane.
 -- Includes:
 --   Task identity, idempotency, submission, resume, cancellation
---   Task-lane writer readiness observation (catalog and credentials only)
+--   Execution-owned status observations with Offload task-admission policy
 --   Task worker execution constraints, requested checks, result publication
 --   Result retrieval validation, change application, application journal
 --   Attached relay sessions, confined local tools, provenance, fail-closed evidence
@@ -153,17 +153,19 @@ entity Task {
     attempt: Integer
     job: WeftJob?
     prior_job_ids: List<String>
+    submission_started: Boolean
+        -- False until the current attempt first enters Weft; persisted before entry.
     error: String?
 
     -- Evidence-based status. completed, failed and validation_failed come
     -- only from a validated task result. queued and running mirror the
     -- accepted Weft job's observed lifecycle. unknown means observation or
     -- evidence was unreadable; it never implies success.
-    status: submitting | submission_unknown | queued | running | completed | failed | validation_failed | failed_without_result | unknown | applied
+    status: submitting | submission_unknown | queued | running | completed | failed | validation_failed | failed_without_result | unknown | applied | cancelled
 
     applied_at: Timestamp when status = applied
     processed_at: Timestamp?
-        -- Acknowledgment of the current job only; cleared for a new attempt.
+        -- Current-job acknowledgment or local predispatch closure; cleared for a new attempt.
     backup: ApplicationBackup?
 
     result: TaskResult with task = this
@@ -322,6 +324,7 @@ rule SubmitTask {
             attempt: 1,
             job: null,
             prior_job_ids: [],
+            submission_started: false,
             status: submitting
         )
     ensures: WorkerProvisioningRequested(task)
@@ -401,7 +404,7 @@ rule ResumeTask {
     -- resumable as a new attempt, except a job the consumer explicitly
     -- canceled.
     requires: task.result = null
-    requires: task.status != applied
+    requires: task.status not in {applied, cancelled}
     requires: task.job = null or task.job?.status in {failed, dead, killed}
     requires: task.job = null or not task.job?.status in {canceled, cancelled}
     requires: baseline_unchanged(task)
@@ -425,6 +428,7 @@ rule ResumeTask {
             task.job = null
             task.processed_at = null
             task.status = submitting
+            task.submission_started = false
             SubmissionSent(task)
     @guidance
         -- An unsubmitted or unresolved submission resumes under the same
@@ -447,6 +451,22 @@ rule ResumeTask {
         -- build that changed or was collected while the failed job queued.
 }
 
+rule CancelBeforeDispatch {
+    when: CancelTask(caller, task)
+    requires: task.job = null
+    requires: not task.submission_started
+    requires: task.status != submission_unknown
+    ensures: task.status = cancelled
+    ensures:
+        if task.processed_at = null:
+            task.processed_at = now
+    @guidance
+        -- Local disposition preserves the immutable request and never calls Weft.
+        -- Missing custody metadata cannot prove that submission never started.
+        -- Repeated cancellation is idempotent; resume cannot resurrect this identity.
+        -- Accepted or ambiguous dispatch custody must be reconciled, not discarded.
+}
+
 rule CancelTask {
     when: CancelTask(caller, task)
 
@@ -457,8 +477,8 @@ rule CancelTask {
     ensures: TaskJobAcknowledgmentRequested(task)
     @guidance
         -- Cancellation operates on the accepted Weft job and preserves the
-        -- baseline and any applied marker. A task with no accepted job
-        -- identity must resolve its submission first.
+        -- baseline and any applied marker. An ambiguous task with no accepted
+        -- job identity must resolve its submission first.
         -- An already-terminal job is disposed without another cancellation.
         -- If cancellation is pending, acknowledgment refuses; repeating
         -- cancel checks the terminal state again before marking processed.
@@ -904,41 +924,36 @@ rule RefuseRetiredNativeSubmission {
         -- provider escape hatch and no fallback to another lane.
 }
 
--- Task-lane writer readiness
+-- Task-lane doctor v2 and Execution-owned observations
 
-rule ReportTaskWriterReadiness {
+rule ReportTaskWriterAdmission {
     when: RunDoctor(caller, host, account, provider?, selector?)
 
     requires: selector != null or provider != "codex"
     let requested = doctor_selection(provider, selector)
-        -- An exact selector is probed alone and overrides provider. An
-        -- explicit provider selects every admitted task writer for it. With
-        -- neither, only config.admitted_selector is probed.
-    ensures: ReadinessReported(
-        writers: requested,
-        available: requested.count > 0
-            and requested.all(w => writer_readiness_observed(host, account, w))
+        -- Exact selector overrides provider; provider selects all admitted
+        -- task writers; no options selects the configured default.
+    ensures: DoctorReported(
+        schema: "agent-offload.doctor/v2",
+        execution_status: fresh_execution_status(host, account, "omp", "offload-task", requested),
+        admission: task_admission("offload-task/v1", requested)
     )
     @guidance
-        -- One remote probe through the worker on the host and account
-        -- observes, for each requested exact selector, its presence in the
-        -- pinned OMP catalog and execution-eligible credentials, together
-        -- with the worker's reported identity. It never generates a model
-        -- response and makes no claim about live quota or generation. A
-        -- failed probe or malformed answer reports unavailable, and a
-        -- provider with no admitted writers reports unavailable without
-        -- probing. Nothing is queued.
+        -- Execution owns public schema, exact selector coverage, identity,
+        -- fact validation and observation provenance. Offload policy requires
+        -- current available capability, authentication, and transport. A
+        -- current explicit quota refusal blocks; unknown quota is not a
+        -- promise of capacity. Failed probes set execution_status null and
+        -- report the policy reason; no universal available flag is emitted.
 }
 
-rule RefuseNativeCodexReadiness {
+rule RefuseNativeCodexAdmission {
     when: RunDoctor(caller, host, account, provider?, selector?)
 
     requires: selector = null and provider = "codex"
-    ensures: ReadinessReported(writers: [], available: false)
+    ensures: DoctorReported(schema: "agent-offload.doctor/v2", execution_status: null,
+        admission: denied("offload-task/v1", "native Codex execution is retired"))
     ensures: RetirementRefusalReported("native Codex execution is retired; use the grounded OMP Anthropic route or an OpenAI packet-only route")
-    @guidance
-        -- Native codex is reported as retired only when explicitly
-        -- requested, without probing the remote host.
 }
 
 ------------------------------------------------------------
@@ -951,24 +966,30 @@ invariant UniqueTaskIdentity {
             a != b implies a.id != b.id
 }
 
-invariant NewJobsRequireObservedWriterReadiness {
-    -- Every Weft job the task lane newly queues was sent only after a remote
-    -- observation, for task.account on the target host through the
-    -- provisioned worker build (task.worker_bin_dir), that the exact
-    -- task.selector is in the pinned OMP catalog with execution-eligible
-    -- credentials, and that the worker's reported identity matches the
-    -- dispatch. The observation is of catalog and credentials only, not of
-    -- live quota or generation. An unavailable writer leaves
-    -- the task with no job and a diagnostic naming its identity and resume.
+invariant NewJobsRequireExecutionStatusAdmission {
+    -- New Weft submissions obtain fresh Execution-owned exact-selector facts
+    -- through the provisioned worker build, and the pinned task executor probes
+    -- again immediately before generation. Offload requires current capability,
+    -- authentication, and transport; a current explicit quota refusal blocks,
+    -- while unknown quota is not a capacity promise. A refusal before submission
+    -- leaves no new job and names the retained identity and resume command.
+    -- A refusal on the executor publishes a terminal failed result for its
+    -- accepted job without running the model. Resume reports that result;
+    -- retrying after fixing the cause requires a new task identity.
     -- Exempt: an accepted job recovered from Weft by the attempt's
     -- idempotency key. A send that may have reached Weft (unresolved, or
     -- interrupted after `weft run` began) is reconciled by that key before
     -- any provisioning or readiness check, and a recorded job is bound
     -- however readiness has since changed; a failed or malformed lookup is
     -- not evidence of absence and leaves the submission unresolved.
+    -- A not-found lookup permits an idempotent resend, not release of custody:
+    -- an earlier in-flight request may still be accepted. Admission refusal
+    -- after such a lookup leaves submission_started set and cancellation blocked.
     for task in Tasks:
         task.job != null and not recovered_by_idempotency_key(task)
-            implies writer_readiness_observed_before_send(task)
+            implies execution_status_admitted_before_send(task)
+        generation_started(task)
+            implies fresh_execution_status_admitted_before_generation(task)
 }
 
 invariant NoUnvalidatedOutcome {

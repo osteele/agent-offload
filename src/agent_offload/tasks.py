@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import getpass
 import json
 import math
 import os
 import re
 import shlex
+import socket
 import subprocess
 import tempfile
 import time
@@ -194,6 +196,8 @@ def submit(
             "id": identity,
             "brief": brief,
             "selector": selector,
+            "requester_host": socket.gethostname(),
+            "requester_user": getpass.getuser(),
             "timeout": timeout,
             "check": check,
             "baseline": manifest(project, editable),
@@ -212,6 +216,7 @@ def submit(
             "title": task_title(brief),
             "created_at": time.time(),
             "status": "submitting",
+            "submission_started": False,
             "job_id": None,
             "request_sha256": digest(payload.read_bytes()),
             "request": request,
@@ -468,6 +473,8 @@ def oversized_content(path: Path, snapshot_name: str, excluded) -> list[str]:
 def send(record: dict, directory: Path) -> dict:
     from .cli import WeftReceipt
 
+    if record.get("status") == "cancelled" and not record.get("job_id"):
+        raise TaskError("task was cancelled before dispatch; submit a new task identity")
     payload = directory / "request.json"
     if digest(payload.read_bytes()) != record["request_sha256"]:
         raise TaskError("retained request was modified")
@@ -503,6 +510,8 @@ def send(record: dict, directory: Path) -> dict:
             record.pop("error", None)
             save(directory / "task.json", record)
             return summary(record)
+        # Absence permits an idempotent resend, not release of dispatch custody:
+        # an earlier in-flight request may still be accepted after this lookup.
     if not record.get("bin_dir") or not record.get("build_id"):
         ensure_worker(record)
         save(directory / "task.json", record)
@@ -510,7 +519,7 @@ def send(record: dict, directory: Path) -> dict:
         require_writer(record)
     except TaskError as error:
         raise TaskError(
-            f"writer readiness failed for retained task {record['id']}: {error}; "
+            f"Execution status admission failed for retained task {record['id']}: {error}; "
             f"resume with: agent-offload task resume {record['id']}"
         ) from error
     command = shlex.join(
@@ -670,7 +679,7 @@ def resubmit(record: dict, directory: Path) -> dict:
     # The new attempt's key has not been sent yet; the earlier attempt's
     # started marker must not make it look potentially accepted.
     record.pop("processed_at", None)
-    record.pop("submission_started", None)
+    record["submission_started"] = False
     # A new attempt key lets Weft accept a second job; it survives interruption.
     save(directory / "task.json", record)
     return send(record, directory)
@@ -992,13 +1001,25 @@ def handler(args: argparse.Namespace) -> int:
                         value = send(record, directory)
                 elif args.action == "cancel":
                     if not record.get("job_id"):
-                        raise TaskError("resolve submission before cancellation")
-                    observed = observe_job(record)
-                    if observed["status"] not in TERMINAL_JOB_STATUSES:
-                        run(["weft", "cancel", record["job_id"]])
-                    # Cancellation may be asynchronous; acknowledge only after
-                    # a second observation confirms the job is terminal.
-                    acknowledge(record, directory)
+                        if (
+                            record.get("submission_started") is not False
+                            or record.get("status") == "submission_unknown"
+                        ):
+                            raise TaskError("resolve submission before cancellation")
+                        # send persists its marker before entering Weft. A
+                        # readiness refusal has never crossed that boundary.
+                        record.update(
+                            status="cancelled",
+                            processed_at=record.get("processed_at") or time.time(),
+                        )
+                        record.pop("error", None)
+                        save(directory / "task.json", record)
+                    else:
+                        observed = observe_job(record)
+                        if observed["status"] not in TERMINAL_JOB_STATUSES:
+                            run(["weft", "cancel", record["job_id"]])
+                        # Acknowledge only after terminal cancellation is observed.
+                        acknowledge(record, directory)
                     value = status(record)
                 else:
                     if args.action != "apply":

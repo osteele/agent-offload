@@ -14,7 +14,7 @@ from . import __version__
 WORKER_PROTOCOL_VERSION = 1
 IDENTITY_SCHEMA = "agent-offload.worker-identity/v1"
 RESULT_SCHEMA = "agent-offload.worker-result/v1"
-DOCTOR_SCHEMA = "agent-offload.doctor/v1"
+DOCTOR_SCHEMA = "agent-offload.doctor/v2"
 RETRIEVAL_SCHEMA = "agent-offload.retrieval/v1"
 SUPPORTED_PROVIDER = "codex"
 SUPPORTED_MODE = "report"

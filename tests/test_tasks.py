@@ -1279,44 +1279,39 @@ def test_submit_launches_the_pinned_build_by_absolute_path(tmp_path, monkeypatch
     assert " agent-offload-task-worker " not in f" {run} "
 
 
-def fake_writer_readiness(tmp_path: Path):
-    """Fake ssh answering the remote worker's readiness probe for the slow task's writer.
+def fake_writer_readiness(tmp_path: Path, monkeypatch):
+    """Synthetic shared observations; retain a log to detect duplicate probing."""
+    from conftest import status_envelope
 
-    Install after fake_tools (it shares the PATH directory). Returns a setter
-    for the observed catalog/credential state and the file logging each probe.
-    """
-    from agent_execution.identity import source_sha256
+    from agent_offload import readiness
 
-    answer = tmp_path / "readiness.json"
-    probes = tmp_path / "ssh-calls"
-    ssh = tmp_path / "bin" / "ssh"
-    ssh.write_text(f'#!/bin/sh\necho probe >> "{probes}"\n/bin/cat "{answer}"\n')
-    ssh.chmod(0o755)
+    answer = tmp_path / "execution-status.json"
+    probes = tmp_path / "status-calls"
 
     def observe(
         *, model_available: bool = True, credential_available: bool = True, detail: str = "ready"
     ) -> None:
-        answer.write_text(
-            json.dumps(
-                {
-                    "schema_version": "agent-execution.writer-readiness/v1",
-                    "worker_identity": {
-                        "schema_version": "agent-execution.worker-identity/v1",
-                        "source_sha256": source_sha256(),
-                    },
-                    "writers": [
-                        {
-                            "selector": "openai-codex/gpt-6-astra",
-                            "model_available": model_available,
-                            "credential_available": credential_available,
-                            "available": model_available and credential_available,
-                            "detail": detail,
-                        }
-                    ],
-                }
-            )
+        status = status_envelope(
+            ["openai-codex/gpt-6-astra"],
+            overrides={
+                "capability": {
+                    "state": "available" if model_available else "unavailable",
+                    "detail": detail,
+                },
+                "authentication": {
+                    "state": "available" if credential_available else "unavailable",
+                    "detail": detail,
+                },
+            },
         )
+        answer.write_text(json.dumps(status))
 
+    def probe(**kwargs):
+        with probes.open("a") as stream:
+            stream.write("probe\n")
+        return json.loads(answer.read_text())
+
+    monkeypatch.setattr(readiness, "probe_remote_status", probe)
     return observe, probes
 
 
@@ -1337,7 +1332,7 @@ def test_unavailable_writer_never_queues_and_resume_rechecks(
     monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
     monkeypatch.setattr(tasks, "require_writer", require_writer)
     calls = fake_weft_submission(tmp_path, monkeypatch, runs=["queued"], lookup="absent")
-    observe, _ = fake_writer_readiness(tmp_path)
+    observe, _ = fake_writer_readiness(tmp_path, monkeypatch)
     observe(**{missing: False}, detail=detail)
 
     with pytest.raises(TaskError, match=detail):
@@ -1376,7 +1371,7 @@ def test_resume_recovers_an_accepted_submission_without_readiness_or_resend(
     # either the transport fails gracefully or the submitter is interrupted
     # while `weft run` is still running.
     calls = fake_weft_submission(tmp_path, monkeypatch, runs=[interruption], lookup="found")
-    observe, probes = fake_writer_readiness(tmp_path)
+    observe, probes = fake_writer_readiness(tmp_path, monkeypatch)
     observe()
     if interruption == "unresolved":
         with pytest.raises(TaskError):
@@ -1393,8 +1388,7 @@ def test_resume_recovers_an_accepted_submission_without_readiness_or_resend(
     assert read_record("slow")["job_id"] is None
     assert len(probes.read_text().splitlines()) == 1
 
-    # The writer has since lost its credentials and the provisioning tool is
-    # absent from PATH; neither may matter to a job Weft already accepted.
+    # Credentials lost after acceptance cannot turn reconciliation into a resend.
     observe(credential_available=False, detail="No execution-eligible OMP credentials")
     monkeypatch.setattr(tasks, "ensure_worker", REAL_ENSURE_WORKER)
     with pytest.raises(SystemExit) as resumed:
@@ -1404,3 +1398,154 @@ def test_resume_recovers_an_accepted_submission_without_readiness_or_resend(
     assert (record["status"], record["job_id"]) == ("queued", "wj77")
     assert len(probes.read_text().splitlines()) == 1
     assert weft_calls(calls) == ["run -C", "job lookup"]
+
+
+def test_fresh_worker_refusal_prevents_generation_after_submit_admission(tmp_path, monkeypatch):
+    from agent_execution import execution_status
+    from agent_execution.identity import source_sha256
+    from conftest import status_envelope
+
+    from agent_offload import readiness, task_worker
+
+    request, _ = proposal(tmp_path)
+    selector = "openai-codex/gpt-6-luna"
+    request.update(
+        id="late-refusal",
+        selector=selector,
+        execution_sha256=source_sha256(),
+        brief="Edit hello.py",
+        timeout=30,
+        check=[],
+        request_sha256="a" * 64,
+    )
+    monkeypatch.setattr(
+        readiness,
+        "probe_remote_status",
+        lambda **kwargs: status_envelope([selector]),
+    )
+    readiness.require_writer({"host": "studio", "bin_dir": PINNED_BIN, "request": request})
+    refused = status_envelope(
+        [selector],
+        overrides={
+            "authentication": {"state": "unavailable", "detail": "credential revoked"},
+        },
+    )
+    monkeypatch.setattr(execution_status, "probe_status", lambda **kwargs: refused)
+
+    def unexpected_generation(**kwargs):
+        raise AssertionError("revoked credentials reached the model launch")
+
+    monkeypatch.setattr(task_worker, "execute_worker", unexpected_generation)
+    with pytest.raises(TaskError, match="credential revoked"):
+        task_worker.execute(request, tmp_path)
+    assert (tmp_path / "hello.py").read_text() == "print('before')\n"
+
+
+def test_predispatch_refusal_can_be_cancelled_without_queuing_or_resurrection(
+    tmp_path, monkeypatch, capsys
+):
+    from agent_offload import cli
+    from agent_offload.readiness import require_writer
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(tasks, "require_writer", require_writer)
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["queued"], lookup="absent")
+    observe, _ = fake_writer_readiness(tmp_path, monkeypatch)
+    observe(model_available=False, detail="Exact model absent")
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+    original = read_record("slow")
+    for _ in range(2):
+        with pytest.raises(SystemExit) as outcome:
+            cli.main(["task", "cancel", "slow"])
+        assert outcome.value.code == 0
+    cancelled = read_record("slow")
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["request"] == original["request"]
+    assert cancelled["job_id"] is None
+    assert not calls.exists()
+    observe()
+    with pytest.raises(SystemExit) as outcome:
+        cli.main(["task", "resume", "slow"])
+    assert outcome.value.code == 1
+    assert not calls.exists()
+    assert read_record("slow")["status"] == "cancelled"
+
+
+@pytest.mark.parametrize("lookup", ["absent", "fail", "other-key"])
+def test_unresolved_submission_keeps_custody_after_lookup_or_admission_refusal(
+    tmp_path, monkeypatch, capsys, lookup
+):
+    from agent_offload import cli
+    from agent_offload.readiness import require_writer
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(tasks, "require_writer", require_writer)
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["unresolved"], lookup=lookup)
+    observe, _ = fake_writer_readiness(tmp_path, monkeypatch)
+    observe()
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+    original = read_record("slow")
+    assert original["submission_started"] is True
+    observe(credential_available=False, detail="Credential revoked after submission")
+    with pytest.raises(SystemExit) as resumed:
+        cli.main(["task", "resume", "slow"])
+    assert resumed.value.code == 1
+    with pytest.raises(SystemExit) as cancelled:
+        cli.main(["task", "cancel", "slow"])
+    assert cancelled.value.code == 1
+    current = read_record("slow")
+    assert current["status"] == "submission_unknown"
+    assert current["submission_started"] is True
+    assert current["request"] == original["request"]
+    assert current["job_id"] is None
+    assert weft_calls(calls) == ["run -C", "job lookup"]
+
+    if lookup == "absent":
+        # A point-in-time absence cannot rule out acceptance of an in-flight request.
+        (tmp_path / "lookup.json").write_text(
+            json.dumps(
+                {
+                    "api_version": "weft.job.lookup.v1",
+                    "idempotency_key": "slow",
+                    "found": True,
+                    "receipt": receipt("slow", "deduplicated"),
+                }
+            )
+        )
+        monkeypatch.setattr(tasks, "ensure_worker", REAL_ENSURE_WORKER)
+        with pytest.raises(SystemExit) as recovered:
+            cli.main(["task", "resume", "slow"])
+        assert recovered.value.code == 0
+        recovered_record = read_record("slow")
+        assert (recovered_record["status"], recovered_record["job_id"]) == ("queued", "wj77")
+        assert recovered_record["request"] == original["request"]
+        assert weft_calls(calls) == ["run -C", "job lookup", "job lookup"]
+
+
+@pytest.mark.parametrize(
+    ("status", "has_custody_marker"),
+    [("submitting", True), ("submission_unknown", True), ("submitting", False)],
+)
+def test_cancel_cannot_discard_an_ambiguous_submission(
+    tmp_path, monkeypatch, capsys, status, has_custody_marker
+):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["unresolved"], lookup="found")
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+    record = read_record("slow")
+    assert record["submission_started"] is True
+    record["status"] = status
+    if not has_custody_marker:
+        record.pop("submission_started")
+    with locked("slow") as directory:
+        tasks.save(directory / "task.json", record)
+    with pytest.raises(SystemExit) as outcome:
+        cli.main(["task", "cancel", "slow"])
+    assert outcome.value.code == 1
+    assert read_record("slow") == record
+    assert weft_calls(calls) == ["run -C"]
