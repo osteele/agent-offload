@@ -746,6 +746,16 @@ def acknowledge(record: dict, directory: Path) -> None:
     save(directory / "task.json", record)
 
 
+def result_unavailable_message(record: dict, error: ResultUnavailable) -> str:
+    return (
+        f"result unavailable for task {record['id']} (Weft job {record['job_id']}). "
+        "A retrieval failure does not establish that the task failed. "
+        f"Retry `agent-offload task retrieve {record['id']}`; "
+        "do not resubmit the task or substitute job logs for its validated result. "
+        f"Weft diagnostic: {error}"
+    )
+
+
 def status(record: dict) -> dict:
     row = summary(record)
     if record.get("applied_at"):
@@ -775,6 +785,8 @@ def status(record: dict) -> dict:
                     error=unpublished_failure(record, observed, error),
                 )
         row["observed_at"] = time.time()
+    except ResultUnavailable as error:
+        row.update(status="unknown", error=result_unavailable_message(record, error))
     except (OSError, ValueError, TypeError, KeyError) as error:
         row.update(status="unknown", error=str(error))
     return row
@@ -1019,6 +1031,12 @@ def handler(args: argparse.Namespace) -> int:
                         value = summary(record)
         print(json.dumps(value, sort_keys=True))
         return 0
+    except ResultUnavailable as error:
+        print(
+            f"agent-offload task: {result_unavailable_message(record, error)}",
+            file=__import__("sys").stderr,
+        )
+        return 1
     except (OSError, ValueError, KeyError) as error:
         print(f"agent-offload task: {error}", file=__import__("sys").stderr)
         return 1

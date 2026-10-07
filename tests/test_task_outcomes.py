@@ -65,6 +65,8 @@ def task_factory(tmp_path, monkeypatch):
         "    sys.exit(0)\n"
         "kind = {('job', 'inspect'): 'job', ('job', 'log'): 'log'}.get(tuple(args[:2]), 'result')\n"
         "entry = data[args[2]]\n"
+        "if kind == 'result' and 'result_error' in entry:\n"
+        "    sys.exit(entry['result_error'])\n"
         "if kind not in entry:\n"
         "    sys.exit(f'no {kind} for {args[2]}')\n"
         "print(entry[kind] if kind == 'log' else json.dumps(entry[kind]))\n"
@@ -262,6 +264,52 @@ def test_missing_result_of_publishing_job_stays_unknown(
     row = json.loads(capsys.readouterr().out)
     assert row["status"] == "unknown"
     assert "no result" in row["error"]
+
+
+@pytest.mark.parametrize("action", ["retrieve", "diff", "apply", "status", "resume"])
+def test_published_result_outage_recovers_without_new_attempt(
+    task_factory, tmp_path, capsys, action
+):
+    record, result = task_factory("recover-artifact", outcome="validation_failed")
+    result["validation"]["stderr"] = "original check failure"
+    replies = tmp_path / "replies.json"
+    available = json.loads(replies.read_text())
+    available[record["job_id"]]["result"] = result
+    available[record["job_id"]]["job"].update(
+        status="failed", publication={"required_artifacts_state": "ready"}
+    )
+    unavailable = {
+        record["job_id"]: {
+            "job": available[record["job_id"]]["job"],
+            "result_error": "R2 GetObject HTTP 500 after 3 attempts",
+        }
+    }
+    replies.write_text(json.dumps(unavailable))
+    exit_code = tasks.handler(argparse.Namespace(action=action, id=record["id"]))
+    output = capsys.readouterr()
+    if action in {"status", "resume"}:
+        assert exit_code == 0
+        row = json.loads(output.out)
+        assert row["status"] == "unknown"
+        diagnostic = row["error"]
+    else:
+        assert exit_code == 1
+        diagnostic = output.err
+    assert record["job_id"] in diagnostic
+    assert "R2 GetObject HTTP 500 after 3 attempts" in diagnostic
+    # The recovery command must remain executable against the retained identity.
+    recovery = f"agent-offload task retrieve {record['id']}"
+    assert recovery in diagnostic
+    assert tasks.read_record(record["id"]) == record
+    replies.write_text(json.dumps(available))
+    assert tasks.handler(argparse.Namespace(action="retrieve", id=recovery.split()[-1])) == 0
+    recovered = json.loads(capsys.readouterr().out)
+    assert recovered["status"] == "validation_failed"
+    assert recovered["validation"]["stderr"] == "original check failure"
+    assert tasks.read_record(record["id"]) == record
+    assert (Path(record["project"]) / "hello.py").read_text() == "before\n"
+    calls = [json.loads(line) for line in (tmp_path / "weft-calls").read_text().splitlines()]
+    assert all(call[:2] in (["job", "inspect"], ["artifact", "cat"]) for call in calls)
 
 
 def test_resume_resubmits_failed_job_under_new_attempt_key(task_factory, tmp_path, capsys):
