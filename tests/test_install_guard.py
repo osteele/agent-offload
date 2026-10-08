@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 
@@ -30,6 +31,7 @@ def run_without_execution(statement: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="the platform refusal comes first elsewhere")
 @pytest.mark.parametrize("entry_point", ["cli", "worker", "task_worker"])
 def test_entry_point_names_missing_agent_execution_instead_of_a_traceback(
     entry_point: str,
@@ -52,13 +54,19 @@ def test_relay_imports_without_agent_execution() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+@pytest.mark.parametrize("execution_installed", [True, False])
 @pytest.mark.parametrize("entry_point", ["cli", "worker", "task_worker"])
-def test_entry_point_refuses_a_non_posix_platform_by_name(entry_point: str) -> None:
+def test_entry_point_refuses_a_non_posix_platform_by_name(
+    entry_point: str, execution_installed: bool
+) -> None:
+    # An install that also omitted agent-execution must still name the platform.
+    prelude = "" if execution_installed else BLOCK_EXECUTION
     completed = subprocess.run(
         [
             sys.executable,
             "-c",
-            f"import os\nos.name = 'nt'\nfrom agent_offload.entry import {entry_point}\n{entry_point}()",
+            prelude
+            + f"import os\nos.name = 'nt'\nfrom agent_offload.entry import {entry_point}\n{entry_point}()",
         ],
         capture_output=True,
         text=True,

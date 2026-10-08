@@ -38,24 +38,24 @@ def require_posix() -> None:
 
 
 def cli() -> None:
-    require_agent_execution()
     require_posix()
+    require_agent_execution()
     from .cli import main
 
     main()
 
 
 def worker() -> None:
-    require_agent_execution()
     require_posix()
+    require_agent_execution()
     from .worker_cli import main
 
     main()
 
 
 def task_worker() -> None:
-    require_agent_execution()
     require_posix()
+    require_agent_execution()
     from .task_worker import main
 
     main()
