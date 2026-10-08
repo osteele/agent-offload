@@ -35,18 +35,18 @@ from .task_protocol import (
     SCHEMA,
     SELECTORS_SCHEMA,
     TaskError,
+    canonical_digest,
     census,
-    decode,
     digest,
-    file_bytes,
     manifest,
     object_json,
+    preflight_changes,
     render_diff,
     result_path,
-    safe_path,
     split_carried,
     task_id,
     validate_changes,
+    write_changes,
 )
 
 DEFAULT_SELECTOR = "openai-codex/gpt-6-luna"
@@ -154,6 +154,13 @@ def task_title(brief: str) -> str:
     return (title or first or "Untitled task")[:160]
 
 
+def check_timeout(timeout: float) -> float:
+    """Accept only the explicit bounded execution budget every task dispatches with."""
+    if not math.isfinite(timeout) or not 1 <= timeout <= 7200:
+        raise TaskError(f"timeout {timeout!r} is outside the permitted range (1-7200 seconds)")
+    return timeout
+
+
 def submit(
     project: Path,
     brief: str,
@@ -173,8 +180,7 @@ def submit(
     if selector not in OMP_WRITER_SELECTORS:
         permitted = ", ".join(sorted(OMP_WRITER_SELECTORS))
         raise TaskError(f"writer selector {selector!r} is not admitted; permitted: {permitted}")
-    if not math.isfinite(timeout) or not 1 <= timeout <= 7200:
-        raise TaskError(f"timeout {timeout!r} is outside the permitted range (1-7200 seconds)")
+    check_timeout(timeout)
     # The writer cannot execute anything (workspace-write-no-shell), so only a
     # supplied check builds remotely and only it can hit the missing dependency.
     stale = escaping_path_dependencies(project) if check else []
@@ -185,26 +191,42 @@ def submit(
             "so the check would fail remotely after the writer has finished. Use "
             f"{WORKSPACE_LANE} for projects with external path dependencies"
         )
+    # Refuse a retained identity before taking another source census. dispatch
+    # repeats this check under its lock to cover concurrent submissions.
+    if (state_root() / identity / "task.json").exists():
+        raise TaskError(f"task {identity} already exists; inspect it or use task resume")
     # The immutable build returned by ensure_worker must match both bundled
     # package digests. A separate execution worker on PATH does not run this task.
+    editable, carried = split_carried(project, snapshot_names(project))
+    request = {
+        "schema_version": SCHEMA,
+        "id": identity,
+        "brief": brief,
+        "selector": selector,
+        "requester_host": socket.gethostname(),
+        "requester_user": getpass.getuser(),
+        "timeout": timeout,
+        "check": check,
+        "baseline": manifest(project, editable),
+        "carried": census(project, carried),
+        "execution_sha256": source_sha256(),
+        "offload_sha256": package_source_sha256(),
+    }
+    return dispatch(identity, project, request, host=host, account=account, title=task_title(brief))
+
+
+def dispatch(
+    identity: str, project: Path, request: dict, *, host: str, account: str, title: str
+) -> dict:
+    """Persist immutable custody for a built request, then provision and send it.
+
+    The identity and immutable request survive an interrupted submission: a
+    send that may have reached Weft is reconciled by `task resume` under the
+    same idempotency identity rather than accepted again as a second job.
+    """
     with locked(identity) as directory:
         if (directory / "task.json").exists():
             raise TaskError(f"task {identity} already exists; inspect it or use task resume")
-        editable, carried = split_carried(project, snapshot_names(project))
-        request = {
-            "schema_version": SCHEMA,
-            "id": identity,
-            "brief": brief,
-            "selector": selector,
-            "requester_host": socket.gethostname(),
-            "requester_user": getpass.getuser(),
-            "timeout": timeout,
-            "check": check,
-            "baseline": manifest(project, editable),
-            "carried": census(project, carried),
-            "execution_sha256": source_sha256(),
-            "offload_sha256": package_source_sha256(),
-        }
         payload = directory / "request.json"
         save(payload, request)
         record = {
@@ -213,7 +235,7 @@ def submit(
             "project": str(project),
             "host": host,
             "account": account,
-            "title": task_title(brief),
+            "title": title,
             "created_at": time.time(),
             "status": "submitting",
             "submission_started": False,
@@ -512,6 +534,8 @@ def send(record: dict, directory: Path) -> dict:
             return summary(record)
         # Absence permits an idempotent resend, not release of dispatch custody:
         # an earlier in-flight request may still be accepted after this lookup.
+    if "continuation" in record["request"]:
+        check_baseline_unchanged(record)
     if not record.get("bin_dir") or not record.get("build_id"):
         ensure_worker(record)
         save(directory / "task.json", record)
@@ -638,6 +662,10 @@ def check_baseline_unchanged(record: dict) -> None:
     # and could have none: submit refused any project holding one outright.
     project, request = Path(record["project"]), record["request"]
     carried = request.get("carried", {})
+    if "continuation" in request:
+        editable, carried_names = split_carried(project, snapshot_names(project))
+        if set(editable) != set(request["baseline"]) or set(carried_names) != set(carried):
+            raise TaskError("project changed since submission; inspect Weft before resuming")
     if manifest(project, list(request["baseline"])) != request["baseline"] or (
         census(project, list(carried)) != carried
     ):
@@ -685,6 +713,147 @@ def resubmit(record: dict, directory: Path) -> dict:
     return send(record, directory)
 
 
+CONTINUATION_HEADER = (
+    "The edits seeded into this task's snapshot are INCOMPLETE, UNTRUSTED work retained "
+    "from the interrupted parent task: they were never validated by a passing check and "
+    "were never applied. Verify, repair, extend, and finish the work below; do not "
+    "assume the seed is correct."
+)
+
+
+def continuation_brief(parent_brief: str, supplement: str | None = None) -> str:
+    """A child brief preserving the original requirements and marking the seed untrusted."""
+    parts = [
+        f"Continue interrupted task: {task_title(parent_brief)}",
+        CONTINUATION_HEADER,
+        "Original task requirements:",
+        parent_brief.rstrip(),
+    ]
+    if supplement is not None and supplement.strip():
+        parts.extend(["Continuation instructions:", supplement.rstrip()])
+    return "\n\n".join(parts) + "\n"
+
+
+def continue_task(
+    parent_identity: str,
+    *,
+    timeout: float,
+    supplement: str | None = None,
+    identity: str | None = None,
+) -> dict:
+    """Continue a failed task from its retained partial edits as a fresh child task.
+
+    The parent is only read: its record, job, and published result are never
+    mutated or acknowledged, so a parent already closed with `task cancel`
+    stays eligible. The child is an ordinary durable task pinned to the
+    current build; the parent's validated changes are seeded into the child's
+    disposable remote snapshot, never applied to the local project. This is a
+    fresh execution, not a session resume, force-apply, or budget extension.
+    """
+    parent = read_record(parent_identity)
+    request = parent["request"]
+    if parent.get("applied_at"):
+        raise TaskError(
+            f"task {parent['id']} was already applied; its edits are in the project, "
+            "and continuing it could duplicate them"
+        )
+    if not parent.get("job_id"):
+        raise TaskError(f"task {parent['id']} has no accepted job identity to continue")
+    observed = observe_job(parent)
+    if observed["status"] not in TERMINAL_JOB_STATUSES:
+        raise TaskError(
+            f"job {parent['job_id']} is {observed['status']!r}; only a finished task "
+            "can be continued"
+        )
+    try:
+        result = retrieve(parent)
+    except ResultUnavailable as error:
+        cancelled = observed["status"] in {"canceled", "cancelled"}
+        raise TaskError(
+            f"task {parent['id']} published no result to continue from"
+            + (" (it was cancelled without publishing one)" if cancelled else "")
+            + f"; a retrieval failure does not establish failure: {error}. "
+            f"Retry `agent-offload task retrieve {parent['id']}`"
+        ) from error
+    except TaskError as error:
+        raise TaskError(f"task {parent['id']} cannot be continued: {error}") from error
+    if result["status"] == "completed":
+        raise TaskError(
+            f"task {parent['id']} succeeded; apply it with "
+            f"`agent-offload task apply {parent['id']}`"
+        )
+    if result["worker"] is None:
+        raise TaskError(
+            f"task {parent['id']} failed without a validated edit snapshot; "
+            "continue an earlier ancestor with retained edits, or submit a fresh task"
+        )
+    check_timeout(timeout)
+    if request["selector"] not in OMP_WRITER_SELECTORS:
+        permitted = ", ".join(sorted(OMP_WRITER_SELECTORS))
+        raise TaskError(
+            f"parent writer selector {request['selector']!r} is no longer admitted; "
+            f"permitted: {permitted}"
+        )
+    seed = result["changes"]
+    project = Path(parent["project"])
+    # The child inherits the parent's original baseline, so the unchanged local
+    # project must still be exactly that baseline: every editable file and the
+    # carried census, with no additions. A new local file could collide with a
+    # seeded addition, so path-set drift refuses before anything is submitted,
+    # and nothing is written here.
+    editable, carried = split_carried(project, snapshot_names(project))
+    baseline, carried_census = manifest(project, editable), census(project, carried)
+    if baseline != request["baseline"] or carried_census != request.get("carried", {}):
+        raise TaskError(
+            "project changed since the parent task was submitted; a continuation must "
+            "start from the parent's retained original baseline, so drift (including "
+            "any new file) is refused. Restore the submitted state and retry"
+        )
+    child_identity = task_id(identity or uuid.uuid4().hex)
+    brief = continuation_brief(request["brief"], supplement)
+    child_request = {
+        "schema_version": SCHEMA,
+        "id": child_identity,
+        "brief": brief,
+        "selector": request["selector"],
+        "requester_host": socket.gethostname(),
+        "requester_user": getpass.getuser(),
+        "timeout": timeout,
+        "check": list(request["check"]),
+        "baseline": baseline,
+        "carried": carried_census,
+        # The child is pinned to the build dispatching it, which may be newer
+        # than the build that produced the parent: the parent is validated
+        # against its own retained request above.
+        "execution_sha256": source_sha256(),
+        "offload_sha256": package_source_sha256(),
+        # Provenance by digest: a parent result can be large, so its published
+        # artifact is canonically hashed (JSON, sorted keys, compact separators)
+        # rather than duplicating the transcript in the child request.
+        "continuation": {
+            "parent_id": parent["id"],
+            "parent_job_id": parent["job_id"],
+            "parent_request_sha256": parent["request_sha256"],
+            "parent_result_sha256": canonical_digest(
+                {key: value for key, value in result.items() if key not in {"diff", "job_id"}}
+            ),
+            "seed_sha256": canonical_digest(seed),
+        },
+        "seed": seed,
+    }
+    # dispatch persists the complete child custody before any remote side
+    # effect, so an interrupted or ambiguous send recovers through
+    # `task resume CHILD` and can never cause duplicate jobs.
+    return dispatch(
+        child_identity,
+        project,
+        child_request,
+        host=parent["host"],
+        account=parent.get("account", "agent"),
+        title=task_title(brief),
+    )
+
+
 def unpublished_failure(record: dict, observed: dict, error: ResultUnavailable) -> str:
     try:
         log = run(["weft", "job", "log", record["job_id"], "-n", "20"], timeout=15).strip()
@@ -703,7 +872,7 @@ def unpublished_failure(record: dict, observed: dict, error: ResultUnavailable) 
 
 
 def summary(record: dict) -> dict:
-    return {
+    row = {
         key: record.get(key)
         for key in (
             "schema_version",
@@ -720,6 +889,11 @@ def summary(record: dict) -> dict:
             "processed_at",
         )
     }
+    request = record.get("request")
+    continuation = request.get("continuation") if isinstance(request, dict) else None
+    if isinstance(continuation, dict) and continuation.get("parent_id"):
+        row["parent_id"] = continuation["parent_id"]
+    return row
 
 
 def observe_job(record: dict) -> dict:
@@ -880,52 +1054,11 @@ def retrieve(record: dict, *, include_diff: bool = True) -> dict:
 
 
 def apply_changes(root: Path, changes: list[dict], backup: Path) -> None:
-    # Preflight every path before replacing any file. Existing bytes are kept
-    # in the task journal so application failures can be rolled back.
-    for change in changes:
-        path = safe_path(root, change["path"])
-        before = decode(change["before"]) if change["before"] is not None else None
-        actual = file_bytes(path) if path.exists() else None
-        if actual != before or (
-            before is not None and path.stat().st_mode & 0o777 != change["before_mode"]
-        ):
-            raise TaskError(f"local file changed since submission: {change['path']}")
+    # Every destination is checked before any write; the journal retains the
+    # prior bytes so a failed application can be rolled back.
+    preflight_changes(root, changes)
     save(backup, {"changes": changes})
-    replaced = []
-    created: list[Path] = []
-    try:
-        for change in changes:
-            path = safe_path(root, change["path"])
-            if change["after"] is None:
-                path.unlink()
-            else:
-                missing = [p for p in path.parents if p.is_relative_to(root) and not p.exists()]
-                for directory in reversed(missing):
-                    directory.mkdir()
-                    created.append(directory)
-                with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-                    temporary = Path(stream.name)
-                    try:
-                        stream.write(decode(change["after"]))
-                        stream.close()
-                        temporary.chmod(change["after_mode"])
-                        temporary.replace(path)
-                    except OSError:
-                        temporary.unlink(missing_ok=True)
-                        raise
-            replaced.append(change)
-    except (OSError, TaskError):
-        # TaskError covers a path that turned into a symlink after preflight.
-        for change in reversed(replaced):
-            path = safe_path(root, change["path"])
-            if change["before"] is None:
-                path.unlink()
-            else:
-                path.write_bytes(decode(change["before"]))
-                path.chmod(change["before_mode"])
-        for directory in reversed(created):
-            directory.rmdir()
-        raise
+    write_changes(root, changes)
 
 
 def selectors() -> dict:
@@ -982,6 +1115,13 @@ def handler(args: argparse.Namespace) -> int:
             with ThreadPoolExecutor(max_workers=4) as pool:
                 rows = list(pool.map(status, records))
             value = {"schema_version": LIST_SCHEMA, "tasks": rows}
+        elif args.action == "continue":
+            supplement = args.prompt
+            if supplement is None and args.brief is not None:
+                supplement = args.brief.read_text()
+            value = continue_task(
+                args.parent, timeout=args.timeout, supplement=supplement, identity=args.id
+            )
         else:
             with locked(args.id) as directory:
                 record = read_record(args.id)
@@ -997,7 +1137,10 @@ def handler(args: argparse.Namespace) -> int:
                         # its idempotency key; resending must repeat the same
                         # command, so the recorded build is kept. send provisions
                         # one only for a record that never had one.
-                        check_baseline_unchanged(record)
+                        # Continuations reconcile an accepted receipt in send
+                        # before checking drift that would prevent a new send.
+                        if "continuation" not in record["request"]:
+                            check_baseline_unchanged(record)
                         value = send(record, directory)
                 elif args.action == "cancel":
                     if not record.get("job_id"):
@@ -1080,6 +1223,18 @@ def build_task_parser(subparsers) -> None:
     submit_parser.add_argument("--check", help="validation argv, shell-quoted; no shell expansion")
     submit_parser.add_argument("--id", help="caller-generated idempotency identity")
     submit_parser.set_defaults(handler=handler)
+    continue_parser = actions.add_parser(
+        "continue", help="continue a failed task from its retained partial edits"
+    )
+    continue_parser.add_argument("parent", help="the failed parent task identity")
+    supplement = continue_parser.add_mutually_exclusive_group()
+    supplement.add_argument("--brief", type=Path)
+    supplement.add_argument("--prompt")
+    continue_parser.add_argument("--timeout", type=float, required=True)
+    continue_parser.add_argument(
+        "--id", help="caller-generated idempotency identity for the child task"
+    )
+    continue_parser.set_defaults(handler=handler)
     selectors_parser = actions.add_parser(
         "selectors", help="list admitted writers; submit probes target-host readiness"
     )

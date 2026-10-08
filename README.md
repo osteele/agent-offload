@@ -48,6 +48,41 @@ Submit passes `--no-sync`, so `weft run` returns once the job is recorded and We
 
 Tasks execute agent-execution inside their pinned offload build. The separately installed `agent-execution-worker` may belong to a different agent-review release; changing that release does not change a task's execution code. Provisioning, worker execution, and result retrieval each enforce the task's exact package digests. Automatic provisioning leaves the host's live tool and PATH unchanged.
 
+### Continue partial work
+
+A published `failed` or `validation_failed` result with a validated edit snapshot can seed a fresh task:
+
+```sh
+agent-offload task continue PARENT --timeout 3600 --prompt "Finish the remaining work"
+```
+
+The command prints the child identity. `--timeout` is required and accepts 1–7200 seconds.
+Use `--brief FILE` instead of `--prompt TEXT`, or omit both to retain the parent's
+requirements. `--id CHILD` selects a new identity without overwriting an existing task.
+The child inherits the parent's writer, check, host, and account.
+
+Continuation validates the retained parent result and applies its partial patch only
+inside the disposable worker snapshot. The local project's full editable manifest
+and carried-file census must still match the original baseline, including the path
+set. Local changes refuse continuation; there is no automatic merge.
+
+The parent remains unchanged, including its acknowledgment state. A failed parent
+already acknowledged with `task cancel` is eligible. The child records the parent
+task, job, request digest, and canonical result digest without copying the transcript.
+It starts a fresh harness on the current tool build, so a parent produced before an
+upgrade can be continued. It does not resume the parent's model conversation.
+
+Recover an interrupted child submission with `agent-offload task resume CHILD`.
+The immutable child request retains its seed and provenance through retries.
+Receipt recovery can bind an already accepted child despite local changes; a new
+submission still requires the original baseline.
+The returned patch spans the original baseline to the combined final state.
+Requested checks run on that final state, and only a successful result can be
+applied through the ordinary conflict checks and rollback journal. A failed harness
+result with validated cumulative edits can itself be continued. Setup or census
+failures that publish no validated edit snapshot are refused; continue an earlier
+ancestor with retained edits, or submit a fresh task.
+
 ## Historical report jobs
 
 The historical lane validates and retrieves results from report-only

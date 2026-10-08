@@ -24,10 +24,12 @@ from .task_protocol import (
     file_bytes,
     manifest,
     object_json,
+    preflight_changes,
     result_path,
     safe_path,
     validate_changes,
     walk_files,
+    write_changes,
 )
 
 
@@ -51,9 +53,19 @@ def execute(request: dict, root: Path) -> dict:
     # manifest, so changes to unexpected files cannot masquerade as additions.
     # Carried files are read-only: the protocol moves whole file contents, and
     # these exceed the per-file limit, so they are censused rather than read.
-    before = {
+    # A continuation diffs against this original incoming state, so its
+    # returned changes always span the baseline to the final combined state.
+    origin = {
         name: file_bytes(safe_path(root, name)) for name in walk_files(root) if name not in carried
     }
+    seed = request.get("seed", [])
+    if "seed" in request:
+        # A continuation applies its parent's retained partial edits to this
+        # disposable snapshot only, and only after they validate against the
+        # original baseline. Nothing here can reach the requesting project.
+        validate_changes(request, seed)
+        preflight_changes(root, seed)
+        write_changes(root, seed)
     # The submit-time remote observation is advisory by launch time. Immediately
     # before generation, re-observe the exact subject on this pinned executor
     # and re-apply the task policy, so credentials, capability, transport, or an
@@ -110,15 +122,15 @@ def execute(request: dict, root: Path) -> dict:
         raise TaskError(f"worker changed a file over the task file limit: {', '.join(altered)}")
     after_names = set(walk_files(root)) - set(carried)
     changes = []
-    for name in sorted(set(before) | after_names):
+    for name in sorted(set(origin) | after_names):
         path = safe_path(root, name)
-        old = before.get(name)
+        old = origin.get(name)
         new = file_bytes(path) if name in after_names else None
         old_mode = baseline.get(name, {}).get("mode")
         new_mode = path.stat().st_mode & 0o777 if new is not None else None
         if old == new and (name not in baseline or old_mode == new_mode):
             continue
-        if name in before and name not in baseline:
+        if name in origin and name not in baseline:
             raise TaskError(f"worker changed a file outside the submitted edit manifest: {name}")
         changes.append(
             {

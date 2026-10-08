@@ -10,6 +10,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 from pathlib import Path, PurePosixPath
 
 SCHEMA = "agent-offload.task/v1"
@@ -41,6 +42,15 @@ class TaskError(ValueError):
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def canonical_digest(value: object) -> str:
+    """SHA-256 of a JSON value's canonical form: sorted keys, compact separators.
+
+    Large evidence is retained by this digest instead of duplicating its
+    bytes; a field carrying one names exactly what is hashed.
+    """
+    return digest(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
 
 
 def task_id(value: str) -> str:
@@ -202,6 +212,57 @@ def validate_changes(request: dict, changes: object) -> list[dict]:
         if total > MAX_TOTAL:
             raise TaskError("change bundle exceeds size limit")
     return changes
+
+
+def preflight_changes(root: Path, changes: list[dict]) -> None:
+    """Refuse unless every destination currently holds the change's before-state."""
+    for change in changes:
+        path = safe_path(root, change["path"])
+        before = decode(change["before"]) if change["before"] is not None else None
+        actual = file_bytes(path) if path.exists() else None
+        if actual != before or (
+            before is not None and path.stat().st_mode & 0o777 != change["before_mode"]
+        ):
+            raise TaskError(f"local file changed since submission: {change['path']}")
+
+
+def write_changes(root: Path, changes: list[dict]) -> None:
+    """Apply preflighted changes to root, rolling back in reverse on any failure."""
+    replaced = []
+    created: list[Path] = []
+    try:
+        for change in changes:
+            path = safe_path(root, change["path"])
+            if change["after"] is None:
+                path.unlink()
+            else:
+                missing = [p for p in path.parents if p.is_relative_to(root) and not p.exists()]
+                for directory in reversed(missing):
+                    directory.mkdir()
+                    created.append(directory)
+                with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+                    temporary = Path(stream.name)
+                    try:
+                        stream.write(decode(change["after"]))
+                        stream.close()
+                        temporary.chmod(change["after_mode"])
+                        temporary.replace(path)
+                    except OSError:
+                        temporary.unlink(missing_ok=True)
+                        raise
+            replaced.append(change)
+    except (OSError, TaskError):
+        # TaskError covers a path that turned into a symlink after preflight.
+        for change in reversed(replaced):
+            path = safe_path(root, change["path"])
+            if change["before"] is None:
+                path.unlink()
+            else:
+                path.write_bytes(decode(change["before"]))
+                path.chmod(change["before_mode"])
+        for directory in reversed(created):
+            directory.rmdir()
+        raise
 
 
 def render_diff(changes: list[dict]) -> str:

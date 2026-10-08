@@ -5,6 +5,7 @@
 --         relay, and the historical report lane.
 -- Includes:
 --   Task identity, idempotency, submission, resume, cancellation
+--   Continuation of a failed task from its retained partial edits
 --   Execution-owned status observations with Offload task-admission policy
 --   Task worker execution constraints, requested checks, result publication
 --   Result retrieval validation, change application, application journal
@@ -141,6 +142,10 @@ entity Task {
     account: String
     baseline: BaselineManifest
     request_digest: String
+    parent_task: Task?
+    seed_changes: List<Change>?
+        -- A continuation retains a validated partial proposal from its parent.
+        -- It also binds the parent job, request, and canonical result digest.
     worker_source_digest: String
     worker_build_id: String?
     worker_bin_dir: String?
@@ -407,7 +412,10 @@ rule ResumeTask {
     requires: task.status not in {applied, cancelled}
     requires: task.job = null or task.job?.status in {failed, dead, killed}
     requires: task.job = null or not task.job?.status in {canceled, cancelled}
-    requires: baseline_unchanged(task)
+    requires: baseline_unchanged(task) or continuation_receipt_recoverable(task)
+        -- For an unresolved continuation, lookup precedes the baseline check.
+        -- A valid accepted receipt binds its existing job despite local drift;
+        -- absence or lookup failure never permits sending changed source.
     requires: task.job = null or submitter_unchanged(task)
     requires: task.job = null or provisioned_build_matches(task)
     requires: task.job = null or weft_accepts_processed(task.job)
@@ -416,7 +424,11 @@ rule ResumeTask {
 
     ensures:
         if task.job = null:
-            if task.worker_build_id = null:
+            if continuation_receipt_recoverable(task):
+                task.job = accepted_job(task)
+                task.status = queued
+                task.error = null
+            else if task.worker_build_id = null:
                 WorkerProvisioningRequested(task)
             else:
                 SubmissionSent(task)
@@ -449,6 +461,64 @@ rule ResumeTask {
         -- repeat the same command. Only a record that never had a build is
         -- provisioned. A resubmission provisions afresh, which repairs a
         -- build that changed or was collected while the failed job queued.
+}
+
+rule ContinueTask {
+    when: ContinueTask(caller, parent, timeout, supplement?, requested_id?)
+
+    requires: parent.result != null and parent.result.status in {failed, validation_failed}
+        -- A validated published result is the only continuation seed. A
+        -- succeeded parent is applied instead; a cancelled, running, or
+        -- result-less parent, and a result that fails validation against the
+        -- parent's retained dispatch, are refused.
+    requires: parent.result.worker != null
+        -- Setup or census failures without a validated edit snapshot cannot
+        -- seed a continuation; their empty changes do not erase inherited edits.
+        -- Continue an earlier ancestor with retained edits, or submit a fresh task.
+    requires: parent.status != applied
+        -- Continuing an applied task could duplicate edits already in the
+        -- project.
+    requires: baseline_unchanged(parent, including additions)
+        -- The whole editable manifest and carried census of the live project
+        -- must equal the parent's retained original baseline; drift, or a new
+        -- local file that could collide with a seeded addition, refuses
+        -- before anything is submitted. Nothing is written locally.
+    requires: timeout >= 1.second and timeout <= config.max_task_timeout
+    requires: requested_id = null or not Tasks.any(t => t.id = requested_id)
+    ensures:
+        let child = Task.created(
+            id: requested_id ?? generated_task_id(),
+            project: parent.project,
+            brief: continuation_brief(parent.brief, supplement),
+                -- Preserves the original requirements and marks the seeded
+                -- edits incomplete and untrusted.
+            selector: parent.selector,
+            check: parent.check,
+            timeout: timeout,
+            account: parent.account,
+            baseline: parent.baseline,
+            parent_task: parent,
+            seed_changes: parent.result.changes,
+            worker_source_digest: bundled_worker_digest(),
+                -- The child is pinned to the build dispatching it, which may
+                -- be newer than the build that produced the parent.
+            attempt: 1,
+            job: null,
+            prior_job_ids: [],
+            submission_started: false,
+            status: submitting
+        )
+    ensures: parent = parent_before
+        -- The parent is evidence: continue reads it and never acknowledges,
+        -- cancels, or mutates it, whether or not cancel already closed it.
+    ensures: WorkerProvisioningRequested(child)
+    @guidance
+        -- The child request retains the parent task, job, and request
+        -- identities and a canonical digest of the parent's published result
+        -- artifact (never a duplicated transcript), plus the validated seed.
+        -- The child request is durable before any remote side effect, so an
+        -- interrupted or ambiguous send recovers with `task resume CHILD`
+        -- under one idempotency key and cannot cause duplicate jobs.
 }
 
 rule CancelBeforeDispatch {
@@ -613,6 +683,12 @@ rule WorkerProposesChanges {
         -- The writer edits the snapshot under a workspace-write policy that
         -- admits no shell; its coding behavior is a black box specified only
         -- by this evidence contract.
+        -- For a continuation, validate seed_changes against the original
+        -- baseline and preflight every destination before materializing them
+        -- in the disposable snapshot. The fresh writer starts from that state.
+        -- Compute the proposal against the original baseline, including seed
+        -- edits retained, reverted, or changed by the writer. A harness failure
+        -- retains this cumulative proposal as a failed, unappliable result.
 }
 
 rule WorkerPublishesSuccess {
@@ -1049,6 +1125,7 @@ surface TaskControl {
         SubmitTask(caller, project, brief, selector, check, timeout, account?, requested_id?)
         ObserveTask(caller, task)
         ResumeTask(caller, task)
+        ContinueTask(caller, parent, timeout, supplement?, requested_id?)
         CancelTask(caller, task)
         RetrieveTaskResult(caller, task)
         ApplyTaskResult(caller, task)

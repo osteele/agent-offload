@@ -38,6 +38,36 @@ Checks must preserve ordinary source files and their permissions. Edits, additio
 
 The snapshot carries only the project directory. A `--check` run is refused when the project's `Package.swift` or `[tool.uv.sources]` path dependencies resolve outside it; without `--check` nothing builds remotely and such projects are accepted — run check-dependent projects in the workspace lane (`agent-host-sync workspace run --dependency <path> ...`). The task runs agent-execution bundled inside its pinned offload build, independently of the `agent-execution-worker` on PATH. Both package digests must match the retained request at provisioning, execution, and retrieval.
 
+## Continue interrupted work
+
+A task that publishes a validated partial patch can seed a fresh attempt. Continue it explicitly:
+
+```sh
+agent-offload task continue TASK_ID --timeout 3600
+```
+
+The command prints a fresh child identity and seeds only its disposable snapshot
+with the parent's validated partial patch. It preserves the parent, including a
+terminal result already acknowledged with `task cancel`. The local project's
+editable manifest and carried census must match the original baseline, with no
+added paths. Resolve local drift deliberately; continuation does not merge it.
+
+The child inherits the parent's writer, check, host, account, and original brief.
+Optional `--brief FILE` or `--prompt TEXT` adds continuation instructions.
+The required `--timeout` accepts 1–7200 seconds. It starts a fresh harness pinned
+to the current tool build, including when the parent predates an upgrade.
+Partial edits are untrusted input, not proof of successful execution.
+
+Use `--id CHILD` to choose the child identity. Recover interrupted submission
+with `task resume CHILD`, preserving its immutable seed and parent provenance.
+An accepted child's receipt can be recovered despite local drift; sending a new
+job still requires the original baseline.
+The child's diff spans the original baseline to the combined final state.
+Requested validation and ordinary apply conflict checks still govern acceptance.
+A failed harness result with validated cumulative edits can be continued again.
+Setup or census failures without a validated edit snapshot are refused; continue
+an earlier ancestor with retained edits, or submit a fresh task.
+
 ## Retrieve and verify
 
 ```sh
