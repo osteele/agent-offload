@@ -104,6 +104,21 @@ To check that a writer is reachable and admitted before submitting:
 agent-offload doctor --host HOST --selector openai-codex/gpt-6-luna --json
 ```
 
+A first task, once the host runs Weft jobs ([docs/weft.md](docs/weft.md)):
+
+```sh
+agent-offload doctor --host HOST     # prints "admit: ..." and exits 0
+agent-offload task submit . --host HOST --prompt "Add a docstring to main()"
+agent-offload task status TASK_ID    # repeat until "status" is "completed"
+agent-offload task diff TASK_ID
+```
+
+`submit` prints the task ID. While the job runs, `status` is Weft's job status,
+starting at `queued`; Weft starts the job about a minute after submission. The
+task ends `completed` when its edits are ready to apply, `validation_failed`
+when the check failed or changed files, or `failed`; `task retrieve` shows the
+agent's report either way.
+
 ## Relay
 
 ```sh
@@ -129,7 +144,10 @@ live project. The relay differs from a task in these ways:
 - **It fails closed.** The relay stops unless exactly its three tools are
   registered, and it never falls back to remote tools.
 
-Results are written to `outputs/relay-result-*.json`.
+The relay prints the agent's final response under `=== ATTACHED RELAY RESULT
+===` and exits 0; a failed run prints `failure: REASON` and exits 4. Either
+way the full record, including every file the tools served, is written to
+`outputs/relay-result-*.json`, and `--json` prints it.
 
 ## Retired report jobs
 
@@ -146,6 +164,9 @@ validate existing ones.
 - writer admission
 - result records
 - operations
+
+[docs/weft.md](docs/weft.md) covers what tasks need from Weft and how to check
+a host.
 
 ## License
 
