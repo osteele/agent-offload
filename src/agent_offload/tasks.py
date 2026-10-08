@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from fnmatch import fnmatchcase
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from agent_execution.identity import source_sha256
 from agent_execution.omp_execution import OMP_WRITER_SELECTORS, validate_omp_transcript
@@ -49,6 +50,9 @@ from .task_protocol import (
     write_changes,
 )
 
+if TYPE_CHECKING:
+    from .cli import WeftReceipt
+
 DEFAULT_SELECTOR = "openai-codex/gpt-6-luna"
 # Allow the updater's 45-minute source-lock wait plus time for a cold build.
 ENSURE_TIMEOUT = 3600
@@ -58,6 +62,8 @@ WORKSPACE_LANE = "agent-host-sync workspace run --dependency <path> ... <command
 # --no-sync, so the budget covers source pinning and recording, not the host
 # push; `send` resolves a timeout through `weft job lookup` rather than failing.
 SUBMIT_TIMEOUT = 180
+FENCE_TIMEOUT = 60
+WEFT_FENCE_SCHEMA = "weft.job.fence.v1"
 # Weft statuses of a job that ended without completing. A job that ends this
 # way and publishes no result is resumable; a canceled job is not, because the
 # consumer asked for it to stop.
@@ -655,6 +661,91 @@ def idempotency_key(record: dict) -> str:
     return record["id"] if attempt == 1 else f"{record['id']}-{attempt}"
 
 
+def fence_submission(record: dict) -> WeftReceipt | None:
+    """Return the accepted receipt or final no-job verdict for this attempt key."""
+    from .cli import WeftReceipt
+
+    key = idempotency_key(record)
+    raw = run(
+        ["weft", "job", "fence", "--idempotency-key", key, "--json"],
+        cwd=Path(record["project"]),
+        timeout=FENCE_TIMEOUT,
+    )
+    try:
+        answer = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise TaskError("weft job fence returned invalid JSON") from error
+    if (
+        not isinstance(answer, dict)
+        or answer.get("api_version") != WEFT_FENCE_SCHEMA
+        or answer.get("idempotency_key") != key
+        or not isinstance(answer.get("fenced"), bool)
+    ):
+        raise TaskError(f"weft job fence did not return a {WEFT_FENCE_SCHEMA} answer for {key}")
+
+    receipt = answer.get("receipt")
+    if answer["fenced"]:
+        # The producer contract includes the receipt only when fenced is
+        # false; an explicit null contradicts the verdict like a receipt does.
+        if "receipt" in answer:
+            raise TaskError("weft job fence answered no job but also returned a receipt")
+        return None
+    if not isinstance(receipt, dict):
+        raise TaskError("weft job fence found the key's job but returned no receipt")
+    try:
+        bound = WeftReceipt.parse(json.dumps(receipt), idempotency_key=key)
+    except (TypeError, ValueError) as error:
+        raise TaskError(f"weft job fence returned an invalid receipt: {error}") from error
+    if not bound.job_id:
+        raise TaskError("weft job fence returned no accepted job identity to retain")
+    return bound
+
+
+def close_cancelled(record: dict, directory: Path) -> None:
+    """Durably close a jobless attempt without rewriting its custody history."""
+    record.update(status="cancelled", processed_at=record.get("processed_at") or time.time())
+    record.pop("error", None)
+    save(directory / "task.json", record)
+
+
+def cancel_job(record: dict, directory: Path) -> None:
+    """Cancel a live job and acknowledge it only after terminal observation."""
+    observed = observe_job(record)
+    if observed["status"] not in TERMINAL_JOB_STATUSES:
+        run(["weft", "cancel", record["job_id"]])
+    acknowledge(record, directory)
+
+
+def cancel_without_job(record: dict, directory: Path) -> None:
+    """Close proven-never-sent attempts locally; fence all ambiguous attempts."""
+    if record.get("status") == "cancelled" and record.get("processed_at"):
+        return
+    if record.get("submission_started") is False and record.get("status") != "submission_unknown":
+        close_cancelled(record, directory)
+        return
+    try:
+        receipt = fence_submission(record)
+    except TaskError as error:
+        raise TaskError(
+            f"submission of task {record['id']} keeps its custody: {error}. Nothing was "
+            f"discarded; retry `agent-offload task cancel {record['id']}` once Weft answers, "
+            f"or run `agent-offload task resume {record['id']}` to recover an accepted job"
+        ) from error
+    if receipt is None:
+        close_cancelled(record, directory)
+        return
+    # Bind the recovered identity durably before contacting cancellation or acknowledgment.
+    record.update(
+        job_id=receipt.job_id,
+        host=receipt.selected_host,
+        source_pin=receipt.source_pin,
+        status="queued",
+    )
+    record.pop("error", None)
+    save(directory / "task.json", record)
+    cancel_job(record, directory)
+
+
 def check_baseline_unchanged(record: dict) -> None:
     # A new source snapshot must not silently replace the retained baseline,
     # nor the carried files the writer reads and the check builds against. A
@@ -1143,26 +1234,10 @@ def handler(args: argparse.Namespace) -> int:
                             check_baseline_unchanged(record)
                         value = send(record, directory)
                 elif args.action == "cancel":
-                    if not record.get("job_id"):
-                        if (
-                            record.get("submission_started") is not False
-                            or record.get("status") == "submission_unknown"
-                        ):
-                            raise TaskError("resolve submission before cancellation")
-                        # send persists its marker before entering Weft. A
-                        # readiness refusal has never crossed that boundary.
-                        record.update(
-                            status="cancelled",
-                            processed_at=record.get("processed_at") or time.time(),
-                        )
-                        record.pop("error", None)
-                        save(directory / "task.json", record)
+                    if record.get("job_id"):
+                        cancel_job(record, directory)
                     else:
-                        observed = observe_job(record)
-                        if observed["status"] not in TERMINAL_JOB_STATUSES:
-                            run(["weft", "cancel", record["job_id"]])
-                        # Acknowledge only after terminal cancellation is observed.
-                        acknowledge(record, directory)
+                        cancel_without_job(record, directory)
                     value = status(record)
                 else:
                     if args.action != "apply":

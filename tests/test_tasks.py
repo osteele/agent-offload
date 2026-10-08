@@ -11,6 +11,7 @@ from conftest import PINNED_BIN, PINNED_BUILD, REAL_ENSURE_WORKER
 from agent_offload import tasks
 from agent_offload.task_protocol import (
     TaskError,
+    digest,
     encode,
     manifest,
     render_diff,
@@ -371,7 +372,18 @@ def receipt(key: str, decision: str) -> dict:
     }
 
 
-def fake_weft_submission(tmp_path, monkeypatch, *, runs: list[str], lookup: str) -> Path:
+CANCELLED_JOB = '{"id": "%s", "status": "cancelled"}'
+
+
+def fence_answer(fenced, key="slow", **extra) -> str:
+    """A contract-shaped fence answer; `extra` adds contract violations."""
+    answer = {"api_version": "weft.job.fence.v1", "idempotency_key": key, "fenced": fenced}
+    return json.dumps(answer | extra)
+
+
+def fake_weft_submission(
+    tmp_path, monkeypatch, *, runs: list[str], lookup: str, fence: str = "answer"
+) -> Path:
     """Fake weft whose successive `weft run` calls follow `runs`, logging every call.
 
     Each run is "hang" (outlive the submit budget), "queued" (print a receipt
@@ -380,7 +392,11 @@ def fake_weft_submission(tmp_path, monkeypatch, *, runs: list[str], lookup: str)
     the submitting process with SIGINT while the command is still running, so
     nothing after it persists). `lookup` is "found",
     "absent", "other-key" (an answer about a different key), or "fail" for
-    `weft job lookup`.
+    `weft job lookup`. `fence` is "answer" (serve fence.json, refusing when it
+    is absent), "unavailable", or "hang" for `weft job fence`, which records
+    its working directory. job.json answers `job inspect`, and `weft cancel`
+    rewrites it to the cancelled state; a refuse-cancel or refuse-mark file
+    fails that command.
     """
     monkeypatch.setattr(tasks, "SUBMIT_TIMEOUT", 1)
     calls = tmp_path / "weft-calls"
@@ -403,6 +419,18 @@ def fake_weft_submission(tmp_path, monkeypatch, *, runs: list[str], lookup: str)
                 {"api_version": "weft.job.lookup.v1", "idempotency_key": "x", "found": False}
             )
         )
+    fence_file = tmp_path / "fence.json"
+    fence_cwd = tmp_path / "fence-cwd"
+    job_state = tmp_path / "job.json"
+    fence_steps = {
+        "answer": (
+            f'if [ -f "{fence_file}" ]; then /bin/cat "{fence_file}"; '
+            'else echo "fence unavailable" >&2; exit 1; fi'
+        ),
+        "unavailable": 'echo "fence unavailable" >&2; exit 1',
+        "hang": "exec /bin/sleep 5",
+    }
+    fence_step = fence_steps[fence]
     lookup_step = (
         "echo 'ledger unreadable' >&2; exit 1" if lookup == "fail" else f'/bin/cat "{answer}"'
     )
@@ -422,6 +450,10 @@ def fake_weft_submission(tmp_path, monkeypatch, *, runs: list[str], lookup: str)
         excludes=[".git"],
         run=(
             f'echo "$*" >> "{calls}"\n'
+            f'if [ "$1 $2 $3" = "job fence --idempotency-key" ]; then pwd > "{fence_cwd}"; {fence_step}; exit 0; fi\n'
+            f'if [ "$1 $2" = "job inspect" ]; then /bin/cat "{job_state}"; exit 0; fi\n'
+            f'if [ "$1" = "cancel" ]; then if [ -f "{tmp_path}/refuse-cancel" ]; then /bin/cp "{tmp_path}/state/tasks/slow/task.json" "{tmp_path}/record-at-cancel.json"; echo "weft: the daemon cannot be reached" >&2; exit 1; fi; printf {shlex.quote(CANCELLED_JOB)} "$2" > "{job_state}"; exit 0; fi\n'
+            f'if [ "$1 $2" = "job mark-processed" ]; then if [ -f "{tmp_path}/refuse-mark" ]; then /bin/cp "{tmp_path}/state/tasks/slow/task.json" "{tmp_path}/record-at-mark.json"; echo "weft: the ledger refuses the processed transition" >&2; exit 1; fi; exit 0; fi\n'
             f'if [ "$1 $2" = "job lookup" ]; then {lookup_step}; exit 0; fi\n'
             f'case "$(/usr/bin/grep -c "^run " "{calls}")" in\n{run_steps}esac'
         ),
@@ -1500,7 +1532,7 @@ def test_unresolved_submission_keeps_custody_after_lookup_or_admission_refusal(
     assert current["submission_started"] is True
     assert current["request"] == original["request"]
     assert current["job_id"] is None
-    assert weft_calls(calls) == ["run -C", "job lookup"]
+    assert weft_calls(calls) == ["run -C", "job lookup", "job fence"]
 
     if lookup == "absent":
         # A point-in-time absence cannot rule out acceptance of an in-flight request.
@@ -1521,7 +1553,7 @@ def test_unresolved_submission_keeps_custody_after_lookup_or_admission_refusal(
         recovered_record = read_record("slow")
         assert (recovered_record["status"], recovered_record["job_id"]) == ("queued", "wj77")
         assert recovered_record["request"] == original["request"]
-        assert weft_calls(calls) == ["run -C", "job lookup", "job lookup"]
+        assert weft_calls(calls) == ["run -C", "job lookup", "job fence", "job lookup"]
 
 
 @pytest.mark.parametrize(
@@ -1548,4 +1580,264 @@ def test_cancel_cannot_discard_an_ambiguous_submission(
         cli.main(["task", "cancel", "slow"])
     assert outcome.value.code == 1
     assert read_record("slow") == record
-    assert weft_calls(calls) == ["run -C"]
+    assert weft_calls(calls) == ["run -C", "job fence"]
+
+
+@pytest.mark.parametrize("custody", ["attempted", "unmarked"])
+def test_fence_final_no_job_closes_attempt_without_erasing_custody(tmp_path, monkeypatch, custody):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["unresolved"], lookup="fail")
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+    record = read_record("slow")
+    assert record["submission_started"] is True
+    if custody == "unmarked":
+        # A lost marker is ambiguous; closure must not manufacture False custody.
+        record.pop("submission_started")
+        with locked("slow") as directory:
+            tasks.save(directory / "task.json", record)
+    (tmp_path / "fence.json").write_text(fence_answer(True))
+
+    with pytest.raises(SystemExit) as result:
+        cli.main(["task", "cancel", "slow"])
+    assert result.value.code == 0
+
+    cancelled = read_record("slow")
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["processed_at"]
+    assert cancelled["request"] == record["request"]
+    assert cancelled["request_sha256"] == record["request_sha256"]
+    payload = tmp_path / "state" / "tasks" / "slow" / "request.json"
+    assert digest(payload.read_bytes()) == cancelled["request_sha256"]
+    if custody == "unmarked":
+        assert "submission_started" not in cancelled
+    else:
+        assert cancelled["submission_started"] is True
+    assert weft_calls(calls) == ["run -C", "job fence"]
+
+    # Repeated cancellation is idempotent and never contacts Weft again.
+    with pytest.raises(SystemExit) as repeated:
+        cli.main(["task", "cancel", "slow"])
+    assert repeated.value.code == 0
+    assert read_record("slow") == cancelled
+    assert weft_calls(calls) == ["run -C", "job fence"]
+
+    # The identity stays closed: resume cannot queue another Weft job.
+    with pytest.raises(SystemExit) as resurrected:
+        cli.main(["task", "resume", "slow"])
+    assert resurrected.value.code == 1
+    assert read_record("slow") == cancelled
+    assert weft_calls(calls) == ["run -C", "job fence"]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "not JSON",
+        '{"api_version": "wrong", "idempotency_key": "slow", "fenced": true}',
+        fence_answer(True, key="other"),
+        fence_answer(1),
+        fence_answer(False),
+        fence_answer(True, receipt=None),
+        fence_answer(True, receipt=receipt("slow", "queued")),
+        fence_answer(False, receipt={"api_version": "weft.run.receipt.v1"}),
+        fence_answer(False, receipt=receipt("other", "queued")),
+        fence_answer(False, receipt=receipt("slow", "not_accepted")),
+    ],
+    ids=[
+        "malformed",
+        "wrong-version",
+        "other-key",
+        "nonboolean-fenced",
+        "receipt-without-job",
+        "null-receipt-contradiction",
+        "receipt-contradiction",
+        "invalid-receipt",
+        "mismatched-receipt",
+        "unaccepted-receipt",
+    ],
+)
+def test_cancel_keeps_custody_when_the_fence_answer_is_not_final(tmp_path, monkeypatch, answer):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["unresolved"], lookup="fail")
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+    retained = read_record("slow")
+    (tmp_path / "fence.json").write_text(answer)
+
+    with pytest.raises(SystemExit) as outcome:
+        cli.main(["task", "cancel", "slow"])
+    assert outcome.value.code == 1
+
+    # The whole retained record, request bytes included, is untouched.
+    assert read_record("slow") == retained
+    assert weft_calls(calls) == ["run -C", "job fence"]
+
+
+@pytest.mark.parametrize("fence", ["unavailable", "hang"])
+def test_cancel_keeps_custody_when_weft_fails_or_outlives_the_fence_budget(
+    tmp_path, monkeypatch, capsys, fence
+):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(tasks, "FENCE_TIMEOUT", 1)
+    calls = fake_weft_submission(
+        tmp_path, monkeypatch, runs=["unresolved"], lookup="fail", fence=fence
+    )
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+    retained = read_record("slow")
+
+    with pytest.raises(SystemExit) as outcome:
+        cli.main(["task", "cancel", "slow"])
+    assert outcome.value.code == 1
+
+    # The failure stays visible and names both ways forward.
+    diagnostic = capsys.readouterr().err
+    assert "agent-offload task cancel slow" in diagnostic
+    assert "agent-offload task resume slow" in diagnostic
+    assert read_record("slow") == retained
+    assert weft_calls(calls) == ["run -C", "job fence"]
+
+
+def test_fence_addresses_the_current_attempt_key_in_the_project_cwd(tmp_path, monkeypatch):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["unresolved"], lookup="fail")
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+    # Rotate the attempt the way a resubmission would; the fence must address
+    # that attempt's key, not the bare identity.
+    record = read_record("slow")
+    record["attempt"] = 2
+    with locked("slow") as directory:
+        tasks.save(directory / "task.json", record)
+    (tmp_path / "fence.json").write_text(fence_answer(True, key="slow-2"))
+
+    with pytest.raises(SystemExit) as outcome:
+        cli.main(["task", "cancel", "slow"])
+    assert outcome.value.code == 0
+
+    assert "job fence --idempotency-key slow-2 --json" in calls.read_text()
+    assert weft_calls(calls) == ["run -C", "job fence"]
+    project = Path(record["project"])
+    assert Path((tmp_path / "fence-cwd").read_text().strip()).resolve() == project.resolve()
+    assert read_record("slow")["status"] == "cancelled"
+
+
+@pytest.mark.parametrize("stage", ["cancel", "ack"])
+def test_a_fenced_receipt_stays_bound_when_cancellation_or_acknowledgment_fails(
+    tmp_path, monkeypatch, stage
+):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["unresolved"], lookup="fail")
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+    original = read_record("slow")
+    (tmp_path / "fence.json").write_text(fence_answer(False, receipt=receipt("slow", "queued")))
+    (tmp_path / "job.json").write_text(json.dumps({"id": "wj77", "status": "queued"}))
+    # The fake names both its refusal switch and its capture after the refused command.
+    refused = "cancel" if stage == "cancel" else "mark"
+    (tmp_path / f"refuse-{refused}").write_text("refuse\n")
+
+    with pytest.raises(SystemExit) as outcome:
+        cli.main(["task", "cancel", "slow"])
+    assert outcome.value.code == 1
+
+    # The recovered identity was already durable when the failing call ran.
+    recovered = ("wj77", "studio", "pin")
+    at_failure = json.loads((tmp_path / f"record-at-{refused}.json").read_text())
+    assert (at_failure["job_id"], at_failure["host"], at_failure["source_pin"]) == recovered
+    assert "processed_at" not in at_failure
+    assert at_failure["request"] == original["request"]
+    assert at_failure["request_sha256"] == original["request_sha256"]
+    retained = read_record("slow")
+    assert (retained["job_id"], retained["host"], retained["source_pin"]) == recovered
+    assert "processed_at" not in retained
+    if stage == "cancel":
+        assert weft_calls(calls) == ["run -C", "job fence", "job inspect", "cancel wj77"]
+    else:
+        assert json.loads((tmp_path / "job.json").read_text())["status"] == "cancelled"
+        assert weft_calls(calls) == [
+            "run -C",
+            "job fence",
+            "job inspect",
+            "cancel wj77",
+            "job inspect",
+            "job mark-processed",
+        ]
+
+    # Clearing the refusal retries only the owed disposition, without another fence.
+    (tmp_path / "refuse-cancel").unlink(missing_ok=True)
+    (tmp_path / "refuse-mark").unlink(missing_ok=True)
+    with pytest.raises(SystemExit) as retried:
+        cli.main(["task", "cancel", "slow"])
+    assert retried.value.code == 0
+    assert read_record("slow")["processed_at"]
+    assert weft_calls(calls).count("job fence") == 1
+
+
+@pytest.mark.parametrize("custody", ["attempted", "unmarked"])
+@pytest.mark.parametrize("job_status", ["queued", "canceled"])
+def test_cancel_binds_a_fenced_receipt_then_disposes_the_job(
+    tmp_path, monkeypatch, capsys, custody, job_status
+):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["unresolved"], lookup="fail")
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+    record = read_record("slow")
+    if custody == "unmarked":
+        record.pop("submission_started")
+        with locked("slow") as directory:
+            tasks.save(directory / "task.json", record)
+    (tmp_path / "fence.json").write_text(fence_answer(False, receipt=receipt("slow", "queued")))
+    (tmp_path / "job.json").write_text(json.dumps({"id": "wj77", "status": job_status}))
+
+    with pytest.raises(SystemExit) as outcome:
+        cli.main(["task", "cancel", "slow"])
+    assert outcome.value.code == 0
+
+    row = json.loads(capsys.readouterr().out)
+    assert (row["status"], row["job_id"]) == (
+        "cancelled" if job_status == "queued" else "canceled",
+        "wj77",
+    )
+    bound = read_record("slow")
+    assert (bound["job_id"], bound["host"], bound["source_pin"]) == ("wj77", "studio", "pin")
+    assert bound["status"] == "queued"
+    assert bound["processed_at"]
+    assert bound["request"] == record["request"]
+    assert bound["request_sha256"] == record["request_sha256"]
+    if custody == "unmarked":
+        assert "submission_started" not in bound
+    else:
+        assert bound["submission_started"] is True
+    # Read-only `job inspect` calls are incidental; only the side effects are pinned.
+    side_effects = ("job fence", "cancel wj77", "job mark-processed")
+    steps = weft_calls(calls)
+    assert steps[:2] == ["run -C", "job fence"]
+    disposed = [step for step in steps if step in side_effects]
+    if job_status == "queued":
+        # A live job is fenced once, then cancelled before its terminal acknowledgment.
+        assert disposed == ["job fence", "cancel wj77", "job mark-processed"]
+    else:
+        # A job Weft already ended is acknowledged without another cancellation.
+        assert disposed == ["job fence", "job mark-processed"]
+
+    # The disposition is owed once: a repeat neither re-fences, cancels, nor re-acknowledges.
+    with pytest.raises(SystemExit) as repeated:
+        cli.main(["task", "cancel", "slow"])
+    assert repeated.value.code == 0
+    assert read_record("slow") == bound
+    assert [step for step in weft_calls(calls) if step in side_effects] == disposed
