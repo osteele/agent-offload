@@ -359,7 +359,10 @@ rule ProvisionWorker {
     requires: provisioned_build_matches(task)
         -- Provisioning builds an immutable, content-addressed worker for
         -- the task's host and account without activating it: the host's
-        -- current build and PATH are untouched. The build is accepted only
+        -- current build and PATH are untouched. The configured provider
+        -- makes it: by default, by copying the installed agent-offload and
+        -- agent-execution packages over SSH; optionally, through
+        -- agent-host-sync from the checkouts it deploys. The build is accepted only
         -- when the identity its own worker reports carries an agent-offload
         -- source digest equal to the request's offload digest and an
         -- agent-execution source digest equal to the request's execution
@@ -380,7 +383,7 @@ rule RefuseMismatchedWorker {
         -- provisions again. The diagnostic names which side differs
         -- (agent-offload, agent-execution, or both) and the fix: the local
         -- installed agent-offload was built from different bytes than the
-        -- checkouts the host build is made from, so reinstall it locally or
+        -- sources the host build is made from, so reinstall it locally or
         -- commit or revert the checkout edits, then resubmit. A failed or
         -- malformed provisioning answer refuses the same way.
 }

@@ -79,6 +79,19 @@ def status_envelope(selectors, *, overrides=None):
 
 
 @pytest.fixture(autouse=True)
+def isolated_config(tmp_path, monkeypatch):
+    """Keep the developer's own config out of tests; tests that need one write it here."""
+    path = tmp_path / "agent-offload-config.toml"
+    monkeypatch.setenv("AGENT_OFFLOAD_CONFIG", str(path))
+    return path
+
+
+@pytest.fixture
+def agent_host_sync_provider(isolated_config):
+    isolated_config.write_text('[worker]\nprovider = "agent-host-sync"\n')
+
+
+@pytest.fixture(autouse=True)
 def pinned_worker(monkeypatch):
     """Isolate provisioning and remote credential checks from task tests."""
     if not POSIX:

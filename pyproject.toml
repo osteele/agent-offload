@@ -2,7 +2,7 @@
 name = "agent-offload"
 version = "0.1.0"
 description = "Durable remote coding tasks and attached agent relays"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 dependencies = []
 

@@ -6,11 +6,11 @@ The detailed contract behind the commands in the [README](../README.md).
 
 Submit returns a task identity and Weft job identity without waiting for the agent. Requests and accepted job bindings live under `~/.local/state/agent-offload/tasks` (override with `AGENT_OFFLOAD_STATE`). JSON responses use `agent-offload.task/v1`, `agent-offload.tasks/v1`, and `agent-offload.task-result/v1`. Consumers use this CLI rather than reading the registry. Agent Dispatch's **Remote coding** control uses the same API.
 
-Before queueing, provisioning may wait up to 45 minutes for another update to release the target account's sources. Agent-offload allows one hour for that wait and the worker build; the task's execution timeout applies separately.
+Before queueing, submission provisions the task's worker build (see [Worker builds](#worker-builds)). The `ssh` provider allows 15 minutes for that; the `agent-host-sync` provider allows one hour, because its updater may wait up to 45 minutes for another update to release the account's sources. The task's execution timeout applies separately.
 
 `task status` and `task list` expose Weft's observed lifecycle as `job_status`. For jobs that completed or ended `failed`, `dead`, or `killed`, `status` comes from the validated task result, including `failed` and `validation_failed`. If that result is unavailable or invalid, `status` is `unknown` with a diagnostic; job completion alone does not establish task success. A job that ended `failed`, `dead`, or `killed` without publishing a result, such as a worker that refused to start because its installed version does not match, has `status` `failed_without_result`; its diagnostic carries the exit code and the tail of the job log. A canceled job keeps Weft's `canceled` status, and resume does not resubmit it.
 
-Each task runs against a Weft source snapshot with `workspace-write-no-shell`. The retained baseline holds the files that snapshot carries: files matching the source exclusions Weft reports (`weft sync inspect --json`), such as `testdata/`, `bin/`, and `CLAUDE.md`, are left out of both. The snapshot carries only the project directory, so a `--check` run is refused when the project's `Package.swift` or `[tool.uv.sources]` path dependencies resolve outside it; without `--check` nothing builds remotely and such projects are accepted. Validate check-dependent projects in the workspace lane with `agent-host-sync workspace run --dependency <path> ...`. The worker refuses symlinks, so submit refuses a project containing a symlink that the snapshot carries: one whose target stays inside the project and that no source exclusion drops. Weft replaces a link pointing outside the project with its target's content, so such links are accepted unless that content holds a file over the 2 MiB task file limit. The agent can read and edit project files but cannot run shell commands. `--check` supplies an optional, caller-chosen validation command executed after the agent finishes; its arguments use shell quoting without shell expansion. A failing check prevents application. Without a check, the result's `validation` field is null. The default coding writer is `openai-codex/gpt-6-luna`. Interactive user-facing Codex sessions use `openai-codex/gpt-6-astra`. `--selector` overrides the writer with any identity registered by agent-execution; `agent-offload task selectors --json` lists them with the default, under schema `agent-offload.task-selectors/v1`. The default agent timeout is 1800 seconds; `--timeout` accepts 1–7200 seconds.
+Each task runs against a Weft source snapshot with `workspace-write-no-shell`. The retained baseline holds the files that snapshot carries: files matching the source exclusions Weft reports (`weft sync inspect --json`), such as `testdata/`, `bin/`, and `CLAUDE.md`, are left out of both. The snapshot carries only the project directory, so a `--check` run is refused when the project's `Package.swift` or `[tool.uv.sources]` path dependencies resolve outside it; without `--check` nothing builds remotely and such projects are accepted. Run the checks of such projects in a remote workspace that also holds their dependencies. The worker refuses symlinks, so submit refuses a project containing a symlink that the snapshot carries: one whose target stays inside the project and that no source exclusion drops. Weft replaces a link pointing outside the project with its target's content, so such links are accepted unless that content holds a file over the 2 MiB task file limit. The agent can read and edit project files but cannot run shell commands. `--check` supplies an optional, caller-chosen validation command executed after the agent finishes; its arguments use shell quoting without shell expansion. A failing check prevents application. Without a check, the result's `validation` field is null. The default coding writer is `openai-codex/gpt-6-luna`. Interactive user-facing Codex sessions use `openai-codex/gpt-6-astra`. `--selector` overrides the writer with any identity registered by agent-execution; `agent-offload task selectors --json` lists them with the default, under schema `agent-offload.task-selectors/v1`. The default agent timeout is 1800 seconds; `--timeout` accepts 1–7200 seconds.
 
 An empty project is valid: the task starts with an empty baseline and can create files. A census error still stops submission before queueing.
 
@@ -32,7 +32,16 @@ Successful application, confirmed cancellation or abandonment through `task canc
 
 Tasks in the same registry serialize applications to a canonical project path. A competing application is refused until the current application finishes; retrying then checks its baseline against the updated files.
 
-Before creating a Weft job, `task submit` runs `agent-host-sync ensure` for the selected host and account (default `agent`). This mirrors the local checkouts and provisions an immutable content-addressed worker build; the task record retains its absolute `bin_dir` and build ID, and Weft launches that build's worker by absolute path. The ensured worker's agent-offload and bundled agent-execution digests must match the dispatch exactly. If they do not, submission stops before a job exists: the local installed agent-offload may have been built from different bytes than the checkouts being deployed. Reinstall it with `just install` in the agent-offload checkout, or commit/revert checkout edits, then resubmit. This provisioning does not update PATH or a host's current build. Older task records without a pinned path are provisioned when resumed.
+### Worker builds
+
+Before creating a Weft job, `task submit` provisions an immutable worker build on the task host for the task's account, the account Weft runs jobs as there. The task record retains the build's absolute `bin_dir` and build ID, and Weft launches that build's worker by absolute path, so a queued job runs the build it was sent with. Provisioning does not change PATH or anything else on the host. Older task records without a pinned path are provisioned when resumed.
+
+`[worker] provider` in the configuration file selects how the build is made:
+
+- `ssh` (the default) streams the installed `agent_offload` and `agent_execution` packages over `ssh ACCOUNT@HOST` into `~/.local/share/agent-offload/builds/BUILD_ID`, where the build ID is a digest of the two packages' source digests. It writes small launchers that run the packages with the first Python 3.11 or later that `uv python find` or `python3` supplies, installs agent-execution's pinned OMP runtime with Bun, and publishes the build by renaming a complete staging directory. A build that already exists is reused, so only the first task after an install pays for the copy. Because the copied bytes are the installed ones, the build's digests equal the dispatch's.
+- `agent-host-sync` runs `agent-host-sync --host HOST --account ACCOUNT ensure --tool agent-offload --json`, which builds from the checkouts that tool deploys. That tool is not published.
+
+Either way, the build's own worker reports its agent-offload and bundled agent-execution digests, and they must match the dispatch exactly. If they do not, submission stops before a job exists. With the `agent-host-sync` provider this means the local installed agent-offload was built from different bytes than the checkouts being deployed: reinstall it with `just install` in the agent-offload checkout, or commit or revert the checkout edits, then resubmit.
 
 Submit passes `--no-sync`, so `weft run` returns once the job is recorded and Weft's daemon pushes it to the host on its next pass; a task can therefore wait about a minute before it starts. If `weft run` still exceeds its 180-second budget, submit asks `weft job lookup --idempotency-key` whether the job was recorded, binds it if so, and submits once more if not. A lookup that fails or answers for another key leaves the submission unresolved. If submission is interrupted or unresolved, use `agent-offload task resume TASK_ID`; it always resumes under the same idempotency identity, preventing a second job. A changed baseline still refuses resume. Resuming a `failed_without_result` task submits the retained request again as a new attempt with its own idempotency key; the task keeps its identity and lists the earlier jobs in `prior_job_ids`. Resume provisions the retained matching worker build before resending, repairing a build that changed or was collected while a job was queued. If the submitting machine's agent-offload or agent-execution has changed since submission, resume refuses a failed job's resubmission; submit a new task for the same brief. `--id` lets a caller choose the identity before starting the command. Submission failures retain that identity and never fall back to local execution. Cancellation operates on an accepted Weft job, closes a proven never-submitted task, or obtains an atomic key-fence result for an unresolved submission.
 
@@ -105,10 +114,10 @@ capability, authentication, and transport; a current explicit quota refusal
 blocks admission, while unknown quota is not a promise of capacity. It does not
 claim generation success. Probe failures leave `execution_status` null and
 include a visible policy reason. There is no universal `available` flag. For
-example, check one exact writer on Studio:
+example, check one exact writer:
 
 ```sh
-agent-offload doctor --host studio --selector openai-codex/gpt-6-luna --json
+agent-offload doctor --host HOST --selector openai-codex/gpt-6-luna --json
 ```
 
 Without options, doctor checks only the default task writer.
@@ -184,20 +193,13 @@ weft job inspect wj1234 --json
 weft job kill wj1234
 ```
 
-Install or refresh the Studio worker through the account updater:
+After a source change to agent-offload or agent-execution, reinstall the local command:
 
 ```sh
-cd ~/code/agent-tools/agent-host-sync
-uv run agent-host-sync --account agent plan --stage tools --tool agent-offload
-uv run agent-host-sync --account agent apply --stage tools --tool agent-offload
-```
-
-After a worker source change, reinstall the local command and redeploy:
-
-```sh
-cd ~/code/agent-tools/agent-offload
-uv tool install --force --reinstall ../agent-execution
+cd agent-offload
 just install
 ```
+
+With the `ssh` provider, the next task copies the new build to the host. With the `agent-host-sync` provider, also refresh the host through that tool, for example `agent-host-sync --account agent apply --stage tools --tool agent-offload`; its exit code 4 means the installation succeeded but existing sessions must restart.
 
 `just install` builds a new release under `~/.local/share/agent-offload/releases/` with agent-execution bundled, checks that it starts, and only then repoints `releases/current`, which the `~/.local/bin` entry points resolve through. agent-execution is not a declared dependency, so a plain `uv tool install .` produces an environment in which every command exits with a message naming the missing package.

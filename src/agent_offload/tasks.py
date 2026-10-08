@@ -25,6 +25,7 @@ from agent_execution.identity import source_sha256
 from agent_execution.omp_execution import OMP_WRITER_SELECTORS, validate_omp_transcript
 from agent_execution.worker import WORKER_PROTOCOL_VERSION, WorkerResult
 
+from .config import load_config, require_task_host, task_account
 from .protocol import package_source_sha256
 from .readiness import require_writer
 from .task_protocol import (
@@ -49,15 +50,12 @@ from .task_protocol import (
     validate_changes,
     write_changes,
 )
+from .worker_build import ensure_worker_build
 
 if TYPE_CHECKING:
     from .cli import WeftReceipt
 
 DEFAULT_SELECTOR = "openai-codex/gpt-6-luna"
-# Allow the updater's 45-minute source-lock wait plus time for a cold build.
-ENSURE_TIMEOUT = 3600
-ENSURE_SCHEMA = "agent-host-sync.ensure/v1"
-WORKSPACE_LANE = "agent-host-sync workspace run --dependency <path> ... <command>"
 # Seconds one `weft run` may take to record the job. Submission passes
 # --no-sync, so the budget covers source pinning and recording, not the host
 # push; `send` resolves a timeout through `weft job lookup` rather than failing.
@@ -194,8 +192,8 @@ def submit(
         raise TaskError(
             "project declares path dependencies outside the snapshot "
             f"({', '.join(stale)}); the worker receives only the project directory, "
-            "so the check would fail remotely after the writer has finished. Use "
-            f"{WORKSPACE_LANE} for projects with external path dependencies"
+            "so the check would fail remotely after the writer has finished. Run the check "
+            "in a remote workspace that also holds those dependencies instead"
         )
     # Refuse a retained identity before taking another source census. dispatch
     # repeats this check under its lock to cover concurrent submissions.
@@ -257,70 +255,17 @@ def dispatch(
 
 
 def ensure_worker(record: dict) -> None:
-    """Build the exact peer for this dispatch without changing the host's live tool."""
-    try:
-        raw = run(
-            [
-                "agent-host-sync",
-                "--host",
-                record["host"],
-                "--account",
-                record.get("account", "agent"),
-                "ensure",
-                "--tool",
-                "agent-offload",
-                "--json",
-            ],
-            timeout=ENSURE_TIMEOUT,
-        )
-    except TaskError as error:
-        detail = str(error).strip()
-        raise TaskError(f"agent-host-sync ensure failed: {detail[-2000:]}") from error
-    try:
-        value = json.loads(raw)
-    except (TypeError, json.JSONDecodeError) as error:
-        raise TaskError("agent-host-sync ensure returned invalid JSON") from error
-    if not isinstance(value, dict) or value.get("schema") != ENSURE_SCHEMA:
-        raise TaskError(f"agent-host-sync ensure did not return {ENSURE_SCHEMA}")
-    builds = value.get("builds")
-    peers = (
-        [item for item in builds if isinstance(item, dict) and item.get("tool") == "agent-offload"]
-        if isinstance(builds, list)
-        else []
-    )
-    if len(peers) != 1:
-        raise TaskError("agent-host-sync ensure must return exactly one agent-offload build")
-    peer = peers[0]
-    identity = peer.get("identity")
-    build_id, bin_dir = peer.get("build_id"), peer.get("bin_dir")
-    if (
-        not isinstance(identity, dict)
-        or not isinstance(identity.get("source_sha256"), str)
-        or not isinstance(identity.get("execution"), dict)
-        or not isinstance(identity["execution"].get("source_sha256"), str)
-        or not isinstance(build_id, str)
-        or not re.fullmatch(r"[0-9a-f]{64}", build_id)
-        or not isinstance(bin_dir, str)
-        or not Path(bin_dir).is_absolute()
-    ):
-        raise TaskError("agent-host-sync ensure returned a malformed agent-offload build")
+    """Pin the exact worker build for this dispatch without changing the host's live tool."""
     request = record["request"]
-    mismatches = []
-    if identity["source_sha256"] != request["offload_sha256"]:
-        mismatches.append("agent-offload")
-    if identity["execution"]["source_sha256"] != request["execution_sha256"]:
-        mismatches.append("agent-execution")
-    if mismatches:
-        sides = " and ".join(mismatches)
-        raise TaskError(
-            f"remote {sides} identity differs from the task dispatch. The local installed "
-            "agent-offload was built from different bytes than the agent-offload / "
-            "agent-execution checkouts that agent-host-sync deploys. Reinstall agent-offload "
-            "locally (`just install` in the agent-offload checkout), or commit/revert the "
-            "checkout edits, then resubmit."
-        )
-    record["bin_dir"] = bin_dir
-    record["build_id"] = build_id
+    build = ensure_worker_build(
+        provider=load_config().worker_provider,
+        host=record["host"],
+        account=record.get("account", "agent"),
+        offload_sha256=request["offload_sha256"],
+        execution_sha256=request["execution_sha256"],
+    )
+    record["bin_dir"] = build.bin_dir
+    record["build_id"] = build.build_id
 
 
 def swiftpm_path_dependencies(source: str) -> list[str]:
@@ -1169,14 +1114,15 @@ def handler(args: argparse.Namespace) -> int:
                 return 0
         elif args.action == "submit":
             brief = args.prompt if args.prompt is not None else args.brief.read_text()
+            config = load_config()
             value = submit(
                 args.project,
                 brief,
-                host=args.host,
+                host=require_task_host(args.host, config),
                 selector=args.selector,
                 timeout=args.timeout,
                 check=shlex.split(args.check or ""),
-                account=args.account,
+                account=task_account(args.account, config),
                 identity=args.id,
             )
         elif args.action == "list":
@@ -1289,8 +1235,10 @@ def build_task_parser(subparsers) -> None:
     brief = submit_parser.add_mutually_exclusive_group(required=True)
     brief.add_argument("--brief", type=Path)
     brief.add_argument("--prompt")
-    submit_parser.add_argument("--host", default="studio")
-    submit_parser.add_argument("--account", default="agent")
+    submit_parser.add_argument("--host", help="Weft host to run on (default: [tasks] host)")
+    submit_parser.add_argument(
+        "--account", help="account Weft runs jobs as on that host (default: local user)"
+    )
     submit_parser.add_argument(
         "--selector", choices=sorted(OMP_WRITER_SELECTORS), default=DEFAULT_SELECTOR
     )

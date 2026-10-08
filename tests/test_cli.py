@@ -379,7 +379,7 @@ def test_doctor_cli_exit_tracks_active_writer_readiness(
     status = status_envelope([selector], overrides={"capability": {"state": state}})
     monkeypatch.setattr(cli, "probe_status", lambda **_kwargs: status)
     with pytest.raises(SystemExit) as exit_code:
-        cli.main(["doctor", "--selector", selector])
+        cli.main(["doctor", "--host", "studio", "--selector", selector])
     assert exit_code.value.code == expected_exit
     output = capsys.readouterr().out
     assert ("admit:" if available else "refuse:") in output
@@ -421,7 +421,7 @@ def _openai_writers() -> list[str]:
 def test_doctor_selects_writers_to_probe(monkeypatch, capsys, arguments, expected) -> None:
     probed = _answer_requested_writers(monkeypatch)
     with pytest.raises(SystemExit) as exit_code:
-        cli.main(["doctor", "--json", *arguments])
+        cli.main(["doctor", "--host", "studio", "--json", *arguments])
     assert exit_code.value.code == 0
     assert probed == [expected()]
     report = json.loads(capsys.readouterr().out)

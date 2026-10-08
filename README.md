@@ -15,25 +15,21 @@ which confines the agent's tools and records what it was given and what it did.
 
 ## Status
 
-Used daily from a macOS laptop, with a macOS remote host. It was written for
-that one setup:
-
-- `task submit` installs the worker on the remote host with agent-host-sync, an
-  unpublished tool. Without it, submission fails before any job is created.
-- `--host` defaults to the author's host name, so pass your own.
-- The relay needs only SSH access and OMP on the remote host.
-
-There are no releases; install from a checkout.
+Used daily from a macOS laptop with a macOS remote host. CI also runs the tests
+on Linux. Windows is not supported; use WSL. There are no releases; install
+from a checkout.
 
 ## Requirements
 
-- Python 3.10 or later, [uv](https://docs.astral.sh/uv/), and
+- Python 3.11 or later, [uv](https://docs.astral.sh/uv/), and
   [just](https://just.systems/).
 - [agent-execution](https://github.com/osteele/agent-execution), checked out
   beside this repository. It is bundled into the install rather than declared
   as a dependency.
-- For tasks: [Weft](https://github.com/osteele/weft), configured with the
-  remote host.
+- For tasks: [Weft](https://github.com/osteele/weft), with the remote host
+  set up for it ([docs/weft.md](docs/weft.md)). The account Weft runs jobs as
+  must be reachable as `ssh ACCOUNT@HOST` and have Python 3.11 or later (or
+  uv) and [Bun](https://bun.sh/).
 - For the relay: [Bun](https://bun.sh/) locally, and SSH access to a host with
   [OMP](https://github.com/can1357/oh-my-pi) installed.
 - On the remote host, credentials for the model that does the writing.
@@ -53,6 +49,23 @@ with agent-execution bundled, checks that it starts, and then points
 A plain `uv tool install .` leaves agent-execution out, and every command then
 exits with a message naming the missing package.
 
+## Configuration
+
+Commands that run on another machine need a host: pass `--host`, or set
+defaults in `~/.config/agent-offload/config.toml`. `$XDG_CONFIG_HOME` is
+honored, and `AGENT_OFFLOAD_CONFIG` names a different file.
+
+```toml
+[tasks]
+host = "build-box"         # Weft host for `task submit` and `doctor`
+account = "agent"          # account Weft runs jobs as there; default: your user name
+
+[relay]
+host = "agent@build-box"   # SSH destination for `relay`
+```
+
+Unknown keys are errors, and a command-line flag overrides the file.
+
 ## Tasks
 
 ```sh
@@ -66,8 +79,10 @@ Other subcommands are `list`, `retrieve`, `resume`, `continue`, `cancel`, and
 `selectors`.
 
 - `task submit` records the request under `~/.local/state/agent-offload/tasks`
-  (or `AGENT_OFFLOAD_STATE`), installs a matching worker build on the host, and
-  queues a Weft job. It returns without waiting for the agent.
+  (or `AGENT_OFFLOAD_STATE`), copies the installed agent-offload and
+  agent-execution packages to a versioned directory on the host if they are
+  not there yet, and queues a Weft job that runs that copy. It returns without
+  waiting for the agent.
 - The agent reads and edits the snapshot through confined tools and cannot run
   shell commands. Files over 2 MiB can be read but not edited.
 - `--check` runs a command on the result after the agent finishes. If the check
@@ -92,8 +107,8 @@ agent-offload doctor --host HOST --selector openai-codex/gpt-6-luna --json
 ## Relay
 
 ```sh
-agent-offload relay /path/to/project --host HOST --prompt "Map the auth flow" --timeout 600
-agent-offload relay . --host HOST --prompt-file brief.txt --json
+agent-offload relay /path/to/project --host USER@HOST --prompt "Map the auth flow" --timeout 600
+agent-offload relay . --host USER@HOST --prompt-file brief.txt --json
 ```
 
 The agent runs on the remote host through OMP, but its three tools
@@ -126,6 +141,7 @@ validate existing ones.
 
 [docs/reference.md](docs/reference.md) covers the detailed contract:
 - task states, retries, and limits
+- worker builds and their providers
 - cancellation and acknowledgment
 - writer admission
 - result records

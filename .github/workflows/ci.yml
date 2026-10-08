@@ -25,7 +25,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ["3.10", "3.14"]
+        python: ["3.11", "3.14"]
         include:
           # agent-offload locks task state with fcntl and manages POSIX process
           # groups, as does agent-execution, so on Windows the suite reduces to

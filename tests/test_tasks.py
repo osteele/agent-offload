@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from conftest import PINNED_BIN, PINNED_BUILD, REAL_ENSURE_WORKER
 
-from agent_offload import tasks
+from agent_offload import tasks, worker_build
 from agent_offload.task_protocol import (
     TaskError,
     digest,
@@ -893,7 +893,7 @@ def test_submit_refuses_swiftpm_path_dependencies_outside_the_project(tmp_path, 
         )
     assert "../workflow-state" in str(refusal.value)
     assert "commented-out" not in str(refusal.value)
-    assert "agent-host-sync workspace run --dependency" in str(refusal.value)
+    assert "remote workspace that also holds those dependencies" in str(refusal.value)
     # Without a check nothing builds remotely, so the manifest is accepted.
     fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
     with pytest.raises(TaskError, match="resume this identity"):
@@ -1220,15 +1220,22 @@ def ensure_answer(record: dict) -> dict:
     }
 
 
-def test_ensure_worker_provisions_for_the_task_host_and_account(monkeypatch):
-    record = peer_record()
+def answering(answer):
+    """A provider runner that records each command and prints ``answer``."""
     calls = []
 
-    def run(argv, **kwargs):
+    def run_provider(argv, **kwargs):
         calls.append((argv, kwargs.get("timeout")))
-        return json.dumps(ensure_answer(record))
+        return answer.encode() if isinstance(answer, str) else json.dumps(answer).encode()
 
-    monkeypatch.setattr(tasks, "run", run)
+    return calls, run_provider
+
+
+@pytest.mark.usefixtures("agent_host_sync_provider")
+def test_ensure_worker_provisions_for_the_task_host_and_account(monkeypatch):
+    record = peer_record()
+    calls, run_provider = answering(ensure_answer(record))
+    monkeypatch.setattr(worker_build, "run_provider", run_provider)
     REAL_ENSURE_WORKER(record)
     argv, timeout = calls[0]
     assert argv == [
@@ -1250,6 +1257,7 @@ def test_ensure_worker_provisions_for_the_task_host_and_account(monkeypatch):
     )
 
 
+@pytest.mark.usefixtures("agent_host_sync_provider")
 @pytest.mark.parametrize("side", ["agent-offload", "agent-execution"])
 def test_ensure_worker_refuses_a_build_that_is_not_the_pinned_version(monkeypatch, side):
     record = peer_record()
@@ -1259,12 +1267,13 @@ def test_ensure_worker_refuses_a_build_that_is_not_the_pinned_version(monkeypatc
         identity["source_sha256"] = "0" * 64
     else:
         identity["execution"]["source_sha256"] = "0" * 64
-    monkeypatch.setattr(tasks, "run", lambda *args, **kwargs: json.dumps(answer))
+    monkeypatch.setattr(worker_build, "run_provider", answering(answer)[1])
     with pytest.raises(TaskError, match=f"remote {side} identity differs"):
         REAL_ENSURE_WORKER(record)
     assert "bin_dir" not in record
 
 
+@pytest.mark.usefixtures("agent_host_sync_provider")
 @pytest.mark.parametrize(
     "answer",
     [
@@ -1281,19 +1290,19 @@ def test_ensure_worker_refuses_a_build_that_is_not_the_pinned_version(monkeypatc
 )
 def test_ensure_worker_refuses_malformed_answers(monkeypatch, answer):
     record = peer_record()
-    monkeypatch.setattr(tasks, "run", lambda *args, **kwargs: answer)
+    monkeypatch.setattr(worker_build, "run_provider", answering(answer)[1])
     with pytest.raises(TaskError, match="ensure"):
         REAL_ENSURE_WORKER(record)
     assert "bin_dir" not in record
 
 
-def test_ensure_worker_failure_carries_the_reason(monkeypatch):
-    def run(*args, **kwargs):
-        raise TaskError("agent-host-sync: build failed: uv resolution error")
-
-    monkeypatch.setattr(tasks, "run", run)
+def test_provider_failure_carries_the_reason():
     with pytest.raises(TaskError, match="ensure failed: .*uv resolution error"):
-        REAL_ENSURE_WORKER(peer_record())
+        worker_build.run_provider(
+            ["sh", "-c", "echo 'build failed: uv resolution error' >&2; exit 1"],
+            timeout=30,
+            failure="agent-host-sync ensure failed",
+        )
 
 
 def test_submit_launches_the_pinned_build_by_absolute_path(tmp_path, monkeypatch):

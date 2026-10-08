@@ -14,6 +14,7 @@ from typing import Any
 
 from agent_execution.omp_execution import OMP_WRITER_SELECTORS
 
+from .config import load_config, require_task_host, task_account
 from .protocol import (
     DOCTOR_SCHEMA,
     NATIVE_DISPATCH_RETIRED,
@@ -465,7 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="submit a durable report-only task")
     run.add_argument("project", nargs="?", type=Path, default=Path.cwd())
     run.add_argument("--brief", type=Path, required=True)
-    run.add_argument("--host", default="studio")
+    run.add_argument("--host")
     run.add_argument("--provider", default=SUPPORTED_PROVIDER)
     run.add_argument("--mode", default=SUPPORTED_MODE)
     run.add_argument("--selector", choices=(SUPPORTED_SELECTOR,), default=SUPPORTED_SELECTOR)
@@ -489,8 +490,10 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(handler=cmd_status)
 
     doctor_parser = subparsers.add_parser("doctor", help="check remote agent readiness")
-    doctor_parser.add_argument("--host", default="studio")
-    doctor_parser.add_argument("--account", default="agent")
+    doctor_parser.add_argument("--host", help="Weft host to probe (default: [tasks] host)")
+    doctor_parser.add_argument(
+        "--account", help="account Weft runs jobs as on that host (default: local user)"
+    )
     doctor_parser.add_argument(
         "--provider",
         help="probe every admitted task writer for this provider (default: default writer only)",
@@ -568,8 +571,16 @@ def print_execution_status(status: dict[str, Any]) -> None:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    try:
+        config = load_config()
+        host = require_task_host(args.host, config)
+    except TaskError as error:
+        raise OffloadError(str(error)) from error
     result = doctor(
-        host=args.host, provider=args.provider, selector=args.selector, account=args.account
+        host=host,
+        provider=args.provider,
+        selector=args.selector,
+        account=task_account(args.account, config),
     )
     decision = result["admission"]
     if args.json:

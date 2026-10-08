@@ -20,7 +20,7 @@ from agent_execution.omp_execution import (
 from agent_execution.worker import WORKER_PROTOCOL_VERSION, HarnessOutcome, WorkerResult
 from test_task_outcomes import task_factory as parent_task_factory
 
-from agent_offload import task_worker, tasks
+from agent_offload import task_worker, tasks, worker_build
 from agent_offload.protocol import package_source_sha256
 from agent_offload.task_protocol import (
     SCHEMA,
@@ -536,7 +536,7 @@ def test_continue_accepts_a_parent_already_acknowledged_with_cancel(
 
 @pytest.mark.parametrize("answers_with_current_build", [True, False], ids=["current", "stale"])
 def test_continue_pins_the_child_to_the_current_build_not_the_parent_pins(
-    task_factory, tmp_path, monkeypatch, capsys, answers_with_current_build
+    task_factory, tmp_path, monkeypatch, capsys, answers_with_current_build, isolated_config
 ):
     # Guard: an older parent dispatched by a previous build still continues
     # (validated against its own retained request), while the child is pinned
@@ -566,24 +566,25 @@ def test_continue_pins_the_child_to_the_current_build_not_the_parent_pins(
         "execution": {"source_sha256": source_sha256() if answers_with_current_build else "0" * 64},
     }
 
-    def run(argv, **kwargs):
-        if argv[0] == "agent-host-sync":
-            return json.dumps(
-                {
-                    "schema": "agent-host-sync.ensure/v1",
-                    "builds": [
-                        {
-                            "tool": "agent-offload",
-                            "build_id": "c" * 64,
-                            "bin_dir": PINNED_BIN,
-                            "identity": identity,
-                        }
-                    ],
-                }
-            )
-        return fake(argv, **kwargs)
+    def run_provider(argv, **kwargs):
+        assert argv[0] == "agent-host-sync"
+        return json.dumps(
+            {
+                "schema": "agent-host-sync.ensure/v1",
+                "builds": [
+                    {
+                        "tool": "agent-offload",
+                        "build_id": "c" * 64,
+                        "bin_dir": PINNED_BIN,
+                        "identity": identity,
+                    }
+                ],
+            }
+        ).encode()
 
-    monkeypatch.setattr(tasks, "run", run)
+    isolated_config.write_text('[worker]\nprovider = "agent-host-sync"\n')
+    monkeypatch.setattr(worker_build, "run_provider", run_provider)
+    monkeypatch.setattr(tasks, "run", fake)
     monkeypatch.setattr(tasks, "ensure_worker", REAL_ENSURE_WORKER)
     monkeypatch.setattr(tasks, "snapshot_names", ordinary_names)
     exit_code = tasks.handler(continue_args("old-pin", id="pin-child"))

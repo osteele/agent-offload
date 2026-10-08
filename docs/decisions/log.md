@@ -27,3 +27,21 @@ decision-records skill; a full record needs Oliver's explicit confirmation.
   without a second exclusion surface beside `.weft.toml`, accepting that an
   oversized file is silently unavailable for editing and that its integrity is
   judged by stat rather than by content.
+- **2026-10-09** — In the context of running task workers on hosts that do not
+  have the author's account updater, facing a submit that could not create a
+  job without agent-host-sync, we decided that agent-offload provisions the
+  worker itself by copying the installed agent-offload and agent-execution
+  packages over SSH into a content-addressed build, and neglected discovering a
+  worker the user preinstalled on the host, to keep a fresh host usable with
+  nothing installed but Python and Bun and to make the remote digests equal the
+  local ones by construction, accepting a per-version copy over SSH and a build
+  directory per installed version that nothing yet collects. agent-host-sync
+  remains a configurable provider. Chosen by Oliver on 2026-10-09 (relayed by
+  Glowing Glow, which presented the choice).
+- **2026-10-09** — In the context of removing the author's host from the
+  command defaults, facing a choice of where a user's default host lives, we
+  decided on a TOML file (`~/.config/agent-offload/config.toml`, read with
+  `tomllib`) and neglected an `AGENT_OFFLOAD_HOST` environment variable, to hold
+  the task host, its account, the relay destination, and the worker provider
+  in one validated place, accepting a Python 3.11 floor. Chosen by Oliver on
+  2026-10-09 (relayed by Glowing Glow).

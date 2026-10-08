@@ -572,6 +572,15 @@ def cmd_relay(args: argparse.Namespace) -> int:
         return 2
     del shutil
 
+    # Imported here: agent-host-sync imports this module for relay_source_sha256.
+    from .config import load_config, require_relay_host
+    from .task_protocol import TaskError
+
+    try:
+        host = require_relay_host(args.host, load_config())
+    except TaskError as exc:
+        print(f"agent-offload: {exc}", file=sys.stderr)
+        return 2
     project_root = args.project.expanduser().resolve()
     prompt = (
         args.prompt
@@ -582,7 +591,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
         result_path, record = run_relay(
             project_root=project_root,
             prompt=prompt,
-            host=args.host,
+            host=host,
             timeout_seconds=args.timeout,
         )
     except RelayProtocolError as exc:
@@ -627,8 +636,7 @@ def build_relay_parser(subparsers: argparse._SubParsersAction) -> None:
     relay.add_argument("--prompt-file", type=Path, help="read the prompt from a file")
     relay.add_argument(
         "--host",
-        default="agent@studio",
-        help="headless SSH target for the agent runtime (the agent@ worker account, not a personal login)",
+        help="headless SSH target for the agent runtime, USER@HOST (default: [relay] host)",
     )
     relay.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     relay.add_argument("--json", action="store_true")
