@@ -50,3 +50,21 @@ def test_relay_imports_without_agent_execution() -> None:
     completed = run_without_execution("from agent_offload.relay import relay_source_sha256")
 
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("entry_point", ["cli", "worker", "task_worker"])
+def test_entry_point_refuses_a_non_posix_platform_by_name(entry_point: str) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import os\nos.name = 'nt'\nfrom agent_offload.entry import {entry_point}\n{entry_point}()",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "runs on macOS and Linux" in completed.stderr
+    assert "Traceback" not in completed.stderr

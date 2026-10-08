@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
-from agent_offload import tasks
+POSIX = os.name == "posix"
+if POSIX:
+    from agent_offload import tasks
 
-REAL_ENSURE_WORKER = tasks.ensure_worker
+    REAL_ENSURE_WORKER = tasks.ensure_worker
+else:
+    # agent-offload and agent-execution lock state with fcntl and manage POSIX
+    # process groups; elsewhere only the entry points' refusal is tested.
+    collect_ignore = [
+        path.name
+        for path in Path(__file__).parent.glob("test_*.py")
+        if path.name != "test_install_guard.py"
+    ]
 PINNED_BUILD = "b" * 64
 PINNED_BIN = f"/Users/agent/.local/state/agent-host-sync/builds/agent-offload/{PINNED_BUILD}/bin"
 
@@ -68,6 +81,8 @@ def status_envelope(selectors, *, overrides=None):
 @pytest.fixture(autouse=True)
 def pinned_worker(monkeypatch):
     """Isolate provisioning and remote credential checks from task tests."""
+    if not POSIX:
+        return
 
     def ensure(record: dict) -> None:
         record["bin_dir"] = PINNED_BIN
@@ -80,6 +95,8 @@ def pinned_worker(monkeypatch):
 @pytest.fixture(autouse=True)
 def pinned_local_probe(monkeypatch):
     """Avoid real credentials; launch-refusal tests override this observation."""
+    if not POSIX:
+        return
     from agent_execution import execution_status
 
     monkeypatch.setattr(

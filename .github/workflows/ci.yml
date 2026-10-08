@@ -1,0 +1,78 @@
+name: CI
+
+# `ci/**` lets a temporary branch be validated without opening a PR.
+on:
+  push:
+    branches: [main, "ci/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      # Report every platform; cancelling the rest on the first failure hides
+      # whether a fault is platform-specific.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.14"]
+        include:
+          # agent-offload locks task state with fcntl and manages POSIX process
+          # groups, as does agent-execution, so on Windows the suite reduces to
+          # the entry points' install and platform refusals.
+          - os: windows-latest
+            python: "3.14"
+    defaults:
+      run:
+        working-directory: agent-offload
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: agent-offload
+
+      # Bundled into every install rather than declared as a dependency; the
+      # justfile and tests expect it as a sibling checkout.
+      - uses: actions/checkout@v7
+        with:
+          repository: osteele/agent-execution
+          path: agent-execution
+
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Lint
+        run: |
+          uv run ruff check src tests
+          uv run ruff format --check src tests
+
+      - name: Install ripgrep (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ripgrep
+
+      - name: Install ripgrep (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ripgrep
+
+      - name: Test
+        run: uv run --with-editable ../agent-execution python -m pytest
+
+      - uses: oven-sh/setup-bun@v2
+        if: runner.os != 'Windows'
+
+      - name: Test the relay runtime
+        if: runner.os != 'Windows'
+        run: |
+          bun install --frozen-lockfile --cwd src/agent_offload/relay_runtime
+          bun test src/agent_offload/relay_runtime
+          bun run --shell=bun --cwd src/agent_offload/relay_runtime typecheck

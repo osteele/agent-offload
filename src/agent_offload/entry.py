@@ -1,4 +1,4 @@
-"""Console entry points that name a missing agent-execution before importing it.
+"""Console entry points that refuse an unusable install by name, before importing it.
 
 agent-execution is bundled with `--with ../agent-execution` rather than declared,
 so an install that omits it builds cleanly and then fails in every command. The
@@ -6,6 +6,7 @@ check lives here, not in the package `__init__`, because agent-host-sync imports
 agent-execution-free submodules such as `agent_offload.relay` from source.
 """
 
+import os
 import sys
 
 MISSING_EXECUTION_MESSAGE = (
@@ -25,8 +26,20 @@ def require_agent_execution() -> None:
         sys.exit(MISSING_EXECUTION_MESSAGE)
 
 
+UNSUPPORTED_PLATFORM_MESSAGE = (
+    "agent-offload runs on macOS and Linux: it locks task state with fcntl and manages\n"
+    "POSIX process groups. On Windows, run it from WSL."
+)
+
+
+def require_posix() -> None:
+    if os.name != "posix":
+        sys.exit(UNSUPPORTED_PLATFORM_MESSAGE)
+
+
 def cli() -> None:
     require_agent_execution()
+    require_posix()
     from .cli import main
 
     main()
@@ -34,6 +47,7 @@ def cli() -> None:
 
 def worker() -> None:
     require_agent_execution()
+    require_posix()
     from .worker_cli import main
 
     main()
@@ -41,6 +55,7 @@ def worker() -> None:
 
 def task_worker() -> None:
     require_agent_execution()
+    require_posix()
     from .task_worker import main
 
     main()
