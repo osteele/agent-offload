@@ -160,6 +160,16 @@ entity Task {
     prior_job_ids: List<String>
     submission_started: Boolean
         -- False until the current attempt first enters Weft; persisted before entry.
+    provisioning: String
+        -- pending before the current attempt's first provisioning call,
+        -- in_progress while the pinned build is provisioned, ready after,
+        -- failed with the reason retained. A record written before the field
+        -- existed reports unknown, except that a retained build identity
+        -- still derives ready.
+    cancelled_without_job: String?
+        -- For a jobless closure: never_submitted when the durable start
+        -- marker proves no send was attempted, weft_reported_no_job when a
+        -- final fence answer proved the key jobless.
     error: String?
 
     -- Evidence-based status. completed, failed and validation_failed come
@@ -330,6 +340,7 @@ rule SubmitTask {
             job: null,
             prior_job_ids: [],
             submission_started: false,
+            provisioning: "pending",
             status: submitting
         )
     ensures: WorkerProvisioningRequested(task)
@@ -359,16 +370,19 @@ rule ProvisionWorker {
     requires: provisioned_build_matches(task)
         -- Provisioning builds an immutable, content-addressed worker for
         -- the task's host and account without activating it: the host's
-        -- current build and PATH are untouched. The configured provider
-        -- makes it: by default, by copying the installed agent-offload and
-        -- agent-execution packages over SSH; optionally, through
-        -- agent-host-sync from the checkouts it deploys. The build is accepted only
-        -- when the identity its own worker reports carries an agent-offload
-        -- source digest equal to the request's offload digest and an
+        -- current build and PATH are untouched. There is exactly one
+        -- mechanism: the installed agent-offload and agent-execution
+        -- packages are copied over SSH, so the build is deterministic from
+        -- the installed pinned pair and independent of any source checkout.
+        -- The configured provider value is accepted for compatibility but no
+        -- longer selects a builder. The build is accepted only when the
+        -- identity its own worker reports carries an agent-offload source
+        -- digest equal to the request's offload digest and an
         -- agent-execution source digest equal to the request's execution
         -- digest.
     ensures: task.worker_build_id = provisioned_build(task).id
     ensures: task.worker_bin_dir = provisioned_build(task).bin_dir
+    ensures: task.provisioning = "ready"
     ensures: SubmissionSent(task)
 }
 
@@ -379,13 +393,15 @@ rule RefuseMismatchedWorker {
     ensures: ProvisioningRefusalReported(task)
     @guidance
         -- The refusal happens before any Weft job exists, and the task keeps
-        -- its identity with no job and no recorded build, so resume
-        -- provisions again. The diagnostic names which side differs
-        -- (agent-offload, agent-execution, or both) and the fix: the local
-        -- installed agent-offload was built from different bytes than the
-        -- sources the host build is made from, so reinstall it locally or
-        -- commit or revert the checkout edits, then resubmit. A failed or
-        -- malformed provisioning answer refuses the same way.
+        -- its identity with no job and no recorded build. The diagnostic
+        -- names which side differs and both digests. The refused case is a
+        -- pinned build the install can no longer supply: the pinned bytes
+        -- are never reconstructed from a checkout, no reinstall or checkout
+        -- rewrite is attempted automatically, and that identity cannot
+        -- resume -- the caller submits a new task for the same brief. Any
+        -- other provisioning failure keeps the identity and names the
+        -- same-ID resume that retries provisioning. A failed or malformed
+        -- provisioning answer refuses the same way.
 }
 
 rule SubmissionAccepted {
@@ -467,7 +483,7 @@ rule ResumeTask {
 }
 
 rule ContinueTask {
-    when: ContinueTask(caller, parent, timeout, supplement?, requested_id?)
+    when: ContinueTask(caller, parent, timeout, supplement?, requested_id?, selector_override?)
 
     requires: parent.result != null and parent.result.status in {failed, validation_failed}
         -- A validated published result is the only continuation seed. A
@@ -487,15 +503,23 @@ rule ContinueTask {
         -- local file that could collide with a seeded addition, refuses
         -- before anything is submitted. Nothing is written locally.
     requires: timeout >= 1.second and timeout <= config.max_task_timeout
+    requires: selected = selector_override ?? parent.selector
+    requires: selected in OMP_WRITER_SELECTORS
+        -- Validate the selected exact writer, not a retired inherited parent
+        -- when the caller supplies a replacement.
     requires: requested_id = null or not Tasks.any(t => t.id = requested_id)
     ensures:
         let child = Task.created(
             id: requested_id ?? generated_task_id(),
             project: parent.project,
-            brief: continuation_brief(parent.brief, supplement),
-                -- Preserves the original requirements and marks the seeded
-                -- edits incomplete and untrusted.
-            selector: parent.selector,
+            brief: continuation_brief(
+                parent.brief,
+                supplement,
+                untrusted_validation_diagnostic(parent.result, parent.check)
+            ),
+                -- Preserves requirements/manual instructions and adds validated
+                -- failed-check output as bounded quoted untrusted data.
+            selector: selected,
             check: parent.check,
             timeout: timeout,
             account: parent.account,
@@ -509,6 +533,7 @@ rule ContinueTask {
             job: null,
             prior_job_ids: [],
             submission_started: false,
+            provisioning: "pending",
             status: submitting
         )
     ensures: parent = parent_before
@@ -530,6 +555,7 @@ rule CancelBeforeDispatch {
     requires: task.submission_started = false
     requires: task.status != submission_unknown
     ensures: task.status = cancelled
+    ensures: task.cancelled_without_job = "never_submitted"
     ensures:
         if task.processed_at = null:
             task.processed_at = now
@@ -547,6 +573,7 @@ rule FenceAmbiguousSubmission {
     ensures:
         if ValidFence(api_version = "weft.job.fence.v1", key = K, fenced = true, receipt = null):
             task.status = cancelled
+            task.cancelled_without_job = "weft_reported_no_job"
             task.processed_at = now
         else if ValidFence(api_version = "weft.job.fence.v1", key = K, fenced = false, receipt = R):
             Persist(task.job = R.job_id, task.host = R.selected_host, task.source_pin = R.source_pin)
@@ -640,7 +667,15 @@ rule ValidateRetrievedResult {
         -- before-digest and mode equal to the retained baseline for existing
         -- files, absence matching for new files, per-file and bundle bounds.
     ensures: TaskEvidenceValidated(task)
+    ensures: task.review = destructive_review_summary(task.result.changes)
+        -- Deterministic evidence comes only from validated before/after bytes:
+        -- removed paths, removed Python AST test-shaped definitions, and
+        -- candidate files that could not be assessed. It is advisory.
     @guidance
+        -- Python inventory covers module-level and direct class test_* defs,
+        -- not nested helpers or pytest/unittest collection and parameterized
+        -- case totals. Unsupported test languages and parse failures are
+        -- unassessed. Review metadata does not alter artifact digest binding.
         -- Retrieval never marks the Weft job processed in this lane and
         -- never mutates task state by itself.
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -220,11 +221,14 @@ def test_identity_must_name_the_requested_build():
 
 
 @posix_only
-def test_ssh_provider_copies_the_running_install_not_its_checkout(tmp_path):
+@pytest.mark.parametrize("provider", ["ssh", "agent-host-sync"])
+def test_task_provisioning_copies_the_running_install_not_its_checkout(tmp_path, provider):
     """An install built from other bytes than its checkout still gets a matching build.
 
     Building the host copy from a checkout refused every task once the checkout
-    was edited after the install; copying the running packages cannot.
+    was edited after the install; copying the running packages cannot. The
+    configured provider no longer changes this: agent-host-sync provisions the
+    same installed pair as ssh, so unrelated checkout edits cannot touch a task.
     """
     installed = tmp_path / "installed"
     for package in (agent_offload, agent_execution):
@@ -237,14 +241,14 @@ def test_ssh_provider_copies_the_running_install_not_its_checkout(tmp_path):
     protocol = installed / "agent_offload" / "protocol.py"
     protocol.write_text(protocol.read_text() + "\n# an installed release\n")
     environment = {**os.environ, **fake_host(tmp_path), "PYTHONPATH": str(installed)}
-    program = """
+    program = f"""
 import json
 from agent_execution.identity import source_sha256
 from agent_offload.protocol import package_source_sha256
 from agent_offload.worker_build import ensure_worker_build
 
 build = ensure_worker_build(
-    provider="ssh",
+    provider={provider!r},
     host="box",
     account="agent",
     offload_sha256=package_source_sha256(),
@@ -263,3 +267,41 @@ print(json.dumps([package_source_sha256(), build.offload_sha256]))
     running, built = json.loads(completed.stdout)
     assert running == built
     assert running != package_source_sha256()
+
+
+@posix_only
+@pytest.mark.parametrize("provider", ["ssh", "agent-host-sync"])
+def test_every_configured_provider_provisions_over_ssh_and_never_delegates(
+    tmp_path, monkeypatch, provider
+):
+    for name, value in fake_host(tmp_path).items():
+        monkeypatch.setenv(name, value)
+    # A poisoned agent-host-sync: any delegation fails loudly and leaves proof.
+    stub = tmp_path / "fake-bin" / "agent-host-sync"
+    marker = tmp_path / "agent-host-sync-ran"
+    stub.write_text(f"#!/bin/sh\necho ran > {shlex.quote(str(marker))}\nexit 70\n")
+    stub.chmod(0o755)
+
+    build = worker_build.ensure_worker_build(
+        provider=provider,
+        host="box",
+        account="agent",
+        offload_sha256=package_source_sha256(),
+        execution_sha256=source_sha256(),
+    )
+
+    root = Path(build.bin_dir).parent
+    assert build.build_id == worker_build.ssh_build_id(package_source_sha256(), source_sha256())
+    assert (root / "BUILD_ID").read_text().strip() == build.build_id
+    assert not marker.exists()
+
+
+def test_an_unadmitted_provider_still_refuses():
+    with pytest.raises(TaskError, match="unknown worker provider"):
+        worker_build.ensure_worker_build(
+            provider="rsync",
+            host="box",
+            account="agent",
+            offload_sha256=package_source_sha256(),
+            execution_sha256=source_sha256(),
+        )

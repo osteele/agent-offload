@@ -86,6 +86,8 @@ def weft_runs(tmp_path) -> list[list[str]]:
 def rewrite_request(tmp_path, record, result, **fields):
     """Retain an amended request and keep its served result digest-consistent."""
     record["request"].update(fields)
+    if "check" in fields and isinstance(result.get("validation"), dict):
+        result["validation"]["command"] = list(fields["check"])
     payload = tasks.state_root() / record["id"] / "request.json"
     tasks.save(payload, record["request"])
     record["request_sha256"] = digest(payload.read_bytes())
@@ -542,7 +544,7 @@ def test_continue_pins_the_child_to_the_current_build_not_the_parent_pins(
     # (validated against its own retained request), while the child is pinned
     # to the current build; provisioning against the parent's stale digests
     # refuses instead of queueing a mismatched worker.
-    from conftest import PINNED_BIN, REAL_ENSURE_WORKER
+    from conftest import REAL_ENSURE_WORKER
     from test_task_processing import FakeWeft
 
     parent, result = task_factory("old-pin", "validation_failed")
@@ -561,26 +563,19 @@ def test_continue_pins_the_child_to_the_current_build_not_the_parent_pins(
         "job": {"id": parent["job_id"], "status": "completed"},
         "result": json.dumps(result),
     }
+    offload_sha = package_source_sha256() if answers_with_current_build else "1" * 64
+    execution_sha = source_sha256() if answers_with_current_build else "0" * 64
+    build_id = worker_build.ssh_build_id(package_source_sha256(), source_sha256())
     identity = {
-        "source_sha256": package_source_sha256() if answers_with_current_build else "1" * 64,
-        "execution": {"source_sha256": source_sha256() if answers_with_current_build else "0" * 64},
+        "build_id": build_id,
+        "source_sha256": offload_sha,
+        "execution": {"source_sha256": execution_sha},
     }
+    bin_dir = "/worker/build/bin"
 
     def run_provider(argv, **kwargs):
-        assert argv[0] == "agent-host-sync"
-        return json.dumps(
-            {
-                "schema": "agent-host-sync.ensure/v1",
-                "builds": [
-                    {
-                        "tool": "agent-offload",
-                        "build_id": "c" * 64,
-                        "bin_dir": PINNED_BIN,
-                        "identity": identity,
-                    }
-                ],
-            }
-        ).encode()
+        assert argv[0] == "ssh"
+        return f"{bin_dir}\n{json.dumps(identity)}\n".encode()
 
     isolated_config.write_text('[worker]\nprovider = "agent-host-sync"\n')
     monkeypatch.setattr(worker_build, "run_provider", run_provider)
@@ -588,19 +583,18 @@ def test_continue_pins_the_child_to_the_current_build_not_the_parent_pins(
     monkeypatch.setattr(tasks, "ensure_worker", REAL_ENSURE_WORKER)
     monkeypatch.setattr(tasks, "snapshot_names", ordinary_names)
     exit_code = tasks.handler(continue_args("old-pin", id="pin-child"))
-    output = capsys.readouterr()
+    capsys.readouterr()
     if answers_with_current_build:
         assert exit_code == 0
         record = tasks.read_record("pin-child")
         assert record["request"]["execution_sha256"] == source_sha256()
         assert record["request"]["offload_sha256"] == package_source_sha256()
-        assert (record["bin_dir"], record["build_id"]) == (PINNED_BIN, "c" * 64)
+        assert (record["bin_dir"], record["build_id"]) == (bin_dir, build_id)
         assert (
             record["request"]["continuation"]["parent_request_sha256"] == parent["request_sha256"]
         )
     else:
         assert exit_code == 1
-        assert "identity differs" in output.err
         retained = tasks.read_record("pin-child")
         assert retained["job_id"] is None and "bin_dir" not in retained
         assert fake.steps() == ["inspect", "artifact"]

@@ -5,13 +5,21 @@ agent-execution packages, and the remote job must run those exact bytes. A
 provider returns the absolute ``bin_dir`` of such a build on the task host and
 its ``build_id``; the caller then verifies the build's own identity report.
 
-Two providers exist:
+There is exactly one mechanism: copy the two installed packages to a
+content-addressed directory on the host over SSH. It needs only ``python3``
+3.11 or later (or ``uv``) there, plus Bun for the OMP runtime. Because the
+copied bytes are the installed ones, the build matches the dispatch by
+construction, and edits to any source checkout cannot change what a task
+runs.
 
-- ``ssh`` (the default) copies the two installed packages to a
-  content-addressed directory on the host over SSH. It needs only ``python3``
-  3.11 or later (or ``uv``) there, plus Bun for the OMP runtime.
-- ``agent-host-sync`` delegates to that tool's ``ensure`` command, which builds
-  from the checkouts it deploys.
+The configuration still accepts ``[worker] provider = "agent-host-sync"`` so
+deployed configuration files keep loading, but it no longer selects a builder:
+every task provisions through the installed-package mechanism. The retired
+delegation to agent-host-sync's ``ensure`` built from the checkouts that tool
+deploys, so an unrelated checkout edit changed (or broke) what tasks ran, and
+its digest-mismatch failure could only suggest reinstalling or rewriting the
+checkout. That path is gone; see ``ensure_over_ssh`` for the identity guards
+that replaced it.
 """
 
 from __future__ import annotations
@@ -31,12 +39,21 @@ from agent_execution.identity import source_sha256
 
 import agent_offload
 
+from .config import WORKER_PROVIDERS
 from .protocol import package_source_sha256
 from .task_protocol import TaskError
 
-ENSURE_SCHEMA = "agent-host-sync.ensure/v1"
-# Allow agent-host-sync's 45-minute source-lock wait plus time for a cold build.
-ENSURE_TIMEOUT = 3600
+
+class PinnedBuildUnavailable(TaskError):
+    """The installed packages cannot build a task's pinned worker.
+
+    Unlike a transport or host failure, resuming the task cannot help: the
+    pinned bytes no longer exist in any install this machine can copy, and
+    they are never reconstructed from a checkout. The task keeps its identity
+    and its refusal; a new task pins the current install.
+    """
+
+
 SSH_TIMEOUT = 900
 ENTRY_POINTS = {
     "agent-offload": "cli",
@@ -56,24 +73,26 @@ class WorkerBuild:
 def ensure_worker_build(
     *, provider: str, host: str, account: str, offload_sha256: str, execution_sha256: str
 ) -> WorkerBuild:
-    if provider == "ssh":
-        build = ensure_over_ssh(host, account, offload_sha256, execution_sha256)
-    elif provider == "agent-host-sync":
-        build = ensure_with_agent_host_sync(host, account)
-    else:
+    """Return the immutable build for this dispatch, provisioning it if needed.
+
+    ``provider`` is still validated so a mistyped configuration fails loudly,
+    and it is accepted for every value the configuration has ever admitted,
+    but it no longer selects a builder: a task build is content-addressed
+    from the installed, pinned package pair, so provisioning is deterministic
+    and independent of any source checkout's state.
+    """
+    if provider not in WORKER_PROVIDERS:
         raise TaskError(f"unknown worker provider {provider!r}")
-    mismatches = []
+    build = ensure_over_ssh(host, account, offload_sha256, execution_sha256)
     if build.offload_sha256 != offload_sha256:
-        mismatches.append("agent-offload")
-    if build.execution_sha256 != execution_sha256:
-        mismatches.append("agent-execution")
-    if mismatches:
-        sides = " and ".join(mismatches)
         raise TaskError(
-            f"remote {sides} identity differs from the task dispatch: the {provider} provider "
-            "built different bytes from the local install. Reinstall agent-offload locally "
-            "(`just install` in the agent-offload checkout), or commit or revert the checkout "
-            "edits the provider builds from, then resubmit."
+            "worker build agent-offload digest differs from the dispatch "
+            f"(expected {offload_sha256}, got {build.offload_sha256})"
+        )
+    if build.execution_sha256 != execution_sha256:
+        raise TaskError(
+            "worker build agent-execution digest differs from the dispatch "
+            f"(expected {execution_sha256}, got {build.execution_sha256})"
         )
     return build
 
@@ -220,8 +239,15 @@ echo "$root/bin"
 def ensure_over_ssh(
     host: str, account: str, offload_sha256: str, execution_sha256: str
 ) -> WorkerBuild:
+    """Copy the installed pair into the pinned content-addressed build.
+
+    The digests are checked before anything is copied: a task recorded by an
+    earlier install would otherwise put other bytes under its pinned build's
+    name. The host repeats the check on the staged packages before publishing,
+    so no failure leaves a wrong build under this build ID.
+    """
     changed = [
-        name
+        (name, installed, requested)
         for name, installed, requested in (
             ("agent-offload", package_source_sha256(), offload_sha256),
             ("agent-execution", source_sha256(), execution_sha256),
@@ -229,10 +255,16 @@ def ensure_over_ssh(
         if installed != requested
     ]
     if changed:
-        raise TaskError(
-            f"the installed {' and '.join(changed)} changed since this task was recorded, "
-            "so the worker it pinned cannot be built from this install; submit a new task "
-            "for the same brief"
+        sides = " and ".join(name for name, _, _ in changed)
+        detail = "; ".join(
+            f"{name} task pinned {requested[:12]}, installed {installed[:12]}"
+            for name, installed, requested in changed
+        )
+        raise PinnedBuildUnavailable(
+            f"the installed {sides} changed since this task was recorded ({detail}), so the "
+            "worker it pinned cannot be built from this install; the pinned bytes cannot be "
+            "reconstructed, and this task identity cannot resume: submit a new task for the "
+            "same brief"
         )
     build_id = ssh_build_id(offload_sha256, execution_sha256)
     target = ssh_target(host, account)
@@ -247,52 +279,3 @@ def ensure_over_ssh(
     if not bin_dir.startswith("/"):
         raise TaskError(f"worker provisioning on {target} printed no build directory")
     return parse_identity(identity, build_id=build_id, bin_dir=bin_dir)
-
-
-def ensure_with_agent_host_sync(host: str, account: str) -> WorkerBuild:
-    argv = [
-        "agent-host-sync",
-        "--host",
-        host,
-        "--account",
-        account,
-        "ensure",
-        "--tool",
-        "agent-offload",
-        "--json",
-    ]
-    stdout = run_provider(argv, timeout=ENSURE_TIMEOUT, failure="agent-host-sync ensure failed")
-    try:
-        value = json.loads(stdout)
-    except json.JSONDecodeError as error:
-        raise TaskError("agent-host-sync ensure returned invalid JSON") from error
-    if not isinstance(value, dict) or value.get("schema") != ENSURE_SCHEMA:
-        raise TaskError(f"agent-host-sync ensure did not return {ENSURE_SCHEMA}")
-    builds = value.get("builds")
-    peers = (
-        [item for item in builds if isinstance(item, dict) and item.get("tool") == "agent-offload"]
-        if isinstance(builds, list)
-        else []
-    )
-    if len(peers) != 1:
-        raise TaskError("agent-host-sync ensure must return exactly one agent-offload build")
-    peer = peers[0]
-    identity = peer.get("identity")
-    build_id, bin_dir = peer.get("build_id"), peer.get("bin_dir")
-    if (
-        not isinstance(identity, dict)
-        or not isinstance(identity.get("source_sha256"), str)
-        or not isinstance(identity.get("execution"), dict)
-        or not isinstance(identity["execution"].get("source_sha256"), str)
-        or not isinstance(build_id, str)
-        or not re.fullmatch(r"[0-9a-f]{64}", build_id)
-        or not isinstance(bin_dir, str)
-        or not bin_dir.startswith("/")
-    ):
-        raise TaskError("agent-host-sync ensure returned a malformed agent-offload build")
-    return WorkerBuild(
-        build_id=build_id,
-        bin_dir=bin_dir,
-        offload_sha256=identity["source_sha256"],
-        execution_sha256=identity["execution"]["source_sha256"],
-    )

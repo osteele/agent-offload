@@ -1193,116 +1193,74 @@ def peer_record() -> dict:
     }
 
 
-def ensure_answer(record: dict) -> dict:
-    return {
-        "schema": "agent-host-sync.ensure/v1",
-        "account": record["account"],
-        "host": "studio-osteele",
-        "builds": [
-            {
-                "tool": "agent-execution",
-                "build_id": "c" * 64,
-                "bin_dir": "/Users/osteele/builds/execution/bin",
-                "created": False,
-                "identity": {"source_sha256": record["request"]["execution_sha256"]},
-            },
-            {
-                "tool": "agent-offload",
-                "build_id": "a" * 64,
-                "bin_dir": "/Users/osteele/builds/offload/bin",
-                "created": True,
-                "identity": {
-                    "source_sha256": record["request"]["offload_sha256"],
-                    "execution": {"source_sha256": record["request"]["execution_sha256"]},
-                },
-            },
-        ],
-    }
+def host_sync_fixture_environment(tmp_path: Path, monkeypatch) -> Path:
+    """A local stand-in task host, plus a poisoned agent-host-sync stub.
 
+    Task provisioning must never delegate to that tool again, so the stub
+    fails loudly and leaves a marker if it is ever executed.
+    """
+    from test_worker_build import fake_host
 
-def answering(answer):
-    """A provider runner that records each command and prints ``answer``."""
-    calls = []
-
-    def run_provider(argv, **kwargs):
-        calls.append((argv, kwargs.get("timeout")))
-        return answer.encode() if isinstance(answer, str) else json.dumps(answer).encode()
-
-    return calls, run_provider
+    for name, value in fake_host(tmp_path).items():
+        monkeypatch.setenv(name, value)
+    marker = tmp_path / "agent-host-sync-ran"
+    stub = tmp_path / "fake-bin" / "agent-host-sync"
+    stub.write_text(f"#!/bin/sh\necho ran > {shlex.quote(str(marker))}\nexit 70\n")
+    stub.chmod(0o755)
+    return marker
 
 
 @pytest.mark.usefixtures("agent_host_sync_provider")
-def test_ensure_worker_provisions_for_the_task_host_and_account(monkeypatch):
+def test_host_sync_config_provisions_from_the_installed_pair_over_ssh(tmp_path, monkeypatch):
+    marker = host_sync_fixture_environment(tmp_path, monkeypatch)
     record = peer_record()
-    calls, run_provider = answering(ensure_answer(record))
-    monkeypatch.setattr(worker_build, "run_provider", run_provider)
+
     REAL_ENSURE_WORKER(record)
-    argv, timeout = calls[0]
-    assert argv == [
-        "agent-host-sync",
-        "--host",
-        "studio",
-        "--account",
-        "osteele",
-        "ensure",
-        "--tool",
-        "agent-offload",
-        "--json",
-    ]
-    # A cold build takes minutes; the ordinary 60 s helper budget would kill it.
-    assert timeout >= 600
-    assert (record["bin_dir"], record["build_id"]) == (
-        "/Users/osteele/builds/offload/bin",
-        "a" * 64,
+
+    build_id = worker_build.ssh_build_id(
+        record["request"]["offload_sha256"], record["request"]["execution_sha256"]
     )
+    root = tmp_path / "home/.local/share/agent-offload/builds" / build_id
+    assert record["build_id"] == build_id
+    assert record["bin_dir"] == str(root / "bin")
+    assert (root / "BUILD_ID").read_text().strip() == build_id
+    assert not marker.exists()
 
 
 @pytest.mark.usefixtures("agent_host_sync_provider")
 @pytest.mark.parametrize("side", ["agent-offload", "agent-execution"])
-def test_ensure_worker_refuses_a_build_that_is_not_the_pinned_version(monkeypatch, side):
+def test_host_sync_config_still_refuses_a_pin_the_install_cannot_satisfy(
+    tmp_path, monkeypatch, side
+):
+    marker = host_sync_fixture_environment(tmp_path, monkeypatch)
     record = peer_record()
-    answer = ensure_answer(record)
-    identity = answer["builds"][1]["identity"]
     if side == "agent-offload":
-        identity["source_sha256"] = "0" * 64
+        record["request"]["offload_sha256"] = "0" * 64
     else:
-        identity["execution"]["source_sha256"] = "0" * 64
-    monkeypatch.setattr(worker_build, "run_provider", answering(answer)[1])
-    with pytest.raises(TaskError, match=f"remote {side} identity differs"):
+        record["request"]["execution_sha256"] = "0" * 64
+
+    with pytest.raises(worker_build.PinnedBuildUnavailable) as refused:
         REAL_ENSURE_WORKER(record)
-    assert "bin_dir" not in record
+
+    message = str(refused.value)
+    assert f"installed {side} changed" in message
+    assert "task pinned 000000000000" in message
+    assert "submit a new task for the same brief" in message
+    # Nothing was built and nothing was delegated: the refusal precedes any
+    # host effect, and the record keeps no build to half-trust.
+    assert "bin_dir" not in record and "build_id" not in record
+    assert not (tmp_path / "home/.local/share/agent-offload").exists()
+    assert not marker.exists()
 
 
-@pytest.mark.usefixtures("agent_host_sync_provider")
-@pytest.mark.parametrize(
-    "answer",
-    [
-        "{",
-        json.dumps({"schema": "other", "builds": []}),
-        json.dumps({"schema": "agent-host-sync.ensure/v1", "builds": []}),
-        json.dumps(
-            {
-                "schema": "agent-host-sync.ensure/v1",
-                "builds": [{"tool": "agent-offload", "build_id": "a" * 64, "bin_dir": "relative"}],
-            }
-        ),
-    ],
-)
-def test_ensure_worker_refuses_malformed_answers(monkeypatch, answer):
-    record = peer_record()
-    monkeypatch.setattr(worker_build, "run_provider", answering(answer)[1])
-    with pytest.raises(TaskError, match="ensure"):
-        REAL_ENSURE_WORKER(record)
-    assert "bin_dir" not in record
-
-
-def test_provider_failure_carries_the_reason():
-    with pytest.raises(TaskError, match="ensure failed: .*uv resolution error"):
+def test_provider_failure_preserves_remote_failure_detail():
+    with pytest.raises(TaskError) as failure:
         worker_build.run_provider(
             ["sh", "-c", "echo 'build failed: uv resolution error' >&2; exit 1"],
             timeout=30,
-            failure="agent-host-sync ensure failed",
+            failure="worker provisioning on agent@box failed",
         )
+    assert "build failed: uv resolution error" in str(failure.value)
 
 
 def test_submit_launches_the_pinned_build_by_absolute_path(tmp_path, monkeypatch):
@@ -1850,3 +1808,279 @@ def test_cancel_binds_a_fenced_receipt_then_disposes_the_job(
     assert repeated.value.code == 0
     assert read_record("slow") == bound
     assert [step for step in weft_calls(calls) if step in side_effects] == disposed
+
+
+# ---------------------------------------------------------------------------
+# Submission-stage and custody diagnostics (consumer-visible)
+# ---------------------------------------------------------------------------
+
+
+def minimal_record(identity: str) -> dict:
+    """A record shaped like one an older release wrote: no new fields."""
+    return {
+        "schema_version": "agent-offload.task/v1",
+        "id": identity,
+        "project": "/project",
+        "host": "studio",
+        "title": identity,
+        "created_at": 1.0,
+        "status": "submitting",
+        "submission_started": False,
+        "job_id": None,
+    }
+
+
+def status_row(identity: str, capsys) -> dict:
+    from agent_offload import cli
+
+    with pytest.raises(SystemExit) as shown:
+        cli.main(["task", "status", identity])
+    assert shown.value.code == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_the_durable_stage_is_visible_while_provisioning_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    fake_weft_submission(tmp_path, monkeypatch, runs=["queued"], lookup="fail")
+    observed = {}
+
+    def slow_provision(record):
+        # Whatever a crash here left on disk is what consumers must see.
+        retained = read_record(record["id"])
+        observed["record"] = retained
+        observed["view"] = tasks.summary(retained)["submission"]
+        record["bin_dir"], record["build_id"] = PINNED_BIN, PINNED_BUILD
+
+    monkeypatch.setattr(tasks, "ensure_worker", slow_provision)
+    submit_slow(tmp_path)
+
+    assert observed["record"]["provisioning"] == "in_progress"
+    view = observed["view"]
+    assert (view["stage"], view["provisioning"]) == ("provisioning_in_progress", "in_progress")
+    assert view["submission_started"] is False
+    assert view["job_id"] is None
+
+    view = tasks.summary(read_record("slow"))["submission"]
+    assert (view["stage"], view["provisioning"]) == ("accepted", "ready")
+    assert (view["job_id"], view["build_id"]) == ("wj77", PINNED_BUILD)
+    assert view["submission_started"] is True
+
+
+def test_a_provisioning_failure_keeps_the_identity_and_resume_retries_it(
+    tmp_path, monkeypatch, capsys
+):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["queued"], lookup="fail")
+
+    def unreachable(record):
+        raise TaskError("ssh: host unreachable")
+
+    monkeypatch.setattr(tasks, "ensure_worker", unreachable)
+    with pytest.raises(TaskError) as failed:
+        submit_slow(tmp_path)
+
+    message = str(failed.value)
+    assert "task slow" in message and "ssh: host unreachable" in message
+    assert "agent-offload task resume slow" in message
+    assert not calls.exists()
+
+    row = status_row("slow", capsys)
+    view = row["submission"]
+    assert (view["stage"], view["provisioning"]) == ("provisioning_failed", "failed")
+    assert view["provisioning_error"] == "ssh: host unreachable"
+    assert view["job_id"] is None and view["submission_started"] is False
+
+    def pinned(record):
+        record["bin_dir"], record["build_id"] = PINNED_BIN, PINNED_BUILD
+
+    monkeypatch.setattr(tasks, "ensure_worker", pinned)
+    with pytest.raises(SystemExit) as resumed:
+        cli.main(["task", "resume", "slow"])
+    assert resumed.value.code == 0
+    row = json.loads(capsys.readouterr().out)
+    assert (row["status"], row["job_id"]) == ("queued", "wj77")
+    view = row["submission"]
+    assert (view["stage"], view["provisioning"]) == ("accepted", "ready")
+    assert "provisioning_error" not in view
+
+
+def test_a_pin_the_install_cannot_satisfy_refuses_without_resume_guidance(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["queued"], lookup="fail")
+
+    def unavailable(record):
+        raise worker_build.PinnedBuildUnavailable(
+            "the installed agent-offload changed since this task was recorded; "
+            "submit a new task for the same brief"
+        )
+
+    monkeypatch.setattr(tasks, "ensure_worker", unavailable)
+    with pytest.raises(TaskError) as failed:
+        submit_slow(tmp_path)
+
+    message = str(failed.value)
+    assert "task slow" in message
+    assert "submit a new task for the same brief" in message
+    # Resuming cannot rebuild bytes this install no longer has: no such advice.
+    assert "resume with:" not in message
+    assert not calls.exists()
+
+    view = tasks.summary(read_record("slow"))["submission"]
+    assert (view["stage"], view["provisioning"]) == ("provisioning_failed", "failed")
+    assert "changed since this task was recorded" in view["provisioning_error"]
+
+
+def test_an_admission_refusal_leaves_the_worker_ready_stage_with_retained_error(
+    tmp_path, monkeypatch, capsys
+):
+    from agent_offload import cli
+    from agent_offload.readiness import require_writer
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(tasks, "require_writer", require_writer)
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["queued"], lookup="absent")
+    observe, _ = fake_writer_readiness(tmp_path, monkeypatch)
+    observe(credential_available=False, detail="No execution-eligible OMP credentials")
+
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+
+    assert not calls.exists()
+    row = status_row("slow", capsys)
+    view = row["submission"]
+    assert (view["stage"], view["provisioning"]) == ("worker_ready", "ready")
+    assert view["job_id"] is None and view["submission_started"] is False
+    assert "No execution-eligible OMP credentials" in row["error"]
+
+    observe()
+    with pytest.raises(SystemExit) as resumed:
+        cli.main(["task", "resume", "slow"])
+    assert resumed.value.code == 0
+    row = json.loads(capsys.readouterr().out)
+    assert (row["status"], row["job_id"]) == ("queued", "wj77")
+    assert row["submission"]["stage"] == "accepted"
+    assert row["error"] is None
+
+
+def test_an_ambiguous_send_reads_possibly_accepted_until_resolved(tmp_path, monkeypatch, capsys):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    fake_weft_submission(tmp_path, monkeypatch, runs=["unresolved"], lookup="fail")
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+
+    view = status_row("slow", capsys)["submission"]
+    assert view["stage"] == "submission_possibly_accepted"
+    assert view["submission_started"] is True
+    assert view["job_id"] is None  # a null identity is never proof of refusal
+
+    # Weft's final no-job fence closes the attempt, and the closure says why.
+    (tmp_path / "fence.json").write_text(fence_answer(True))
+    with pytest.raises(SystemExit) as closed:
+        cli.main(["task", "cancel", "slow"])
+    assert closed.value.code == 0
+    view = json.loads(capsys.readouterr().out)["submission"]
+    assert view["stage"] == "cancelled_no_job"
+    assert view["cancelled_because"] == "weft_reported_no_job"
+    assert read_record("slow")["cancelled_without_job"] == "weft_reported_no_job"
+
+
+def test_receipt_recovery_turns_a_possible_acceptance_into_an_accepted_identity(
+    tmp_path, monkeypatch, capsys
+):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["unresolved"], lookup="found")
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+    assert tasks.summary(read_record("slow"))["submission"]["stage"] == (
+        "submission_possibly_accepted"
+    )
+
+    # Reconciliation precedes provisioning, so the accepted job binds even
+    # though a real provisioning call would fail under this restore.
+    monkeypatch.setattr(tasks, "ensure_worker", REAL_ENSURE_WORKER)
+    with pytest.raises(SystemExit) as recovered:
+        cli.main(["task", "resume", "slow"])
+    assert recovered.value.code == 0
+    row = json.loads(capsys.readouterr().out)
+    assert (row["status"], row["job_id"]) == ("queued", "wj77")
+    assert row["submission"]["stage"] == "accepted"
+    assert weft_calls(calls) == ["run -C", "job lookup"]
+
+
+def test_a_never_submitted_task_cancels_with_a_proven_never_submitted_stage(
+    tmp_path, monkeypatch, capsys
+):
+    from agent_offload.readiness import require_writer
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(tasks, "require_writer", require_writer)
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["queued"], lookup="absent")
+    observe, _ = fake_writer_readiness(tmp_path, monkeypatch)
+    observe(model_available=False, detail="Exact model absent")
+    with pytest.raises(TaskError):
+        submit_slow(tmp_path)
+
+    from agent_offload import cli
+
+    with pytest.raises(SystemExit) as closed:
+        cli.main(["task", "cancel", "slow"])
+    assert closed.value.code == 0
+
+    row = json.loads(capsys.readouterr().out)
+    view = row["submission"]
+    assert view["stage"] == "cancelled_no_job"
+    assert view["cancelled_because"] == "never_submitted"
+    assert view["job_id"] is None and view["submission_started"] is False
+    assert read_record("slow")["cancelled_without_job"] == "never_submitted"
+    assert not calls.exists()
+    # The identity stays closed; resume cannot resurrect it.
+    with pytest.raises(SystemExit) as resurrected:
+        cli.main(["task", "resume", "slow"])
+    assert resurrected.value.code == 1
+    assert read_record("slow")["status"] == "cancelled"
+
+
+def test_legacy_records_report_unknown_instead_of_invented_stages(tmp_path, monkeypatch, capsys):
+    from agent_offload import cli
+
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    with locked("old-unprovisioned") as directory:
+        tasks.save(directory / "task.json", minimal_record("old-unprovisioned"))
+    with locked("old-pinned") as directory:
+        record = minimal_record("old-pinned")
+        record.update(bin_dir=PINNED_BIN, build_id=PINNED_BUILD)
+        tasks.save(directory / "task.json", record)
+    with locked("old-cancelled") as directory:
+        # A jobless closure whose proof the record does not carry.
+        record = minimal_record("old-cancelled")
+        record.update(status="cancelled")
+        record.pop("submission_started")
+        tasks.save(directory / "task.json", record)
+
+    unprovisioned = status_row("old-unprovisioned", capsys)["submission"]
+    # Nothing proves where this submission stopped, so nothing claims to.
+    assert unprovisioned["stage"] == "unknown"
+    assert unprovisioned["provisioning"] == "unknown"
+    assert unprovisioned["submission_started"] is False
+
+    pinned = status_row("old-pinned", capsys)["submission"]
+    # A retained build identity proves provisioning without the field.
+    assert (pinned["stage"], pinned["provisioning"]) == ("worker_ready", "ready")
+    assert pinned["build_id"] == PINNED_BUILD
+
+    cancelled = status_row("old-cancelled", capsys)["submission"]
+    assert cancelled["stage"] == "unknown"
+    assert "cancelled_because" not in cancelled
+
+    with pytest.raises(SystemExit) as listed:
+        cli.main(["task", "list"])
+    assert listed.value.code == 0
+    rows = {row["id"]: row for row in json.loads(capsys.readouterr().out)["tasks"]}
+    assert rows["old-pinned"]["submission"]["stage"] == "worker_ready"
+    assert rows["old-unprovisioned"]["submission"]["stage"] == "unknown"

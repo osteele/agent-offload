@@ -357,6 +357,37 @@ def test_resume_disposes_the_dead_attempt_before_resubmitting(task_factory, weft
     # unacknowledged, so its own disposition can still be owed.
     assert "processed_at" not in retained
     assert retained["attempt"] == 2
+    # The retained identity is accepted again, under the new attempt's stages.
+    view = tasks.summary(retained)["submission"]
+    assert (view["stage"], view["provisioning"]) == ("accepted", "ready")
+    assert (view["job_id"], view["submission_started"]) == ("wj-next", True)
+
+
+def test_a_refused_retry_provisioning_keeps_the_dead_attempt_and_its_stage(
+    task_factory, weft, monkeypatch, capsys
+):
+    record, _ = task_factory("retry-provision")
+    abandon(weft, record)
+
+    def unreachable(pinned):
+        raise TaskError("ssh: host unreachable")
+
+    monkeypatch.setattr(tasks, "ensure_worker", unreachable)
+    assert task("resume", record["id"]) == 1
+
+    error = capsys.readouterr().err
+    assert "task retry-provision (retry)" in error
+    assert "ssh: host unreachable" in error
+    assert "agent-offload task resume retry-provision" in error
+    retained = tasks.read_record(record["id"])
+    view = tasks.summary(retained)["submission"]
+    assert (view["stage"], view["provisioning"]) == ("provisioning_failed", "failed")
+    assert view["provisioning_error"] == "ssh: host unreachable"
+    # The dead attempt is untouched: no acknowledgment, no rotation, no send.
+    assert retained["job_id"] == record["job_id"]
+    assert "attempt" not in retained
+    assert not any(call[0] == "run" for call in weft.calls)
+    assert weft.processed == set()
 
 
 def test_a_refused_disposition_keeps_the_dead_identity_and_submits_nothing(

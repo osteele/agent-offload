@@ -90,7 +90,8 @@ Other subcommands are `list`, `retrieve`, `resume`, `continue`, `cancel`, and
   cannot be applied.
 - `task apply` checks the result against the files the task started from and
   refuses to overwrite local changes. It keeps a backup and does not commit.
-- `task continue` starts a new task from the edits a failed task left behind.
+- `task continue` starts a new task from a failed task's retained edits, carries failed-check output as quoted untrusted diagnostic data, and accepts `--selector` to choose another admitted writer.
+- `task retrieve` includes an advisory destructive-change summary. `task diff` keeps stdout as a patch and prints review warnings to stderr.
 - `task resume` recovers an interrupted submission without creating a second
   job.
 
