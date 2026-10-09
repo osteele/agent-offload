@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from conftest import PINNED_BIN, PINNED_BUILD, REAL_ENSURE_WORKER
+from test_task_outcomes import task_factory as parent_task_factory
 
 from agent_offload import tasks, worker_build
 from agent_offload.task_protocol import (
@@ -19,6 +20,8 @@ from agent_offload.task_protocol import (
     validate_changes,
 )
 from agent_offload.tasks import apply_changes, locked, read_record, submit, task_title
+
+task_factory = parent_task_factory
 
 
 @pytest.mark.parametrize(
@@ -533,6 +536,29 @@ def test_submit_is_unresolved_when_the_lookup_after_a_timeout_is_not_an_answer(
     assert weft_calls(calls) == ["run -C", "job lookup"]
 
 
+def test_resend_under_one_idempotency_key_carries_identical_attributes(tmp_path, monkeypatch):
+    # Attributes are fixed at submission from the retained record and request,
+    # so the resend under the same key repeats the first run's values exactly.
+    monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
+    calls = fake_weft_submission(tmp_path, monkeypatch, runs=["hang", "queued"], lookup="absent")
+
+    submit_slow(tmp_path)
+
+    runs = [line.split() for line in calls.read_text().splitlines() if line.startswith("run ")]
+    assert len(runs) == 2
+    attributes = [[value for flag, value in pairwise(argv) if flag == "--attr"] for argv in runs]
+    assert (
+        attributes[0]
+        == attributes[1]
+        == [
+            "client=agent-offload",
+            "kind=task",
+            "task=slow",
+            "selector=openai-codex/gpt-6-astra",
+        ]
+    )
+
+
 def test_baseline_requires_weft_source_exclusions(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
     project = tmp_path / "project"
@@ -581,8 +607,38 @@ def test_submission_uses_repository_project_and_clean_title(tmp_path, monkeypatc
     pairs = list(pairwise(argv))
     assert ("--tag", "inventory") in pairs
     assert ("--tag", "agent-offload-task") in pairs
+    assert [value for flag, value in pairs if flag == "--attr"] == [
+        "client=agent-offload",
+        "kind=task",
+        "task=readable",
+        "selector=openai-codex/gpt-6-astra",
+    ]
     assert argv[argv.index("-m") + 1] == "Fix hello"
     assert read_record("readable")["title"] == "Fix hello"
+
+
+def test_continuation_submission_carries_the_parent_attribute(
+    task_factory, tmp_path, monkeypatch, capsys
+):
+    from test_task_continuation import continue_args, ordinary_names
+
+    # The child's submission labels its parent, again derived only from the
+    # retained request; rg is absent here, so the census lists files directly.
+    monkeypatch.setattr(tasks, "snapshot_names", ordinary_names)
+    task_factory("attr-parent", "validation_failed")
+
+    assert tasks.handler(continue_args("attr-parent", id="attr-child")) == 0
+    capsys.readouterr()
+
+    runs = [json.loads(line) for line in (tmp_path / "weft-calls").read_text().splitlines()]
+    run = next(call for call in runs if call[0] == "run")
+    assert [value for flag, value in pairwise(run) if flag == "--attr"] == [
+        "client=agent-offload",
+        "kind=task",
+        "task=attr-child",
+        "selector=openai-codex/gpt-6-astra",
+        "continues=attr-parent",
+    ]
 
 
 def test_submission_timeout_retains_identity_and_request(tmp_path, monkeypatch):

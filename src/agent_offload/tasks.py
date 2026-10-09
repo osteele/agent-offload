@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -622,6 +623,39 @@ def wall_time(request: dict) -> str:
     return f"{math.ceil(budget['max_seconds']) + 1020}s"
 
 
+def weft_attributes(record: dict) -> list[str]:
+    """The opaque `--attr` key/value pairs submitted with the task's Weft job.
+
+    Weft stores, filters, and emits these attributes but never interprets
+    them; people and display layers tell agent-offload jobs apart with them.
+    They are fixed at submission and derived only from the retained record
+    and request -- never from the clock or the environment -- so every resend
+    under the same idempotency key carries identical values. Values must fit
+    Weft's limits (1-256 UTF-8 bytes, no control characters); task ids and
+    selectors satisfy them in practice, so a violation means corrupt custody
+    and is raised before submission rather than truncated.
+    """
+    request = record["request"]
+    attributes = [
+        ("client", "agent-offload"),
+        ("kind", "task"),
+        ("task", record["id"]),
+        ("selector", request["selector"]),
+    ]
+    if "continuation" in request:
+        attributes.append(("continues", request["continuation"]["parent_id"]))
+    for key, value in attributes:
+        encoded = value.encode("utf-8")
+        if not 1 <= len(encoded) <= 256 or any(
+            unicodedata.category(character) == "Cc" for character in value
+        ):
+            raise TaskError(
+                f"attribute {key}={value!r} does not fit Weft's value limits; the retained "
+                "task is corrupt; inspect it or submit a new task identity"
+            )
+    return [part for key, value in attributes for part in ("--attr", f"{key}={value}")]
+
+
 def send(record: dict, directory: Path) -> dict:
     from .cli import WeftReceipt
 
@@ -701,6 +735,7 @@ def send(record: dict, directory: Path) -> dict:
         "inventory",
         "--tag",
         "agent-offload-task",
+        *weft_attributes(record),
         "--idempotency-key",
         idempotency_key(record),
         "--output",
