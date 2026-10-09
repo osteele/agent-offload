@@ -20,7 +20,50 @@ weft status --wait JOB_ID
 
 The brief's first line becomes the job's description in Weft and in Weft Status, so write it as a short plain summary of the task. Task jobs are listed under the target repository's project name and carry the `agent-offload-task` tag.
 
-Save the returned task and Weft job identities. A local timeout does not cancel the task. An ambiguous submission retains its identity; use `agent-offload task resume TASK_ID` to retry with the same idempotency key. Do not resubmit with a new identity. A task whose job failed before publishing a result reports `failed_without_result` with the job log tail; fix the cause and run `task resume`, which retries the retained request as a new attempt of the same task. Submit automatically provisions the exact remote worker build before queueing, and resume provisions it again before resending, so a host update is not a manual step. If the mismatch remains, a build changed under the queued job and resume repairs it. This machine's config selects the `agent-host-sync` worker provider, which builds from the checkouts that tool deploys, so a mismatch between this machine's installed agent-offload and those checkouts requires reinstalling locally (`just install` in the agent-offload checkout) or committing/reverting checkout edits, then submitting again.
+Save the returned task and Weft job identities. A local timeout does not cancel the task. An ambiguous submission retains its identity; use `agent-offload task resume TASK_ID` with the same idempotency key. Do not submit a duplicate. A task whose job failed before publishing a result reports `failed_without_result` with the job log tail; fix the cause and resume the retained task. Submit and resume provision the requested worker before sending a new job; accepted jobs are reconciled first.
+
+### Provision workers independently of development checkouts
+
+Use installed-package provisioning for ordinary coding tasks. In
+`~/.config/agent-offload/config.toml`:
+
+```toml
+[tasks]
+host = "studio"
+account = "agent"
+
+[worker]
+provider = "ssh"
+```
+
+The `ssh` provider copies the installed Offload and bundled Execution packages
+into a content-addressed remote build and verifies their requested digests.
+Another session may edit either tool's checkout without blocking dispatch.
+The target project's working tree is snapshotted separately; a clean commit is
+not required. Apply still refuses conflicting local edits.
+
+The optional `agent-host-sync` provider builds from shared tool-source checkouts.
+Keep it for work that deliberately provisions those sources. An identity
+mismatch means its build differs from the installed packages the task pinned;
+it does not prove which checkout is dirty. Preserve the identity check.
+Never stash, revert, adopt, commit, or install another session's in-flight work
+to unblock a coding dispatch.
+
+For a retained pre-send task, select `provider = "ssh"` and run
+`agent-offload task resume TASK_ID` if the installed package pins and project
+baseline are unchanged. `AGENT_OFFLOAD_CONFIG=/absolute/path/to/config.toml`
+selects a per-command configuration when a shared default should stay intact.
+Resume retains the request identity and reconciles any accepted job before
+sending. If the installed release changed, or the task is abandoned, inspect
+and explicitly cancel the retained task before submitting a replacement.
+Never treat a missing job id alone as proof that nothing was submitted.
+
+Named build/test workspaces isolate project execution and sibling dependencies.
+They do not change how Offload provisions its own worker. Do not replace the
+durable task lane with an ad hoc workspace writer merely to bypass a
+tool-checkout mismatch.
+
+### Select a writer and check admission
 
 The default coding writer is `openai-codex/gpt-6-luna` through OMP. Interactive user-facing Codex sessions use `openai-codex/gpt-6-astra`. `--selector` overrides the writer with any of Agent Execution's registered writers; `agent-offload task selectors --json` lists them for this installation. This is the admitted local roster, not a claim that a writer is available remotely. Submit and resume obtain fresh exact-subject Execution-owned observations on the provisioned remote build before creating a new Weft job; a retained accepted job is reconciled before probing. The agent uses `workspace-write-no-shell`: it edits the disposable snapshot but cannot execute shell commands. The optional `--check` runs separately afterward, with arguments parsed as shell quoting and no shell expansion. A failing check prevents application. Without a check, `validation` is null.
 
