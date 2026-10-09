@@ -54,6 +54,10 @@ def test_worker_census_failure_is_retrievable(tmp_path, monkeypatch):
     request.update(
         schema_version=SCHEMA,
         id="census-failure",
+        brief="Edit hello.py",
+        selector="openai-codex/gpt-6-luna",
+        check=[],
+        timeout=30,
         execution_sha256=source_sha256(),
         offload_sha256=package_source_sha256(),
     )

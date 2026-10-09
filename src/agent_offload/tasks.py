@@ -27,6 +27,7 @@ from agent_execution.identity import source_sha256
 from agent_execution.omp_execution import OMP_WRITER_SELECTORS, validate_omp_transcript
 from agent_execution.worker import WORKER_PROTOCOL_VERSION, WorkerResult
 
+from .budget import APPROVED_BUDGET, budget_choice, validate_budget
 from .config import load_config, require_task_host, task_account
 from .protocol import package_source_sha256
 from .readiness import require_writer
@@ -161,11 +162,62 @@ def task_title(brief: str) -> str:
     return (title or first or "Untitled task")[:160]
 
 
-def check_timeout(timeout: float) -> float:
+def check_timeout(timeout: object) -> float:
     """Accept only the explicit bounded execution budget every task dispatches with."""
-    if not math.isfinite(timeout) or not 1 <= timeout <= 7200:
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
         raise TaskError(f"timeout {timeout!r} is outside the permitted range (1-7200 seconds)")
-    return timeout
+    try:
+        seconds = float(timeout)
+    except OverflowError:
+        seconds = math.inf
+    if not math.isfinite(seconds) or not 1 <= seconds <= 7200:
+        raise TaskError(f"timeout {timeout!r} is outside the permitted range (1-7200 seconds)")
+    return seconds
+
+
+def explicit_time_choice(
+    timeout: float | None, budget_initial: float | None, budget_cap: float | None
+) -> tuple[float | None, dict | None]:
+    """Resolve the CLI's single explicit time choice into (timeout, budget policy).
+
+    The two choices are exclusive: `timeout` is the fixed hard writer limit a
+    request keeps forever, `budget_initial` selects the renewable policy whose
+    initial amount the request records as its timeout, and an explicit cap
+    belongs to the renewable choice alone -- a fixed limit cannot grow.
+    """
+    if budget_initial is not None:
+        if timeout is not None:
+            raise TaskError("--timeout and --budget-initial are mutually exclusive")
+        return budget_initial, budget_choice(budget_initial, budget_cap)
+    if budget_cap is not None:
+        raise TaskError(
+            "--budget-cap requires --budget-initial; a fixed --timeout is a hard "
+            "limit that never grows"
+        )
+    return timeout, None
+
+
+def submit_time_choice(
+    timeout: float | None, budget_initial: float | None, budget_cap: float | None
+) -> tuple[float, dict | None]:
+    """A fresh submit with no time flags chooses the approved renewable policy.
+
+    An explicit `--timeout` keeps its documented fixed meaning unchanged.
+    """
+    if timeout is None and budget_initial is None and budget_cap is None:
+        return APPROVED_BUDGET["initial_seconds"], dict(APPROVED_BUDGET)
+    resolved, budget = explicit_time_choice(timeout, budget_initial, budget_cap)
+    assert resolved is not None  # every other combination above refuses or resolves
+    return resolved, budget
+
+
+def continue_time_choice(
+    timeout: float | None, budget_initial: float | None, budget_cap: float | None
+) -> tuple[float, dict | None]:
+    """A continuation still needs the caller's explicit fresh time choice."""
+    if timeout is None and budget_initial is None:
+        raise TaskError("a continuation requires an explicit --timeout or --budget-initial")
+    return explicit_time_choice(timeout, budget_initial, budget_cap)
 
 
 def submit(
@@ -178,6 +230,7 @@ def submit(
     check: list[str],
     account: str = "agent",
     identity: str | None = None,
+    budget: dict | None = None,
 ) -> dict:
 
     identity = task_id(identity or uuid.uuid4().hex)
@@ -188,6 +241,11 @@ def submit(
         permitted = ", ".join(sorted(OMP_WRITER_SELECTORS))
         raise TaskError(f"writer selector {selector!r} is not admitted; permitted: {permitted}")
     check_timeout(timeout)
+    if budget is not None:
+        # The complete renewable policy is validated before anything is
+        # persisted, censused, provisioned, or sent: shape, numeric bounds,
+        # timeout consistency, and Execution's own typed policy invariants.
+        budget = validate_budget(budget, timeout=timeout)
     # The writer cannot execute anything (workspace-write-no-shell), so only a
     # supplied check builds remotely and only it can hit the missing dependency.
     stale = escaping_path_dependencies(project) if check else []
@@ -205,6 +263,10 @@ def submit(
     # The immutable build returned by ensure_worker must match both bundled
     # package digests. A separate execution worker on PATH does not run this task.
     editable, carried = split_carried(project, snapshot_names(project))
+    # The retained timeout has one of two documented meanings: a budgeted
+    # request's renewable initial amount, or -- when no budget is present --
+    # the writer's fixed hard limit. Requests stored without a budget keep
+    # that fixed meaning across upgrades.
     request = {
         "schema_version": SCHEMA,
         "id": identity,
@@ -219,6 +281,8 @@ def submit(
         "execution_sha256": source_sha256(),
         "offload_sha256": package_source_sha256(),
     }
+    if budget is not None:
+        request["budget"] = budget
     return dispatch(identity, project, request, host=host, account=account, title=task_title(brief))
 
 
@@ -544,6 +608,20 @@ def oversized_content(path: Path, snapshot_name: str, excluded) -> list[str]:
     return found
 
 
+def wall_time(request: dict) -> str:
+    """The outer Weft budget for one task attempt.
+
+    A fixed request keeps its documented `int(timeout) + 1020` seconds. A
+    renewable request's outer budget must cover its whole finite cap -- never
+    the initial amount alone -- or Weft would kill the attempt before any
+    extension could be used.
+    """
+    budget = request.get("budget")
+    if budget is None:
+        return f"{int(request['timeout']) + 1020}s"
+    return f"{math.ceil(budget['max_seconds']) + 1020}s"
+
+
 def send(record: dict, directory: Path) -> dict:
     from .cli import WeftReceipt
 
@@ -632,7 +710,7 @@ def send(record: dict, directory: Path) -> dict:
         "--payload",
         f"coding-task={payload}",
         "--wall-time",
-        f"{int(record['request']['timeout']) + 1020}s",
+        wall_time(record["request"]),
         "--no-sync",
         "--json",
         "-m",
@@ -990,6 +1068,7 @@ def continue_task(
     supplement: str | None = None,
     identity: str | None = None,
     selector: str | None = None,
+    budget: dict | None = None,
 ) -> dict:
     """Continue a failed task from its retained partial edits as a fresh child task.
 
@@ -998,7 +1077,10 @@ def continue_task(
     stays eligible. The child is an ordinary durable task pinned to the
     current build; the parent's validated changes are seeded into the child's
     disposable remote snapshot, never applied to the local project. This is a
-    fresh execution, not a session resume, force-apply, or budget extension.
+    fresh execution, not a session resume, force-apply, or budget extension:
+    the child's time choice is fresh and explicit -- a fixed `--timeout`, or
+    `--budget-initial` with an optional `--budget-cap` -- and never inherits
+    the parent's budget or its exhaustion.
     """
     parent = read_record(parent_identity)
     request = parent["request"]
@@ -1038,6 +1120,10 @@ def continue_task(
             "continue an earlier ancestor with retained edits, or submit a fresh task"
         )
     check_timeout(timeout)
+    if budget is not None:
+        # The child's own fresh policy, validated exactly like a submitted
+        # one; the exhausted parent's budget decisions are never inherited.
+        budget = validate_budget(budget, timeout=timeout)
     selected = request["selector"] if selector is None else selector
     if selected not in OMP_WRITER_SELECTORS:
         permitted = ", ".join(sorted(OMP_WRITER_SELECTORS))
@@ -1088,6 +1174,8 @@ def continue_task(
         },
         "seed": seed,
     }
+    if budget is not None:
+        child_request["budget"] = budget
     # dispatch persists the complete child custody before any remote side
     # effect, so an interrupted or ambiguous send recovers through
     # `task resume CHILD` and can never cause duplicate jobs.
@@ -1411,12 +1499,20 @@ def handler(args: argparse.Namespace) -> int:
         elif args.action == "submit":
             brief = args.prompt if args.prompt is not None else args.brief.read_text()
             config = load_config()
+            # Parser defaults and older Namespaces may omit the budget fields
+            # entirely; the handler boundary resolves the explicit choice.
+            timeout, budget = submit_time_choice(
+                getattr(args, "timeout", None),
+                getattr(args, "budget_initial", None),
+                getattr(args, "budget_cap", None),
+            )
             value = submit(
                 args.project,
                 brief,
                 host=require_task_host(args.host, config),
                 selector=args.selector,
-                timeout=args.timeout,
+                timeout=timeout,
+                budget=budget,
                 check=shlex.split(args.check or ""),
                 account=task_account(args.account, config),
                 identity=args.id,
@@ -1452,9 +1548,15 @@ def handler(args: argparse.Namespace) -> int:
             supplement = args.prompt
             if supplement is None and args.brief is not None:
                 supplement = args.brief.read_text()
+            timeout, budget = continue_time_choice(
+                args.timeout,
+                getattr(args, "budget_initial", None),
+                getattr(args, "budget_cap", None),
+            )
             value = continue_task(
                 args.parent,
-                timeout=args.timeout,
+                timeout=timeout,
+                budget=budget,
                 supplement=supplement,
                 identity=args.id,
                 selector=getattr(args, "selector", None),
@@ -1566,7 +1668,31 @@ def build_task_parser(subparsers) -> None:
     submit_parser.add_argument(
         "--selector", choices=sorted(OMP_WRITER_SELECTORS), default=DEFAULT_SELECTOR
     )
-    submit_parser.add_argument("--timeout", type=float, default=1800)
+    time_limit = submit_parser.add_mutually_exclusive_group()
+    time_limit.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="fixed hard writer limit in seconds (1-7200); the attempt never renews",
+    )
+    time_limit.add_argument(
+        "--budget-initial",
+        type=float,
+        default=None,
+        help=(
+            "renewable initial budget in seconds (1-7200); fixed 1800s extensions on "
+            "a 900s progress window, capped by --budget-cap"
+        ),
+    )
+    submit_parser.add_argument(
+        "--budget-cap",
+        type=float,
+        default=None,
+        help=(
+            "absolute renewable cap in seconds; finite, at most 14400 "
+            "(default: 14400); requires --budget-initial"
+        ),
+    )
     submit_parser.add_argument("--check", help="validation argv, shell-quoted; no shell expansion")
     submit_parser.add_argument("--id", help="caller-generated idempotency identity")
     submit_parser.set_defaults(handler=handler)
@@ -1577,7 +1703,31 @@ def build_task_parser(subparsers) -> None:
     supplement = continue_parser.add_mutually_exclusive_group()
     supplement.add_argument("--brief", type=Path)
     supplement.add_argument("--prompt")
-    continue_parser.add_argument("--timeout", type=float, required=True)
+    continue_time = continue_parser.add_mutually_exclusive_group(required=True)
+    continue_time.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="fixed hard writer limit in seconds (1-7200); the attempt never renews",
+    )
+    continue_time.add_argument(
+        "--budget-initial",
+        type=float,
+        default=None,
+        help=(
+            "renewable initial budget in seconds (1-7200); fixed 1800s extensions on "
+            "a 900s progress window, capped by --budget-cap"
+        ),
+    )
+    continue_parser.add_argument(
+        "--budget-cap",
+        type=float,
+        default=None,
+        help=(
+            "absolute renewable cap in seconds; finite, at most 14400 "
+            "(default: 14400); requires --budget-initial"
+        ),
+    )
     continue_parser.add_argument("--selector", help="override the inherited writer selector")
     continue_parser.add_argument(
         "--id", help="caller-generated idempotency identity for the child task"

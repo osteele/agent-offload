@@ -6,6 +6,7 @@
 -- Includes:
 --   Task identity, idempotency, submission, resume, cancellation
 --   Continuation of a failed task from its retained partial edits
+--   Renewable task time budgets: fixed timeout vs the approved policy
 --   Execution-owned status observations with Offload task-admission policy
 --   Task worker execution constraints, requested checks, result publication
 --   Result retrieval validation, change application, application journal
@@ -88,6 +89,29 @@ value CheckOutcome {
     stderr_tail: String
 }
 
+value RenewableBudget {
+    -- The renewable time policy persisted in an immutable request. The
+    -- extension and the progress window are fixed by the approved policy;
+    -- only the initial amount and the finite cap are caller-chosen, and a
+    -- fixed `--timeout` request carries no policy at all.
+    initial_seconds: Duration
+    extension_seconds: Duration
+    progress_window_seconds: Duration
+    max_seconds: Duration
+}
+
+value RenewableBudgetEvidence {
+    -- Execution-owned, validated, versioned telemetry for one attempt under
+    -- a renewable policy. It describes observed activity, never usefulness
+    -- or billed cost, and lives only inside the task result's worker record.
+    policy: RenewableBudget
+    duration: Duration
+    decisions: List<String>        -- each extension granted or refused, with evidence age
+    termination_reason: String
+    progress_count: Integer
+    changed_file_count: Integer    -- distinct files actually changed
+}
+
 value ApplicationBackup {
     changes: List<Change>
 }
@@ -139,6 +163,16 @@ entity Task {
     selector: String
     check: List<String>?
     timeout: Duration
+        -- A fixed request's hard writer limit, or a budgeted request's
+        -- renewable initial amount; it still bounds ordinary validation.
+    budget: RenewableBudget?
+        -- Null means timeout is the writer's fixed hard limit and renewal
+        -- never happens; present, timeout is the renewable initial amount.
+        -- The complete policy is validated before persistence and again at
+        -- worker entry: exact shape, numeric bounds, the fixed extension and
+        -- window, a finite cap within 240 minutes that accommodates the
+        -- extension, and consistency with timeout. Requests stored without
+        -- one keep their fixed meaning across upgrades.
     account: String
     baseline: BaselineManifest
     request_digest: String
@@ -199,6 +233,11 @@ entity TaskResult {
     report: String
     changes: List<Change>
     validation: CheckOutcome?
+    budget_evidence: RenewableBudgetEvidence?
+        -- Present only when the task ran under a renewable policy; parsed
+        -- and validated with the worker result at retrieval, never a
+        -- separate artifact. Describes observed activity, never usefulness
+        -- or billed cost.
 
     invariant ValidationFailureCarriesOutcome {
         status = validation_failed implies validation != null
@@ -280,8 +319,12 @@ config {
     default_worker_account: String = "agent"
 
     max_task_timeout: Duration = 120.minutes
-    default_task_timeout: Duration = 30.minutes
     check_timeout: Duration = 15.minutes
+
+    budget_initial_seconds: Duration = 60.minutes             -- approved renewable start
+    budget_extension_seconds: Duration = 30.minutes           -- fixed per-extension grant
+    budget_progress_window_seconds: Duration = 15.minutes     -- progress evidence window
+    budget_cap_seconds: Duration = 240.minutes                -- finite absolute cap
 
     max_file_bytes: Integer = 2 * 1024 * 1024                -- per returned file
     max_change_files: Integer = 10000
@@ -305,11 +348,21 @@ config {
 -- Durable task lane: submission and resume
 
 rule SubmitTask {
-    when: SubmitTask(caller, project, brief, selector, check, timeout, account?, requested_id?)
+    when: SubmitTask(caller, project, brief, selector, check, timeout, budget?, account?, requested_id?)
 
     requires: length(brief) > 0
     requires: writer_selector_admitted(selector)
     requires: timeout >= 1.second and timeout <= config.max_task_timeout
+    requires: budget = null or valid_renewable_budget(budget, timeout)
+        -- Exactly one time choice: a fixed timeout is the writer's hard
+        -- limit and never renews; a renewable budget keeps the extension and
+        -- window at the approved fixed values, bounds the initial by
+        -- 1-7200s, bounds the finite cap by the 14400s ceiling with room for
+        -- the extension, and makes timeout the initial amount. A malformed
+        -- or conflicting policy -- a non-object, a boolean, NaN, infinity, a
+        -- missing or unexpected field, a bound violation, a cap without
+        -- room, or an initial that disagrees with timeout -- refuses before
+        -- anything is persisted, censused, provisioned, or sent.
     requires: check = null or path_dependencies_within_snapshot(project)
         -- A check cannot run against dependencies outside the snapshot; a
         -- project without a check is accepted regardless.
@@ -330,6 +383,9 @@ rule SubmitTask {
             selector: selector,
             check: check,
             timeout: timeout,
+            budget: budget,
+                -- Null for an explicit fixed --timeout; the approved policy
+                -- when the caller passes no time flag at all.
             account: account ?? config.default_worker_account,
             baseline: baseline_manifest(project),
             request_digest: digest_of(brief),
@@ -356,6 +412,10 @@ rule SubmitTask {
         -- up: a recorded job is accepted, and a key Weft never recorded is
         -- sent once more. A failed or malformed lookup is not evidence of
         -- absence and makes the send unresolved, as does a second failure.
+        -- The send's outer wall time covers one whole attempt: the fixed
+        -- timeout's documented seconds plus 1020, or, for a budgeted task,
+        -- the ceiling of the finite cap plus 1020 -- never the initial
+        -- amount alone, so renewal can actually use the cap it is granted.
     @guidance
         -- The task executes the agent-execution bundled inside its pinned
         -- offload build, not the separately installed worker on PATH.
@@ -483,7 +543,7 @@ rule ResumeTask {
 }
 
 rule ContinueTask {
-    when: ContinueTask(caller, parent, timeout, supplement?, requested_id?, selector_override?)
+    when: ContinueTask(caller, parent, timeout, budget?, supplement?, requested_id?, selector_override?)
 
     requires: parent.result != null and parent.result.status in {failed, validation_failed}
         -- A validated published result is the only continuation seed. A
@@ -503,6 +563,12 @@ rule ContinueTask {
         -- local file that could collide with a seeded addition, refuses
         -- before anything is submitted. Nothing is written locally.
     requires: timeout >= 1.second and timeout <= config.max_task_timeout
+    requires: budget = null or valid_renewable_budget(budget, timeout)
+        -- The child's time choice is fresh and explicit: a fixed --timeout
+        -- or an explicit renewable initial with its optional finite cap,
+        -- validated like any submitted policy. It never inherits the
+        -- parent's budget or its exhaustion, and the parent's retained
+        -- request is unchanged.
     requires: selected = selector_override ?? parent.selector
     requires: selected in OMP_WRITER_SELECTORS
         -- Validate the selected exact writer, not a retired inherited parent
@@ -522,6 +588,7 @@ rule ContinueTask {
             selector: selected,
             check: parent.check,
             timeout: timeout,
+            budget: budget,
             account: parent.account,
             baseline: parent.baseline,
             parent_task: parent,
@@ -778,6 +845,38 @@ rule WorkerPublishesValidationFailure {
         -- the captured output and a timeout diagnostic. The worker exits
         -- unsuccessfully after publishing a non-completed result, so the
         -- result remains retrievable and can never be applied.
+}
+
+rule RenewWriterBudget {
+    when: WorkerSessionStarted(task)
+
+    requires: task.budget != null
+        -- Renewal is enabled only for a budgeted request: the worker
+        -- launches with no fixed timeout and Execution's typed policy owns
+        -- the writer's process lifecycle, renewing with inline -p or stdin
+        -- delivery under the same workspace-write-no-shell policy. A fixed
+        -- --timeout request never grants an extension and never grows
+        -- toward the cap.
+    ensures: BudgetDecision(task)
+        -- At each deadline Execution grants an extension only when fresh
+        -- qualifying evidence falls inside the progress window: successful
+        -- confined writes/edits that changed files, or other restricted tools
+        -- with novel inputs that completed successfully. The final extension
+        -- is clipped to the finite cap. Repeated identical reads, failures,
+        -- and unqualified activity do not renew. The granted
+        -- and refused decisions with their evidence age, the termination
+        -- reason, progress counts, and the distinct changed-file count are
+        -- recorded inside the validated worker result of the published task
+        -- result -- the only telemetry schema, never a separate artifact and
+        -- never locally reinvented. The statistics describe observed
+        -- activity, not usefulness or billed cost. Exhaustion is terminal
+        -- for the attempt: no automatic continuation and no automatic retry.
+        -- `task continue` requires an unsuccessful terminal attempt with validated
+        -- partial edits, not a completed task. Completed work can be verified and
+        -- applied before submitting a fresh task. If the edits are unaccepted,
+        -- the caller can instead seed an isolated source copy with the validated
+        -- diff and submit that copy. `task apply` is bound to the retained original
+        -- project; it cannot target an arbitrary copy.
 }
 
 -- Durable task lane: application
@@ -1160,6 +1259,14 @@ invariant RelayProvenanceComplete {
                     -- its explanatory content with nothing served.
 }
 
+invariant RenewalOnlyUnderPersistedPolicy {
+    -- Renewal is enabled only by the request's persisted approved policy: a
+    -- fixed --timeout is a hard limit that never silently grows toward the
+    -- cap, and budget evidence exists only for a budgeted task.
+    for task in Tasks:
+        task.budget = null implies task.result?.budget_evidence = null
+}
+
 invariant HistoricalRefusalsNeverProcessed {
     for record in HistoricalJobs:
         record.status = refused implies record.processed_at = null
@@ -1182,10 +1289,10 @@ surface TaskControl {
         task.result?.validation
 
     provides:
-        SubmitTask(caller, project, brief, selector, check, timeout, account?, requested_id?)
+        SubmitTask(caller, project, brief, selector, check, timeout, budget?, account?, requested_id?)
         ObserveTask(caller, task)
         ResumeTask(caller, task)
-        ContinueTask(caller, parent, timeout, supplement?, requested_id?)
+        ContinueTask(caller, parent, timeout, budget?, supplement?, requested_id?)
         CancelTask(caller, task)
         RetrieveTaskResult(caller, task)
         ApplyTaskResult(caller, task)

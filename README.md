@@ -90,14 +90,43 @@ Other subcommands are `list`, `retrieve`, `resume`, `continue`, `cancel`, and
   cannot be applied.
 - `task apply` checks the result against the files the task started from and
   refuses to overwrite local changes. It keeps a backup and does not commit.
-- `task continue` starts a new task from a failed task's retained edits, carries failed-check output as quoted untrusted diagnostic data, and accepts `--selector` to choose another admitted writer.
+- `task continue` starts a new task from a failed task's retained edits, carries failed-check output as quoted untrusted diagnostic data, and accepts `--selector` to choose another admitted writer. It always needs a fresh explicit time choice (`--timeout`, or `--budget-initial` with an optional `--budget-cap`); it never inherits the parent's budget or its exhaustion.
 - `task retrieve` includes an advisory destructive-change summary. `task diff` keeps stdout as a patch and prints review warnings to stderr.
 - `task resume` recovers an interrupted submission without creating a second
   job.
 
 The default writer is `openai-codex/gpt-6-luna`; `--selector` chooses another
-from the list `task selectors` prints. The agent's time limit defaults to 1800
-seconds, and `--timeout` accepts up to 7200.
+from the list `task selectors` prints.
+
+A task's time is one of two explicit choices:
+
+- `--timeout SECONDS` is a fixed hard writer limit (1–7200). The attempt
+  never renews: when the limit is reached, it ends.
+- A fresh `task submit` with no time flag runs under the approved renewable
+  budget: 3600 s to start, 1800 s extensions granted while the last 900 s
+  window shows progress, and a hard cap of 14400 s (four hours).
+  `--budget-initial SECONDS` (1–7200) picks a different starting amount, and
+  `--budget-cap SECONDS` (default and maximum 14400) lowers the absolute
+  cap; it must be at least the initial amount, extension, and progress window.
+  A final extension is clipped to the cap.
+
+Renewal is not an automatic continuation. Successful confined write/edit
+operations qualify when they change files; other restricted tools qualify only
+for novel inputs that complete successfully. Repeated identical reads, failed
+operations, waiting, and otherwise unqualified activity do not renew. Reaching
+the cap terminates the attempt. Nothing retries or continues by itself.
+`task continue` requires an unsuccessful terminal attempt with validated partial
+edits, not a completed task. You can verify and apply completed work, then submit
+a fresh task. If the edits are unaccepted, instead seed an isolated source copy
+with the validated diff and submit that copy. `task apply` is bound to the
+retained original project; it cannot target an arbitrary copy.
+
+Per-attempt budget statistics (policy, elapsed time, each grant or refusal
+with the age of its evidence,
+termination reason, progress counts, and the number of distinctly changed
+files) are recorded by Execution inside the result's validated worker
+record, never as a separate artifact. They describe observed activity, not
+usefulness or billed cost.
 
 To check that a writer is reachable and admitted before submitting:
 

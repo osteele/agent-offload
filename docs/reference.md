@@ -12,9 +12,71 @@ Before queueing, submission provisions the task's worker build (see [Worker buil
 
 Every task row — from `submit`, `resume`, `status`, and `list` — also carries an additive `submission` object describing how far submission has provably got. It is derived only from the retained task record, never from live Weft or host state. `stage` is one of: `provisioning_pending` (the record is durable; nothing remote has started), `provisioning_in_progress` (a worker build was being provisioned when the record was last written), `provisioning_failed` (the last provisioning attempt failed; `provisioning_error` names why, and the diagnostic carries the task identity and its same-ID `task resume` — unless the pinned build no longer exists in the installed packages, which no resume can repair), `worker_ready` (the pinned build is recorded; writer admission and the Weft send are next), `submission_possibly_accepted` (a `weft run` was started under the attempt's idempotency key and its outcome is not yet bound; a null `job_id` is never evidence that Weft accepted nothing), `accepted` (Weft accepted a job and its identity is retained), `cancelled_no_job` (cancelled with no job; `cancelled_because` is `never_submitted` when the durable marker proves no send was attempted, or `weft_reported_no_job` when Weft's fence answered no job), or `unknown` (the record predates a needed marker, so no stage is claimed; `task resume` reconciles it). `provisioning` reports the recorded build-provisioning state: `pending`, `in_progress`, `ready`, `failed`, or `unknown` for a record written before the field existed. A recorded phase is authoritative even when a retry retains an older build identity; only legacy records without the field infer `ready` from that identity. `submission_started` is the durable marker persisted immediately before `weft run`: `false` proves no send was attempted in the current attempt, `true` means a send may have been accepted, and `null` means the record predates the marker. `build_id` and `job_id` mirror the retained build and job identities.
 
-Each task runs against a Weft source snapshot with `workspace-write-no-shell`. The retained baseline holds the files that snapshot carries: files matching the source exclusions Weft reports (`weft sync inspect --json`), such as `testdata/`, `bin/`, and `CLAUDE.md`, are left out of both. The snapshot carries only the project directory, so a `--check` run is refused when the project's `Package.swift` or `[tool.uv.sources]` path dependencies resolve outside it; without `--check` nothing builds remotely and such projects are accepted. Run the checks of such projects in a remote workspace that also holds their dependencies. The worker refuses symlinks, so submit refuses a project containing a symlink that the snapshot carries: one whose target stays inside the project and that no source exclusion drops. Weft replaces a link pointing outside the project with its target's content, so such links are accepted unless that content holds a file over the 2 MiB task file limit. The agent can read and edit project files but cannot run shell commands. `--check` supplies an optional, caller-chosen validation command executed after the agent finishes; its arguments use shell quoting without shell expansion. A failing check prevents application. Without a check, the result's `validation` field is null. The default coding writer is `openai-codex/gpt-6-luna`. Interactive user-facing Codex sessions use `openai-codex/gpt-6-astra`. `--selector` overrides the writer with any identity registered by agent-execution; `agent-offload task selectors --json` lists them with the default, under schema `agent-offload.task-selectors/v1`. The default agent timeout is 1800 seconds; `--timeout` accepts 1–7200 seconds.
+Each task runs against a Weft source snapshot with `workspace-write-no-shell`. The retained baseline holds the files that snapshot carries: files matching the source exclusions Weft reports (`weft sync inspect --json`), such as `testdata/`, `bin/`, and `CLAUDE.md`, are left out of both. The snapshot carries only the project directory, so a `--check` run is refused when the project's `Package.swift` or `[tool.uv.sources]` path dependencies resolve outside it; without `--check` nothing builds remotely and such projects are accepted. Run the checks of such projects in a remote workspace that also holds their dependencies. The worker refuses symlinks, so submit refuses a project containing a symlink that the snapshot carries: one whose target stays inside the project and that no source exclusion drops. Weft replaces a link pointing outside the project with its target's content, so such links are accepted unless that content holds a file over the 2 MiB task file limit. The agent can read and edit project files but cannot run shell commands. `--check` supplies an optional, caller-chosen validation command executed after the agent finishes; its arguments use shell quoting without shell expansion. A failing check prevents application. Without a check, the result's `validation` field is null. The default coding writer is `openai-codex/gpt-6-luna`. Interactive user-facing Codex sessions use `openai-codex/gpt-6-astra`. `--selector` overrides the writer with any identity registered by agent-execution; `agent-offload task selectors --json` lists them with the default, under schema `agent-offload.task-selectors/v1`. A task's time is one fixed `--timeout` of 1–7200 seconds or a renewable budget ([Time budgets](#time-budgets)); a fresh submission with no time flag uses the approved renewable policy.
 
 An empty project is valid: the task starts with an empty baseline and can create files. A census error still stops submission before queueing.
+
+### Time budgets
+
+Every request carries exactly one of two time choices, and the choice is
+explicit for `task continue` and defaulted for a fresh `task submit`.
+
+`--timeout SECONDS` is a fixed hard writer limit of 1–7200 seconds. The
+request then has no `budget` object, `request.timeout` is that hard limit,
+and the writer never renews: when the limit is reached the attempt ends. A
+budgeted attempt's Weft job gets an outer wall time of `ceil(cap) + 1020`
+seconds; a fixed attempt keeps its documented `int(timeout) + 1020` seconds.
+Explicit `--timeout` requests, and every request stored by older releases,
+keep this fixed meaning across upgrades and remain resumable.
+
+A fresh `task submit` with no time flags runs under the approved renewable
+policy: 3600 s initially, 1800 s extensions, a 900 s progress window, and a
+finite cap of 14400 s (four hours). `--budget-initial SECONDS` (1–7200)
+chooses a different initial amount and is mutually exclusive with
+`--timeout`; `--budget-cap SECONDS` sets the absolute cap (default 14400,
+finite, positive, and at most 14400) and requires `--budget-initial`. The cap
+must be at least the initial amount, extension, and progress window, but need
+not fit a full additional extension after the initial amount. A final extension
+is clipped to the cap. An explicit cap together with `--timeout` is refused:
+a fixed limit cannot grow. The extension and the progress window are fixed;
+there are no other knobs.
+
+A budgeted request persists one optional `budget` object in its immutable
+request, holding exactly the four numeric policy fields `initial_seconds`,
+`extension_seconds`, `progress_window_seconds`, and `max_seconds`, and keeps
+`request.timeout` as the renewable initial amount (it still bounds ordinary
+validation such as the check timeout). The complete shape is validated
+before persistence and again at worker entry: a non-object policy, booleans,
+NaN, infinity, missing or unexpected fields, values outside the bounds, caps
+below any policy duration, and initial amounts that disagree with
+`request.timeout` all refuse before a job is queued or a writer is
+launched, and the worker publishes the refusal as an ordinary retrievable
+failed result. Execution's typed `RenewableBudget` policy remains the
+authority on the policy's own invariants. The worker then launches with
+`timeout=None` and that typed policy, so Execution owns the writer process
+lifecycle: it grants or refuses each extension from the progress window and
+terminates at the cap.
+
+Successful confined write/edit operations qualify when they change files;
+other restricted tools qualify only for novel inputs that complete successfully.
+Repeated identical reads, failed operations, and unqualified activity do not
+renew. The latest qualifying evidence must fall inside the 900 s window, and
+reaching the cap ends the attempt. There is no
+automatic continuation and no automatic retry at exhaustion. `task continue`
+requires an unsuccessful terminal attempt with validated partial edits and a
+fresh `--timeout` or `--budget-initial` choice, optionally with `--budget-cap`.
+It never inherits the parent's budget or exhaustion. Completed tasks cannot be
+continued. You can verify and apply completed work, then submit a fresh task.
+If the edits are unaccepted, instead seed an isolated source copy with the
+validated diff and submit that copy. `task apply` is bound to the retained
+original project; it cannot target an arbitrary copy.
+
+Each attempt's budget telemetry (policy, elapsed time, every extension
+granted or refused with its evidence age, termination reason, progress counts,
+and distinct changed-file count) is recorded by Execution inside the worker record of the published task result
+and is parsed and validated with it at retrieval. It is never a separate
+artifact and never locally reinvented, and it describes observed activity,
+not usefulness or billed cost.
 
 Snapshot exclusions apply to baseline files, symlink checks, and content reached through external links. For example, `.weft.toml` with `[sync] exclude_dirs = ["/harness/src"]` excludes that root-relative path and its descendants while preserving `nested/harness/src`. Patterns without a leading `/` match path components at any depth.
 
@@ -50,7 +112,10 @@ Tasks execute agent-execution inside their pinned offload build. The separately 
 
 ## Continuing partial work
 
-The command prints the child identity. `--timeout` is required and accepts 1–7200 seconds.
+The command prints the child identity. The time choice is required and fresh:
+`--timeout` (fixed, 1–7200 seconds) or `--budget-initial SECONDS` (renewable,
+with an optional `--budget-cap`). The child never inherits the parent's budget
+or its exhaustion.
 Use `--brief FILE` instead of `--prompt TEXT`, or omit both to retain the parent's
 requirements. `--id CHILD` selects a new identity without overwriting an existing task.
 The child inherits the parent's writer by default; `--selector SELECTOR` may choose another exact selector in the admitted OMP registry, including when the parent's writer has since been retired. An invalid selector refuses before child creation. A valid but unavailable selection creates durable child custody and gives a same-ID resume instruction after admission refusal; it does not submit to Weft until ordinary executor admission succeeds. The child inherits the parent's check, host, account, baseline, carried-file census, and immutable lineage.

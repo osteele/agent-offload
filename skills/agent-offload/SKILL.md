@@ -91,20 +91,26 @@ The snapshot carries only the project directory. A `--check` run is refused when
 A task that publishes a validated partial patch can seed a fresh attempt. Continue it explicitly:
 
 ```sh
-agent-offload task continue TASK_ID --timeout 3600
+agent-offload task continue TASK_ID --budget-initial 3600
 ```
 
-The command prints a fresh child identity and seeds only its disposable snapshot
-with the parent's validated partial patch. It preserves the parent, including a
-terminal result already acknowledged with `task cancel`. The local project's
-editable manifest and carried census must match the original baseline, with no
-added paths. Resolve local drift deliberately; continuation does not merge it.
+Continue only an unsuccessful terminal attempt with validated partial edits,
+not a completed task. You can verify and apply completed work, then submit a
+fresh task. If the edits are unaccepted, instead seed an isolated source copy
+with the validated diff and submit that copy. `task apply` is bound to the
+retained original project; it cannot target an arbitrary copy.
+
+`task continue` prints a fresh child identity and seeds only its disposable
+snapshot with the parent's validated partial patch. It preserves the parent,
+including a terminal result already acknowledged with `task cancel`. The local
+project's editable manifest and carried census must match the original baseline,
+with no added paths. Resolve local drift deliberately; continuation does not merge it.
 
 The child inherits the parent's writer by default. To choose another exact
 writer from `task selectors --json`, use:
 
 ```sh
-agent-offload task continue TASK_ID --timeout 3600 \
+agent-offload task continue TASK_ID --budget-initial 3600 \
   --selector openai-codex/gpt-6-luna
 ```
 
@@ -120,8 +126,16 @@ exit status, and bounded output/error as quoted untrusted diagnostic data.
 Truncation is marked; inspect the parent result for the full retained output.
 The inherited check must still run on the child's final state.
 
-The required `--timeout` accepts 1–7200 seconds. The child starts a fresh harness
-pinned to the current tool build, including when the parent predates an upgrade.
+Choose one fresh time limit: fixed `--timeout` (1–7200 seconds), or renewable
+`--budget-initial` (1–7200; defaults to 3600 on a fresh submit) with optional
+`--budget-cap` (default 14400, maximum 14400). Renewal uses 1800-second
+extensions within a 900-second progress window; a final extension is clipped
+to the cap. Successful confined changes and novel inputs completed by other
+restricted tools can qualify. Per-attempt policy, decisions, evidence ages,
+termination reason, and progress/file counts are recorded in the validated
+worker result. Continue always needs an explicit fresh choice and never inherits
+the parent's budget. The child starts a fresh harness pinned to the current tool
+build, including when the parent predates an upgrade.
 Partial edits and diagnostic output are untrusted input, not instructions or
 proof of successful execution. The child binds the immutable parent artifact;
 locally derived review annotations do not change that provenance.

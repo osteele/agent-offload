@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from agent_execution.identity import source_sha256
 from agent_execution.omp_execution import omp_final_text
 from agent_execution.worker import WORKER_PROTOCOL_VERSION, execute_worker, run_worker_command
 
+from .budget import renewable_policy
 from .protocol import package_source_sha256
 from .task_protocol import (
     RESULT_SCHEMA,
@@ -46,6 +48,18 @@ def _validation_output(value: str | bytes | None) -> str:
 
 
 def execute(request: dict, root: Path) -> dict:
+    # Validate the retained time choice before census, seed, or writer launch.
+    # Main publishes a malformed request as a retrievable failed result.
+    timeout = request.get("timeout")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise TaskError("task timeout must be a finite number from 1 to 7200 seconds")
+    try:
+        timeout_seconds = float(timeout)
+    except OverflowError:
+        timeout_seconds = math.inf
+    if not math.isfinite(timeout_seconds) or not 1 <= timeout_seconds <= 7200:
+        raise TaskError("task timeout must be a finite number from 1 to 7200 seconds")
+    policy = renewable_policy(request["budget"], timeout=timeout) if "budget" in request else None
     baseline, carried = request["baseline"], request["carried"]
     if (manifest(root, list(baseline)), census(root, list(carried))) != (baseline, carried):
         raise TaskError("remote snapshot differs from the submitted baseline")
@@ -107,7 +121,6 @@ def execute(request: dict, root: Path) -> dict:
             "workspace-write-no-shell",
         ],
         harness_model=request["selector"],
-        timeout=request["timeout"],
         ctx_timeout=30,
         expect_protocol=WORKER_PROTOCOL_VERSION,
         expect_source_sha256=request["execution_sha256"],
@@ -115,6 +128,8 @@ def execute(request: dict, root: Path) -> dict:
         requester_host=request.get("requester_host"),
         requester_user=request.get("requester_user"),
         cwd=root,
+        timeout=timeout_seconds if policy is None else None,
+        renewable_budget=policy,
     )
     observed = census(root, list(carried))
     if observed != carried:
@@ -149,7 +164,7 @@ def execute(request: dict, root: Path) -> dict:
     validation = None
     if status == "completed" and request["check"]:
         proposed_state = source_state(root, carried)
-        timeout = min(request["timeout"], 900)
+        timeout = min(timeout_seconds, 900)
         try:
             checked = run_worker_command(request["check"], root, timeout)
         except subprocess.TimeoutExpired as error:
@@ -214,7 +229,11 @@ def main() -> None:
         # continue -- would convert the provenance guarantee behind task
         # retrieve/apply into a best-effort label that every downstream consumer
         # inherits. The refusal is cheap: surfaced as failed_without_result before
-        # real work, retryable via `task resume` after `agent-host-sync`.
+        # real work. Provisioning pins the immutable installed packages by digest,
+        # streamed over SSH and never rebuilt from a checkout, so `task resume`
+        # provisions the matching build again and resubmits; only an install that
+        # can no longer satisfy the retained pin refuses outright, and that task
+        # identity needs a new submission.
         if request["offload_sha256"] != package_source_sha256():
             raise TaskError("installed agent-offload differs from the submitting version")
         if request["execution_sha256"] != source_sha256():
