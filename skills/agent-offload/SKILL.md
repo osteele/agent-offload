@@ -18,7 +18,7 @@ agent-offload task status TASK_ID
 weft status --wait JOB_ID
 ```
 
-The brief's first line becomes the job's description in Weft and in Weft Status, so write it as a short plain summary of the task. Task jobs are listed under the target repository's project name and carry the `agent-offload-task` tag. Each job also carries fixed attributes — `client=agent-offload`, `kind=task`, `task`, `selector`, and, for continuations, `continues` — so `weft job list --attr client=agent-offload` lists task jobs.
+The brief's first line becomes the job's description in Weft and in Weft Status, so write it as a short plain summary of the task. Task jobs are listed under the target repository's project name and carry the `agent-offload-task` tag. Each job also carries fixed attributes: `client=agent-offload`, `kind=task`, `task`, `selector`, and, for continuations, `continues`. Use `weft job list --tag agent-offload-task` to list task jobs.
 
 Save the returned task and Weft job identities. A local timeout does not cancel the task. An ambiguous submission retains its identity; use `agent-offload task resume TASK_ID` with the same idempotency key. Do not submit a duplicate. A task whose job failed before publishing a result reports `failed_without_result` with the job log tail; fix the cause and resume the retained task. Submit and resume provision the requested worker before sending a new job; accepted jobs are reconciled first.
 

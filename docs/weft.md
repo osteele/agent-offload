@@ -47,9 +47,9 @@ local Weft daemon running. The job is tagged `agent-offload-task` and listed
 under the project's name, so `weft job list` and Weft Status show it beside the
 project's other jobs. Each job also records submission-time attributes:
 `client=agent-offload`, `kind=task`, `task` (the task id), `selector`, and, on
-continuations, `continues` (the continued parent's id). Weft stores, filters,
-and emits these but never interprets them, so
-`weft job list --attr client=agent-offload` lists task jobs. Its wall-time
+continuations, `continues` (the continued parent's id). Weft stores and emits
+these without interpreting them. Use
+`weft job list --tag agent-offload-task` to list task jobs. Its wall-time
 limit is the task's fixed timeout plus 17
 minutes for setup and the check — or, for a renewable budget, the ceiling of
 the budget's finite cap plus 17 minutes, never just the initial amount.
