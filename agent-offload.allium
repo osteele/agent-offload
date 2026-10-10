@@ -6,6 +6,7 @@
 -- Includes:
 --   Task identity, idempotency, submission, resume, cancellation
 --   Continuation of a failed task from its retained partial edits
+--   Renewable task time budgets: fixed timeout vs the approved policy
 --   Execution-owned status observations with Offload task-admission policy
 --   Task worker execution constraints, requested checks, result publication
 --   Result retrieval validation, change application, application journal
@@ -88,6 +89,29 @@ value CheckOutcome {
     stderr_tail: String
 }
 
+value RenewableBudget {
+    -- The renewable time policy persisted in an immutable request. The
+    -- extension and the progress window are fixed by the approved policy;
+    -- only the initial amount and the finite cap are caller-chosen, and a
+    -- fixed `--timeout` request carries no policy at all.
+    initial_seconds: Duration
+    extension_seconds: Duration
+    progress_window_seconds: Duration
+    max_seconds: Duration
+}
+
+value RenewableBudgetEvidence {
+    -- Execution-owned, validated, versioned telemetry for one attempt under
+    -- a renewable policy. It describes observed activity, never usefulness
+    -- or billed cost, and lives only inside the task result's worker record.
+    policy: RenewableBudget
+    duration: Duration
+    decisions: List<String>        -- each extension granted or refused, with evidence age
+    termination_reason: String
+    progress_count: Integer
+    changed_file_count: Integer    -- distinct files actually changed
+}
+
 value ApplicationBackup {
     changes: List<Change>
 }
@@ -139,8 +163,33 @@ entity Task {
     selector: String
     check: List<String>?
     timeout: Duration
+        -- A fixed request's hard writer limit, or a budgeted request's
+        -- renewable initial amount; it still bounds ordinary validation.
+    budget: RenewableBudget?
+        -- Null means timeout is the writer's fixed hard limit and renewal
+        -- never happens; present, timeout is the renewable initial amount.
+        -- The complete policy is validated before persistence and again at
+        -- worker entry: exact shape, numeric bounds, the fixed extension and
+        -- window, a finite cap within 240 minutes that accommodates the
+        -- extension, and consistency with timeout. Requests stored without
+        -- one keep their fixed meaning across upgrades.
     account: String
     baseline: BaselineManifest
+    symlinks: Map<String, String>?
+        -- The literal relative symlinks the snapshot carries, relative path
+        -- to literal relative target. Each entry must be a safe relative path
+        -- that neither collides with a baseline or carried file nor nests
+        -- under another link, and must resolve, through any chain, to an
+        -- existing in-root path without crossing protected or excluded
+        -- content; the literal target is immutable evidence. New requests
+        -- always include the field, even as {}; explicit {} means a strictly
+        -- observed empty inventory. The optional value here denotes a missing
+        -- wire field on a legacy request; an explicit JSON null is invalid.
+        -- Weft formerly materialized absolute links and relative links whose
+        -- literal target lexically escaped the snapshot. Relative links whose
+        -- literal target stayed within it were carried and refused as
+        -- unrecorded at legacy dispatch. Legacy resume/apply do not compare a
+        -- local link inventory; continuations inherit its absence.
     request_digest: String
     parent_task: Task?
     seed_changes: List<Change>?
@@ -160,6 +209,16 @@ entity Task {
     prior_job_ids: List<String>
     submission_started: Boolean
         -- False until the current attempt first enters Weft; persisted before entry.
+    provisioning: String
+        -- pending before the current attempt's first provisioning call,
+        -- in_progress while the pinned build is provisioned, ready after,
+        -- failed with the reason retained. A record written before the field
+        -- existed reports unknown, except that a retained build identity
+        -- still derives ready.
+    cancelled_without_job: String?
+        -- For a jobless closure: never_submitted when the durable start
+        -- marker proves no send was attempted, weft_reported_no_job when a
+        -- final fence answer proved the key jobless.
     error: String?
 
     -- Evidence-based status. completed, failed and validation_failed come
@@ -189,6 +248,11 @@ entity TaskResult {
     report: String
     changes: List<Change>
     validation: CheckOutcome?
+    budget_evidence: RenewableBudgetEvidence?
+        -- Present only when the task ran under a renewable policy; parsed
+        -- and validated with the worker result at retrieval, never a
+        -- separate artifact. Describes observed activity, never usefulness
+        -- or billed cost.
 
     invariant ValidationFailureCarriesOutcome {
         status = validation_failed implies validation != null
@@ -270,8 +334,12 @@ config {
     default_worker_account: String = "agent"
 
     max_task_timeout: Duration = 120.minutes
-    default_task_timeout: Duration = 30.minutes
     check_timeout: Duration = 15.minutes
+
+    budget_initial_seconds: Duration = 60.minutes             -- approved renewable start
+    budget_extension_seconds: Duration = 30.minutes           -- fixed per-extension grant
+    budget_progress_window_seconds: Duration = 15.minutes     -- progress evidence window
+    budget_cap_seconds: Duration = 240.minutes                -- finite absolute cap
 
     max_file_bytes: Integer = 2 * 1024 * 1024                -- per returned file
     max_change_files: Integer = 10000
@@ -295,22 +363,37 @@ config {
 -- Durable task lane: submission and resume
 
 rule SubmitTask {
-    when: SubmitTask(caller, project, brief, selector, check, timeout, account?, requested_id?)
+    when: SubmitTask(caller, project, brief, selector, check, timeout, budget?, account?, requested_id?)
 
     requires: length(brief) > 0
     requires: writer_selector_admitted(selector)
     requires: timeout >= 1.second and timeout <= config.max_task_timeout
+    requires: budget = null or valid_renewable_budget(budget, timeout)
+        -- Exactly one time choice: a fixed timeout is the writer's hard
+        -- limit and never renews; a renewable budget keeps the extension and
+        -- window at the approved fixed values, bounds the initial by
+        -- 1-7200s, bounds the finite cap by the 14400s ceiling with room for
+        -- the extension, and makes timeout the initial amount. A malformed
+        -- or conflicting policy -- a non-object, a boolean, NaN, infinity, a
+        -- missing or unexpected field, a bound violation, a cap without
+        -- room, or an initial that disagrees with timeout -- refuses before
+        -- anything is persisted, censused, provisioned, or sent.
     requires: check = null or path_dependencies_within_snapshot(project)
         -- A check cannot run against dependencies outside the snapshot; a
         -- project without a check is accepted regardless.
     requires: requested_id = null or not Tasks.any(t => t.id = requested_id)
-    requires: not carries_in_root_symlink(project)
-        -- The worker's census refuses symlinks, and the snapshot keeps every
-        -- in-root link its exclusions do not drop; out-of-root links arrive
-        -- as their targets' content and are accepted.
-    requires: not carries_oversized_linked_content(project)
-        -- Content reached through out-of-root links enters the snapshot, so a
-        -- file there over config.max_file_bytes would fail the census.
+    requires: carries_confined_links_only(project)
+        -- Confined relative symlinks are carried as read-only link objects in
+        -- the request's symlinks inventory, never recursed through during
+        -- census. A link under an excluded path is dropped with it, exactly
+        -- like an ordinary file. Every kept link must resolve, through any
+        -- chain, to an existing path inside the project: an absolute target,
+        -- an escape (including an indirect one, while confined relative `..`
+        -- steps are fine), a cycle, a dangling link, and a target crossing
+        -- protected or excluded content each refuse the submission with the
+        -- link named, instead of being silently dropped or materialized.
+        -- Escaping links are refused rather than materialized from external
+        -- content.
 
     ensures:
         let task = Task.created(
@@ -320,8 +403,14 @@ rule SubmitTask {
             selector: selector,
             check: check,
             timeout: timeout,
+            budget: budget,
+                -- Null for an explicit fixed --timeout; the approved policy
+                -- when the caller passes no time flag at all.
             account: account ?? config.default_worker_account,
             baseline: baseline_manifest(project),
+            symlinks: confined_link_inventory(project),
+                -- Always explicit for fresh submissions, including {}. A
+                -- continuation inherits its parent's field only if present.
             request_digest: digest_of(brief),
             worker_source_digest: bundled_worker_digest(),
             worker_build_id: null,
@@ -330,6 +419,7 @@ rule SubmitTask {
             job: null,
             prior_job_ids: [],
             submission_started: false,
+            provisioning: "pending",
             status: submitting
         )
     ensures: WorkerProvisioningRequested(task)
@@ -345,6 +435,10 @@ rule SubmitTask {
         -- up: a recorded job is accepted, and a key Weft never recorded is
         -- sent once more. A failed or malformed lookup is not evidence of
         -- absence and makes the send unresolved, as does a second failure.
+        -- The send's outer wall time covers one whole attempt: the fixed
+        -- timeout's documented seconds plus 1020, or, for a budgeted task,
+        -- the ceiling of the finite cap plus 1020 -- never the initial
+        -- amount alone, so renewal can actually use the cap it is granted.
     @guidance
         -- The task executes the agent-execution bundled inside its pinned
         -- offload build, not the separately installed worker on PATH.
@@ -359,16 +453,19 @@ rule ProvisionWorker {
     requires: provisioned_build_matches(task)
         -- Provisioning builds an immutable, content-addressed worker for
         -- the task's host and account without activating it: the host's
-        -- current build and PATH are untouched. The configured provider
-        -- makes it: by default, by copying the installed agent-offload and
-        -- agent-execution packages over SSH; optionally, through
-        -- agent-host-sync from the checkouts it deploys. The build is accepted only
-        -- when the identity its own worker reports carries an agent-offload
-        -- source digest equal to the request's offload digest and an
+        -- current build and PATH are untouched. There is exactly one
+        -- mechanism: the installed agent-offload and agent-execution
+        -- packages are copied over SSH, so the build is deterministic from
+        -- the installed pinned pair and independent of any source checkout.
+        -- The configured provider value is accepted for compatibility but no
+        -- longer selects a builder. The build is accepted only when the
+        -- identity its own worker reports carries an agent-offload source
+        -- digest equal to the request's offload digest and an
         -- agent-execution source digest equal to the request's execution
         -- digest.
     ensures: task.worker_build_id = provisioned_build(task).id
     ensures: task.worker_bin_dir = provisioned_build(task).bin_dir
+    ensures: task.provisioning = "ready"
     ensures: SubmissionSent(task)
 }
 
@@ -379,13 +476,15 @@ rule RefuseMismatchedWorker {
     ensures: ProvisioningRefusalReported(task)
     @guidance
         -- The refusal happens before any Weft job exists, and the task keeps
-        -- its identity with no job and no recorded build, so resume
-        -- provisions again. The diagnostic names which side differs
-        -- (agent-offload, agent-execution, or both) and the fix: the local
-        -- installed agent-offload was built from different bytes than the
-        -- sources the host build is made from, so reinstall it locally or
-        -- commit or revert the checkout edits, then resubmit. A failed or
-        -- malformed provisioning answer refuses the same way.
+        -- its identity with no job and no recorded build. The diagnostic
+        -- names which side differs and both digests. The refused case is a
+        -- pinned build the install can no longer supply: the pinned bytes
+        -- are never reconstructed from a checkout, no reinstall or checkout
+        -- rewrite is attempted automatically, and that identity cannot
+        -- resume -- the caller submits a new task for the same brief. Any
+        -- other provisioning failure keeps the identity and names the
+        -- same-ID resume that retries provisioning. A failed or malformed
+        -- provisioning answer refuses the same way.
 }
 
 rule SubmissionAccepted {
@@ -415,10 +514,14 @@ rule ResumeTask {
     requires: task.status not in {applied, cancelled}
     requires: task.job = null or task.job?.status in {failed, dead, killed}
     requires: task.job = null or not task.job?.status in {canceled, cancelled}
-    requires: baseline_unchanged(task) or continuation_receipt_recoverable(task)
-        -- For an unresolved continuation, lookup precedes the baseline check.
+    requires: baseline_unchanged(task) or accepted_receipt_recoverable(task)
+        -- For every unresolved task, lookup precedes the baseline check.
         -- A valid accepted receipt binds its existing job despite local drift;
         -- absence or lookup failure never permits sending changed source.
+        -- For an inventory-bearing request, baseline_unchanged also covers
+        -- link drift. Legacy absence preserves baseline/carried checks without
+        -- inventing an empty link census; resubmission still refuses
+        -- unrecorded carried links.
     requires: task.job = null or submitter_unchanged(task)
     requires: task.job = null or provisioned_build_matches(task)
     requires: task.job = null or weft_accepts_processed(task.job)
@@ -427,7 +530,7 @@ rule ResumeTask {
 
     ensures:
         if task.job = null:
-            if continuation_receipt_recoverable(task):
+            if accepted_receipt_recoverable(task):
                 task.job = accepted_job(task)
                 task.status = queued
                 task.error = null
@@ -467,7 +570,7 @@ rule ResumeTask {
 }
 
 rule ContinueTask {
-    when: ContinueTask(caller, parent, timeout, supplement?, requested_id?)
+    when: ContinueTask(caller, parent, timeout, budget?, supplement?, requested_id?, selector_override?)
 
     requires: parent.result != null and parent.result.status in {failed, validation_failed}
         -- A validated published result is the only continuation seed. A
@@ -482,24 +585,47 @@ rule ContinueTask {
         -- Continuing an applied task could duplicate edits already in the
         -- project.
     requires: baseline_unchanged(parent, including additions)
-        -- The whole editable manifest and carried census of the live project
-        -- must equal the parent's retained original baseline; drift, or a new
-        -- local file that could collide with a seeded addition, refuses
-        -- before anything is submitted. Nothing is written locally.
+        -- The whole editable manifest and carried census must equal the
+        -- parent's baseline, including path sets: a new local file that could
+        -- collide with a seeded addition refuses. An observed link inventory
+        -- must also match; legacy absence permits links Weft materialized
+        -- (absolute or lexically escaping targets) but refuses unrecorded
+        -- links Weft would carry, based on literal targets. Nothing is written
+        -- locally, and the child inherits inventory presence or absence.
     requires: timeout >= 1.second and timeout <= config.max_task_timeout
+    requires: budget = null or valid_renewable_budget(budget, timeout)
+        -- The child's time choice is fresh and explicit: a fixed --timeout
+        -- or an explicit renewable initial with its optional finite cap,
+        -- validated like any submitted policy. It never inherits the
+        -- parent's budget or its exhaustion, and the parent's retained
+        -- request is unchanged.
+    requires: selected = selector_override ?? parent.selector
+    requires: selected in OMP_WRITER_SELECTORS
+        -- Validate the selected exact writer, not a retired inherited parent
+        -- when the caller supplies a replacement.
     requires: requested_id = null or not Tasks.any(t => t.id = requested_id)
     ensures:
         let child = Task.created(
             id: requested_id ?? generated_task_id(),
             project: parent.project,
-            brief: continuation_brief(parent.brief, supplement),
-                -- Preserves the original requirements and marks the seeded
-                -- edits incomplete and untrusted.
-            selector: parent.selector,
+            brief: continuation_brief(
+                parent.brief,
+                supplement,
+                untrusted_validation_diagnostic(parent.result, parent.check)
+            ),
+                -- Preserves requirements/manual instructions and adds validated
+                -- failed-check output as bounded quoted untrusted data.
+            selector: selected,
             check: parent.check,
             timeout: timeout,
+            budget: budget,
             account: parent.account,
             baseline: parent.baseline,
+            symlinks: parent.symlinks,
+                -- Inherit presence as well as value: an inventory-bearing
+                -- parent's links are checked strictly; a historical parent
+                -- with no inventory gives its child no inventory field, not
+                -- a fabricated observed {}.
             parent_task: parent,
             seed_changes: parent.result.changes,
             worker_source_digest: bundled_worker_digest(),
@@ -509,6 +635,7 @@ rule ContinueTask {
             job: null,
             prior_job_ids: [],
             submission_started: false,
+            provisioning: "pending",
             status: submitting
         )
     ensures: parent = parent_before
@@ -530,6 +657,7 @@ rule CancelBeforeDispatch {
     requires: task.submission_started = false
     requires: task.status != submission_unknown
     ensures: task.status = cancelled
+    ensures: task.cancelled_without_job = "never_submitted"
     ensures:
         if task.processed_at = null:
             task.processed_at = now
@@ -547,6 +675,7 @@ rule FenceAmbiguousSubmission {
     ensures:
         if ValidFence(api_version = "weft.job.fence.v1", key = K, fenced = true, receipt = null):
             task.status = cancelled
+            task.cancelled_without_job = "weft_reported_no_job"
             task.processed_at = now
         else if ValidFence(api_version = "weft.job.fence.v1", key = K, fenced = false, receipt = R):
             Persist(task.job = R.job_id, task.host = R.selected_host, task.source_pin = R.source_pin)
@@ -640,7 +769,15 @@ rule ValidateRetrievedResult {
         -- before-digest and mode equal to the retained baseline for existing
         -- files, absence matching for new files, per-file and bundle bounds.
     ensures: TaskEvidenceValidated(task)
+    ensures: task.review = destructive_review_summary(task.result.changes)
+        -- Deterministic evidence comes only from validated before/after bytes:
+        -- removed paths, removed Python AST test-shaped definitions, and
+        -- candidate files that could not be assessed. It is advisory.
     @guidance
+        -- Python inventory covers module-level and direct class test_* defs,
+        -- not nested helpers or pytest/unittest collection and parameterized
+        -- case totals. Unsupported test languages and parse failures are
+        -- unassessed. Review metadata does not alter artifact digest binding.
         -- Retrieval never marks the Weft job processed in this lane and
         -- never mutates task state by itself.
 }
@@ -673,6 +810,13 @@ rule WorkerAcceptsTask {
     requires: payload.task_id = task.id
     requires: payload.worker_source_digest = task.worker_source_digest
     requires: snapshot_census(task.project) = task.baseline.entries
+    requires: snapshot_link_inventory(task.project) = task.symlinks
+        -- The exact carried link inventory, verified before generation: a
+        -- missing, retargeted, replaced, added, or unsafe link refuses even
+        -- when its resolved contents happen to match. The inventory is
+        -- censused again after the writer completes and after validation;
+        -- the writer may not create, replace, retarget, or delete a link,
+        -- and a check that does fails the task as a modified proposal.
     ensures: WorkerSessionStarted(task)
 }
 
@@ -683,6 +827,7 @@ rule WorkerPublishesSetupFailure {
         or payload.task_id != task.id
         or payload.worker_source_digest != task.worker_source_digest
         or snapshot_census(task.project) != task.baseline.entries
+        or snapshot_link_inventory(task.project) != task.symlinks
     ensures: ResultArtifactPublished(task)
     ensures: WorkerRefusesFurtherWork(task)
     @guidance
@@ -745,6 +890,38 @@ rule WorkerPublishesValidationFailure {
         -- result remains retrievable and can never be applied.
 }
 
+rule RenewWriterBudget {
+    when: WorkerSessionStarted(task)
+
+    requires: task.budget != null
+        -- Renewal is enabled only for a budgeted request: the worker
+        -- launches with no fixed timeout and Execution's typed policy owns
+        -- the writer's process lifecycle, renewing with inline -p or stdin
+        -- delivery under the same workspace-write-no-shell policy. A fixed
+        -- --timeout request never grants an extension and never grows
+        -- toward the cap.
+    ensures: BudgetDecision(task)
+        -- At each deadline Execution grants an extension only when fresh
+        -- qualifying evidence falls inside the progress window: successful
+        -- confined writes/edits that changed files, or other restricted tools
+        -- with novel inputs that completed successfully. The final extension
+        -- is clipped to the finite cap. Repeated identical reads, failures,
+        -- and unqualified activity do not renew. The granted
+        -- and refused decisions with their evidence age, the termination
+        -- reason, progress counts, and the distinct changed-file count are
+        -- recorded inside the validated worker result of the published task
+        -- result -- the only telemetry schema, never a separate artifact and
+        -- never locally reinvented. The statistics describe observed
+        -- activity, not usefulness or billed cost. Exhaustion is terminal
+        -- for the attempt: no automatic continuation and no automatic retry.
+        -- `task continue` requires an unsuccessful terminal attempt with validated
+        -- partial edits, not a completed task. Completed work can be verified and
+        -- applied before submitting a fresh task. If the edits are unaccepted,
+        -- the caller can instead seed an isolated source copy with the validated
+        -- diff and submit that copy. `task apply` is bound to the retained original
+        -- project; it cannot target an arbitrary copy.
+}
+
 -- Durable task lane: application
 
 rule ApplyTaskResult {
@@ -762,6 +939,13 @@ rule ApplyTaskResult {
         -- before-state, new files do not exist, paths are safe (inside the
         -- project, no symlinked components, no protected agent or VCS
         -- metadata), and content is text within the per-file bound.
+    requires: task.symlinks = null or snapshot_link_inventory(task.project) = task.symlinks
+        -- When present, the retained carried-link inventory is verified before any write:
+        -- a link retargeted, replaced, added, deleted, or made unsafe since
+        -- submission is local drift, and the application refuses before the
+        -- first byte changes. A change record addressing a link or a
+        -- descendant reached through a linked directory is refused at
+        -- retrieval, and the safe-path preflight refuses it again here.
 
     ensures: task.backup = ApplicationBackup.of(task.result.changes)
     ensures:
@@ -1125,6 +1309,14 @@ invariant RelayProvenanceComplete {
                     -- its explanatory content with nothing served.
 }
 
+invariant RenewalOnlyUnderPersistedPolicy {
+    -- Renewal is enabled only by the request's persisted approved policy: a
+    -- fixed --timeout is a hard limit that never silently grows toward the
+    -- cap, and budget evidence exists only for a budgeted task.
+    for task in Tasks:
+        task.budget = null implies task.result?.budget_evidence = null
+}
+
 invariant HistoricalRefusalsNeverProcessed {
     for record in HistoricalJobs:
         record.status = refused implies record.processed_at = null
@@ -1147,10 +1339,10 @@ surface TaskControl {
         task.result?.validation
 
     provides:
-        SubmitTask(caller, project, brief, selector, check, timeout, account?, requested_id?)
+        SubmitTask(caller, project, brief, selector, check, timeout, budget?, account?, requested_id?)
         ObserveTask(caller, task)
         ResumeTask(caller, task)
-        ContinueTask(caller, parent, timeout, supplement?, requested_id?)
+        ContinueTask(caller, parent, timeout, budget?, supplement?, requested_id?)
         CancelTask(caller, task)
         RetrieveTaskResult(caller, task)
         ApplyTaskResult(caller, task)

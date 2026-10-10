@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from agent_offload.task_protocol import TaskError
-from agent_offload.tasks import read_record, snapshot_names, submit
+from agent_offload.tasks import read_record, snapshot_census, submit
 
 REAL_RG = shutil.which("rg")
 
@@ -84,7 +84,7 @@ def test_real_rg_census_accepts_an_empty_project(tmp_path, monkeypatch):
     tools = stub_dir(tmp_path)
     fake_weft(tmp_path, monkeypatch, excludes=[])
     use_real_rg(tools, monkeypatch)
-    assert snapshot_names(project) == []
+    assert snapshot_census(project)[0] == []
 
 
 @pytest.mark.skipif(REAL_RG is None, reason="rg is not installed")
@@ -105,7 +105,7 @@ def test_real_rg_census_keeps_hidden_files_and_drops_metadata(tmp_path, monkeypa
     tools = stub_dir(tmp_path)
     fake_weft(tmp_path, monkeypatch, excludes=["*.log"])
     use_real_rg(tools, monkeypatch)
-    assert sorted(snapshot_names(project)) == [".hidden", "hello.py", "src/module.py"]
+    assert sorted(snapshot_census(project)[0]) == [".hidden", "hello.py", "src/module.py"]
 
 
 def test_a_real_census_failure_is_explicit(tmp_path, monkeypatch):
@@ -113,14 +113,14 @@ def test_a_real_census_failure_is_explicit(tmp_path, monkeypatch):
     fake_rg(tmp_path, monkeypatch, exit_code=2, stderr="rg: unrecognized flag\n")
     fake_weft(tmp_path, monkeypatch, excludes=[])
     with pytest.raises(TaskError, match="unrecognized flag"):
-        snapshot_names(project)
+        snapshot_census(project)
 
 
 def test_a_missing_rg_is_explicit(tmp_path, monkeypatch):
     project = empty_project(tmp_path)
     fake_weft(tmp_path, monkeypatch, excludes=[])
     with pytest.raises(TaskError, match="could not execute rg"):
-        snapshot_names(project)
+        snapshot_census(project)
 
 
 def test_a_failed_inspection_is_still_explicit(tmp_path, monkeypatch):
@@ -133,7 +133,7 @@ def test_a_failed_inspection_is_still_explicit(tmp_path, monkeypatch):
     weft.chmod(0o755)
     monkeypatch.setenv("PATH", str(stub_dir(tmp_path)))
     with pytest.raises(TaskError, match="exit 1"):
-        snapshot_names(project)
+        snapshot_census(project)
 
 
 def queued_receipt(identity: str) -> dict:
@@ -176,4 +176,4 @@ def test_an_empty_project_submits_once_and_persists(tmp_path, monkeypatch):
     # second one without another census or another Weft dispatch.
     with pytest.raises(TaskError, match="already exists"):
         start()
-    assert len(calls.read_text().splitlines()) == 2
+    assert sum(line.startswith("run ") for line in calls.read_text().splitlines()) == 1

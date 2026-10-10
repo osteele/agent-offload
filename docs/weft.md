@@ -38,15 +38,26 @@ exclude_dirs = ["data", "/harness/src"]
 
 A leading `/` anchors a path at the project root; otherwise the name matches
 at any depth. Files outside the project directory never travel, so a `--check`
-is refused when the project depends on a path outside itself.
+is refused when the project depends on a path outside itself. The same
+exclusions govern relative symlinks: a confined relative link is carried as a
+read-only link object with its literal target recorded in the task request,
+while a link whose own path is excluded is omitted with that path. An included
+link that points outside the project or crosses an excluded or protected target
+refuses the submission instead of being silently rewritten or left dangling.
 
 **A job submitted without waiting.** `task submit` calls `weft run --no-sync`,
 which records the job and returns; Weft's daemon then sends it to the host on
 its next pass. Expect about a minute before the agent starts, and keep the
 local Weft daemon running. The job is tagged `agent-offload-task` and listed
 under the project's name, so `weft job list` and Weft Status show it beside the
-project's other jobs. Its wall-time limit is the task timeout plus 17 minutes
-for setup and the check.
+project's other jobs. Each job also records submission-time attributes:
+`client=agent-offload`, `kind=task`, `task` (the task id), `selector`, and, on
+continuations, `continues` (the continued parent's id). Weft stores and emits
+these without interpreting them. Use
+`weft job list --tag agent-offload-task` to list task jobs. Its wall-time
+limit is the task's fixed timeout plus 17
+minutes for setup and the check — or, for a renewable budget, the ceiling of
+the budget's finite cap plus 17 minutes, never just the initial amount.
 
 **Idempotent submission.** Every attempt carries an idempotency key.
 `task resume` asks `weft job lookup --idempotency-key KEY` whether a submission
