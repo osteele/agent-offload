@@ -18,6 +18,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from fnmatch import fnmatchcase
@@ -35,7 +36,6 @@ from .readiness import require_writer
 from .task_protocol import (
     EXCLUDED,
     LIST_SCHEMA,
-    MAX_FILE,
     MAX_TOTAL,
     RESULT_SCHEMA,
     SCHEMA,
@@ -43,16 +43,20 @@ from .task_protocol import (
     TaskError,
     canonical_digest,
     census,
+    check_symlink_collisions,
     decode,
     digest,
+    link_inventory,
     manifest,
     object_json,
     preflight_changes,
     render_diff,
+    require_confined,
     result_path,
     split_carried,
     task_id,
     validate_changes,
+    validate_symlinks,
     write_changes,
 )
 from .worker_build import PinnedBuildUnavailable, ensure_worker_build
@@ -263,7 +267,11 @@ def submit(
         raise TaskError(f"task {identity} already exists; inspect it or use task resume")
     # The immutable build returned by ensure_worker must match both bundled
     # package digests. A separate execution worker on PATH does not run this task.
-    editable, carried = split_carried(project, snapshot_names(project))
+    names, links = snapshot_census(project)
+    editable, carried = split_carried(project, names)
+    # A carried link may not share a path with -- or sit over or under -- a
+    # file the snapshot also carries: the two censuses describe disjoint sets.
+    check_symlink_collisions(links, [*editable, *carried])
     # The retained timeout has one of two documented meanings: a budgeted
     # request's renewable initial amount, or -- when no budget is present --
     # the writer's fixed hard limit. Requests stored without a budget keep
@@ -279,6 +287,7 @@ def submit(
         "check": check,
         "baseline": manifest(project, editable),
         "carried": census(project, carried),
+        "symlinks": links,
         "execution_sha256": source_sha256(),
         "offload_sha256": package_source_sha256(),
     }
@@ -498,13 +507,17 @@ def escaping_path_dependencies(project: Path) -> list[str]:
     return [entry for entry in declared if not (project / entry).resolve().is_relative_to(project)]
 
 
-def snapshot_names(project: Path) -> list[str]:
-    """Project files that Weft's source snapshot will carry to the worker.
+def snapshot_census(project: Path, *, legacy: bool = False) -> tuple[list[str], dict[str, str]]:
+    """The ordinary files and carried symlinks Weft's snapshot will hold.
 
-    The worker requires every baseline file to exist in its snapshot, so a file
-    that Weft's source exclusions drop must not enter the baseline. Root-anchored
-    patterns match a path or its ancestors; other patterns match individual
-    path components, as Weft's shouldExclude does.
+    The worker requires every baseline file to exist in its snapshot, so a
+    path that Weft's source exclusions drop must not enter either census.
+    Root-anchored patterns match a path or its ancestors; other patterns match
+    individual path components, as Weft's shouldExclude does.
+
+    Fresh and inventory-bearing requests require confined links. Legacy
+    continuations have no observed inventory: Weft formerly materialized
+    external links, but unrecorded in-root links were refused at submission.
     """
     # rg exits 1 when it lists nothing, its documented "no match" result, so
     # an empty project is a valid census rather than a failure. Only that exit
@@ -515,6 +528,30 @@ def snapshot_names(project: Path) -> list[str]:
         cwd=project,
         accept=(1,),
     ).splitlines()
+    excluded = weft_exclusions(project)
+    links = legacy_links(project, excluded) if legacy else confined_links(project, excluded)
+    return [name for name in names if not excluded(Path(name))], links
+
+
+def legacy_links(project: Path, excluded: Callable[[Path], bool]) -> dict[str, str]:
+    """Scan legacy request links using Weft's literal-target transport rule.
+
+    Legacy requests have no recorded link inventory. A link is carried when
+    its relative literal target stays lexically within the snapshot; those
+    unrecorded links must not slip into a new snapshot on resubmission or
+    continuation. Absolute and lexically escaping targets were materialized.
+    """
+    links = link_inventory(project, excluded=excluded)
+    for name, target in links.items():
+        joined = os.path.normpath(os.path.join(os.path.dirname(name), target))
+        carried = not os.path.isabs(target) and joined != ".." and not joined.startswith("../")
+        if carried:
+            raise TaskError(f"unrecorded carried symlink: {name}")
+    return links
+
+
+def weft_exclusions(project: Path) -> Callable[[Path], bool]:
+    """The source-exclusion predicate Weft publicly inspects for a project."""
     inspected = json.loads(run(["weft", "sync", "inspect", str(project), "--json"], cwd=project))
     excludes = inspected.get("excludes") if isinstance(inspected, dict) else None
     if not isinstance(excludes, list) or not all(isinstance(p, str) for p in excludes):
@@ -535,78 +572,22 @@ def snapshot_names(project: Path) -> list[str]:
             for pattern in anchored
         )
 
-    links, oversized = snapshot_link_problems(project, excluded)
-    if links:
-        raise TaskError(
-            f"project contains symlinks the Weft snapshot carries ({listing(links)}); the task "
-            "worker refuses symlinks, so the task would fail remotely before the writer "
-            "started. Replace them with regular files or exclude them from the snapshot"
-        )
-    if oversized:
-        raise TaskError(
-            f"symlinks leaving the project reach files over the {MAX_FILE // 2**20} MiB task "
-            f"file limit ({listing(oversized)}); Weft copies their content into the snapshot "
-            "and the task worker refuses it, so the task would fail remotely before the writer "
-            "started. Exclude them from the snapshot"
-        )
-    return [name for name in names if not excluded(Path(name))]
+    return excluded
 
 
-def listing(names: list[str]) -> str:
-    return ", ".join(names[:5]) + (f", and {len(names) - 5} more" if len(names) > 5 else "")
+def confined_links(project: Path, excluded: Callable[[Path], bool]) -> dict[str, str]:
+    """The confined relative symlinks the snapshot carries, validated.
 
-
-def snapshot_link_problems(project: Path, excluded) -> tuple[list[str], list[str]]:
-    """Symlinks the task worker would refuse, as Weft's source snapshot carries them.
-
-    rg does not list symlinks, so they never enter the baseline. Weft keeps
-    every in-root link that its exclusions do not drop, and the worker's census
-    refuses any symlink it finds; those are the first list. Weft replaces a
-    link whose target is absolute or leaves the tree with the target's content,
-    as its symlinkTargetWithinRoot does, applying the same exclusions inside it
-    and following further links. The census refuses any file of that content
-    over the task file limit; those, by their snapshot paths, are the second.
+    A link under an excluded path is dropped with that path, exactly like an
+    ordinary file. Every kept link is read-only evidence: it must resolve,
+    through any chain, to an existing path inside the project without crossing
+    protected or excluded content, and the request retains its literal target
+    for every later census to compare.
     """
-    in_root: list[str] = []
-    oversized: list[str] = []
-    for directory, dirs, files in os.walk(project):
-        relative = Path(directory).relative_to(project)
-        for name in sorted([*dirs, *files]):
-            path = Path(directory) / name
-            if excluded(relative / name) or not path.is_symlink():
-                continue
-            target = os.readlink(path)
-            joined = os.path.normpath(os.path.join(relative, target))
-            snapshot_name = (relative / name).as_posix()
-            if not os.path.isabs(target) and joined != ".." and not joined.startswith("../"):
-                in_root.append(snapshot_name)
-            else:
-                oversized.extend(oversized_content(path, snapshot_name, excluded))
-        dirs[:] = [d for d in dirs if not excluded(relative / d)]
-    return in_root, oversized
-
-
-def oversized_content(path: Path, snapshot_name: str, excluded) -> list[str]:
-    """Snapshot paths of files over the task file limit at or under path."""
-    if path.is_file():
-        return [snapshot_name] if path.stat().st_size > MAX_FILE else []
-    found = []
-    # Links inside the target are followed, so a link back to an ancestor
-    # would repeat forever; each real directory is walked once, as Weft does.
-    visited = set()
-    for directory, dirs, files in os.walk(path, followlinks=True):
-        visited.add(os.path.realpath(directory))
-        relative = Path(snapshot_name) / Path(directory).relative_to(path)
-        dirs[:] = sorted(
-            d
-            for d in dirs
-            if not excluded(relative / d) and os.path.realpath(Path(directory) / d) not in visited
-        )
-        for name in sorted(files):
-            file = Path(directory) / name
-            if not excluded(relative / name) and file.is_file() and file.stat().st_size > MAX_FILE:
-                found.append((relative / name).as_posix())
-    return found
+    links = validate_symlinks(link_inventory(project, excluded=excluded))
+    for name, target in sorted(links.items()):
+        require_confined(project, name, target, excluded=excluded)
+    return links
 
 
 def wall_time(request: dict) -> str:
@@ -698,8 +679,7 @@ def send(record: dict, directory: Path) -> dict:
             return summary(record)
         # Absence permits an idempotent resend, not release of dispatch custody:
         # an earlier in-flight request may still be accepted after this lookup.
-    if "continuation" in record["request"]:
-        check_baseline_unchanged(record)
+    check_baseline_unchanged(record)
     if not record.get("bin_dir") or not record.get("build_id"):
         provision(record, directory, action="resume")
     try:
@@ -918,19 +898,50 @@ def cancel_without_job(record: dict, directory: Path) -> None:
 
 def check_baseline_unchanged(record: dict) -> None:
     # A new source snapshot must not silently replace the retained baseline,
-    # nor the carried files the writer reads and the check builds against. A
-    # request retained before carried files were admitted has no carried set,
-    # and could have none: submit refused any project holding one outright.
+    # nor the carried files the writer reads and the check builds against, nor
+    # the carried symlinks when an inventory was actually observed. Older
+    # requests without that field could carry materialized external links.
     project, request = Path(record["project"]), record["request"]
     carried = request.get("carried", {})
+    has_links = "symlinks" in request
+    links = validate_symlinks(request["symlinks"]) if has_links else None
+    # Continuations bind the complete path sets; initial tasks retain their
+    # editable manifest and carried census without reclassifying today's files.
     if "continuation" in request:
-        editable, carried_names = split_carried(project, snapshot_names(project))
-        if set(editable) != set(request["baseline"]) or set(carried_names) != set(carried):
-            raise TaskError("project changed since submission; inspect Weft before resuming")
-    if manifest(project, list(request["baseline"])) != request["baseline"] or (
-        census(project, list(carried)) != carried
+        names, current_links = snapshot_census(project, legacy=not has_links)
+        editable, carried_names = split_carried(project, names)
+        paths_changed = set(editable) != set(request["baseline"]) or set(carried_names) != set(
+            carried
+        )
+    else:
+        current_links = confined_links(project, weft_exclusions(project)) if has_links else None
+        paths_changed = False
+    if (
+        paths_changed
+        or (has_links and current_links != links)
+        or manifest(project, list(request["baseline"])) != request["baseline"]
+        or census(project, list(carried)) != carried
     ):
         raise TaskError("project changed since submission; inspect Weft before resuming")
+
+
+def check_links_unchanged(record: dict) -> None:
+    """Refuse unless the project still holds exactly the retained link inventory.
+
+    The carried links are part of what the writer read and of what the returned
+    changes describe, so application is refused before any write when one has
+    since been retargeted, replaced, added, deleted, or made unsafe.
+    """
+    request = record["request"]
+    if "symlinks" not in request:
+        # No local link inventory was observed for this legacy dispatch.
+        # Destination preflight still rejects writes through any live link.
+        return
+    expected = validate_symlinks(request["symlinks"])
+    project = Path(record["project"])
+    current = confined_links(project, weft_exclusions(project))
+    if current != expected:
+        raise TaskError("project symlinks changed since submission")
 
 
 def check_submitter_unchanged(record: dict) -> None:
@@ -954,6 +965,8 @@ def check_submitter_unchanged(record: dict) -> None:
 def resubmit(record: dict, directory: Path) -> dict:
     """Submit the retained request again after its job failed without a result."""
     check_baseline_unchanged(record)
+    if "symlinks" not in record["request"]:
+        legacy_links(Path(record["project"]), weft_exclusions(Path(record["project"])))
     check_submitter_unchanged(record)
     provision(record, directory, action="retry")
     # Dispose the old attempt before rotating its identity; a failed
@@ -1166,13 +1179,21 @@ def continue_task(
     seed = result["changes"]
     project = Path(parent["project"])
     # The child inherits the parent's original baseline, so the unchanged local
-    # project must still be exactly that baseline: every editable file and the
-    # carried census, with no additions. A new local file could collide with a
-    # seeded addition, so path-set drift refuses before anything is submitted,
-    # and nothing is written here.
-    editable, carried = split_carried(project, snapshot_names(project))
+    # project must still be exactly that baseline: every editable file, the
+    # carried census, and (when observed) the carried symlinks, with no new
+    # ordinary files. A new file could collide with a seeded addition; legacy
+    # requests never observed a local link inventory and may have external
+    # links materialized by Weft. Nothing is written here.
+    has_links = "symlinks" in request
+    expected_links = validate_symlinks(request["symlinks"]) if has_links else None
+    names, current_links = snapshot_census(project, legacy=not has_links)
+    editable, carried = split_carried(project, names)
     baseline, carried_census = manifest(project, editable), census(project, carried)
-    if baseline != request["baseline"] or carried_census != request.get("carried", {}):
+    if (
+        baseline != request["baseline"]
+        or carried_census != request.get("carried", {})
+        or (has_links and current_links != expected_links)
+    ):
         raise TaskError(
             "project changed since the parent task was submitted; a continuation must "
             "start from the parent's retained original baseline, so drift (including "
@@ -1192,6 +1213,7 @@ def continue_task(
         "check": list(request["check"]),
         "baseline": baseline,
         "carried": carried_census,
+        **({"symlinks": dict(expected_links)} if has_links else {}),
         # The child is pinned to the build dispatching it, which may be newer
         # than the build that produced the parent: the parent is validated
         # against its own retained request above.
@@ -1611,10 +1633,8 @@ def handler(args: argparse.Namespace) -> int:
                         # its idempotency key; resending must repeat the same
                         # command, so the recorded build is kept. send provisions
                         # one only for a record that never had one.
-                        # Continuations reconcile an accepted receipt in send
-                        # before checking drift that would prevent a new send.
-                        if "continuation" not in record["request"]:
-                            check_baseline_unchanged(record)
+                        # send reconciles accepted receipts before checking drift
+                        # that would prevent a new submission.
                         value = send(record, directory)
                 elif args.action == "cancel":
                     if record.get("job_id"):
@@ -1664,6 +1684,10 @@ def handler(args: argparse.Namespace) -> int:
                             raise TaskError("only successful tasks can be applied")
                         project = Path(record["project"])
                         with project_locked(project):
+                            # The carried links are part of what the writer
+                            # read; verify the retained inventory before any
+                            # write, alongside the per-destination preflight.
+                            check_links_unchanged(record)
                             apply_changes(
                                 project,
                                 value["changes"],

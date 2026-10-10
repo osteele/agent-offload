@@ -102,9 +102,9 @@ retained original project; it cannot target an arbitrary copy.
 
 `task continue` prints a fresh child identity and seeds only its disposable
 snapshot with the parent's validated partial patch. It preserves the parent,
-including a terminal result already acknowledged with `task cancel`. The local
-project's editable manifest and carried census must match the original baseline,
-with no added paths. Resolve local drift deliberately; continuation does not merge it.
+including a terminal result already acknowledged with `task cancel`. The local project's editable manifest, carried census, and carried symlinks
+must match the original baseline, with no added paths. Resolve local drift
+deliberately; continuation does not merge it.
 
 The child inherits the parent's writer by default. To choose another exact
 writer from `task selectors --json`, use:
@@ -172,7 +172,7 @@ to delete tests or an unconditional deletion ban.
 
 Application marks the terminal Weft job processed after saving the applied state. If acknowledgment fails, repeat `task apply TASK_ID`; this retries acknowledgment without reapplying changes. `processed_at` in task responses records acknowledgment of the current job. Retrieval, diff, status, and list do not mark jobs processed.
 
-Edits are ordinary UTF-8 files, at most 2 MiB each and 64 MiB total. A larger project file is carried read-only: the writer and the check can read it, and the task fails if it comes back as an edit, so a repository holding a corpus or fixture still uses the task lane. Symlinks and protected metadata are rejected. Snapshot census failures return failed task artifacts; inspect their reports. Keep tasks requiring interaction, local credentials, or GUI state local.
+Edits are ordinary UTF-8 files, at most 2 MiB each and 64 MiB total. A larger project file is carried read-only: the writer and the check can read it, and the task fails if it comes back as an edit, so a repository holding a corpus or fixture still uses the task lane. A confined relative symlink is also carried read-only: the request records `{relative_path: literal_relative_target}`, the writer and check can read through it, and changes may not address a link or anything reached through a linked directory. A link that is absolute, escapes the project (including indirectly), cycles, dangles, or resolves into excluded or protected metadata refuses the task at submit, named by path. Protected metadata is otherwise rejected. Snapshot census failures return failed task artifacts; inspect their reports. Keep tasks requiring interaction, local credentials, or GUI state local.
 
 ## Cancel and deploy
 

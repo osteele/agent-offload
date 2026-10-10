@@ -175,6 +175,21 @@ entity Task {
         -- one keep their fixed meaning across upgrades.
     account: String
     baseline: BaselineManifest
+    symlinks: Map<String, String>?
+        -- The literal relative symlinks the snapshot carries, relative path
+        -- to literal relative target. Each entry must be a safe relative path
+        -- that neither collides with a baseline or carried file nor nests
+        -- under another link, and must resolve, through any chain, to an
+        -- existing in-root path without crossing protected or excluded
+        -- content; the literal target is immutable evidence. New requests
+        -- always include the field, even as {}; explicit {} means a strictly
+        -- observed empty inventory. The optional value here denotes a missing
+        -- wire field on a legacy request; an explicit JSON null is invalid.
+        -- Weft formerly materialized absolute links and relative links whose
+        -- literal target lexically escaped the snapshot. Relative links whose
+        -- literal target stayed within it were carried and refused as
+        -- unrecorded at legacy dispatch. Legacy resume/apply do not compare a
+        -- local link inventory; continuations inherit its absence.
     request_digest: String
     parent_task: Task?
     seed_changes: List<Change>?
@@ -367,13 +382,18 @@ rule SubmitTask {
         -- A check cannot run against dependencies outside the snapshot; a
         -- project without a check is accepted regardless.
     requires: requested_id = null or not Tasks.any(t => t.id = requested_id)
-    requires: not carries_in_root_symlink(project)
-        -- The worker's census refuses symlinks, and the snapshot keeps every
-        -- in-root link its exclusions do not drop; out-of-root links arrive
-        -- as their targets' content and are accepted.
-    requires: not carries_oversized_linked_content(project)
-        -- Content reached through out-of-root links enters the snapshot, so a
-        -- file there over config.max_file_bytes would fail the census.
+    requires: carries_confined_links_only(project)
+        -- Confined relative symlinks are carried as read-only link objects in
+        -- the request's symlinks inventory, never recursed through during
+        -- census. A link under an excluded path is dropped with it, exactly
+        -- like an ordinary file. Every kept link must resolve, through any
+        -- chain, to an existing path inside the project: an absolute target,
+        -- an escape (including an indirect one, while confined relative `..`
+        -- steps are fine), a cycle, a dangling link, and a target crossing
+        -- protected or excluded content each refuse the submission with the
+        -- link named, instead of being silently dropped or materialized.
+        -- Escaping links are refused rather than materialized from external
+        -- content.
 
     ensures:
         let task = Task.created(
@@ -388,6 +408,9 @@ rule SubmitTask {
                 -- when the caller passes no time flag at all.
             account: account ?? config.default_worker_account,
             baseline: baseline_manifest(project),
+            symlinks: confined_link_inventory(project),
+                -- Always explicit for fresh submissions, including {}. A
+                -- continuation inherits its parent's field only if present.
             request_digest: digest_of(brief),
             worker_source_digest: bundled_worker_digest(),
             worker_build_id: null,
@@ -491,10 +514,14 @@ rule ResumeTask {
     requires: task.status not in {applied, cancelled}
     requires: task.job = null or task.job?.status in {failed, dead, killed}
     requires: task.job = null or not task.job?.status in {canceled, cancelled}
-    requires: baseline_unchanged(task) or continuation_receipt_recoverable(task)
-        -- For an unresolved continuation, lookup precedes the baseline check.
+    requires: baseline_unchanged(task) or accepted_receipt_recoverable(task)
+        -- For every unresolved task, lookup precedes the baseline check.
         -- A valid accepted receipt binds its existing job despite local drift;
         -- absence or lookup failure never permits sending changed source.
+        -- For an inventory-bearing request, baseline_unchanged also covers
+        -- link drift. Legacy absence preserves baseline/carried checks without
+        -- inventing an empty link census; resubmission still refuses
+        -- unrecorded carried links.
     requires: task.job = null or submitter_unchanged(task)
     requires: task.job = null or provisioned_build_matches(task)
     requires: task.job = null or weft_accepts_processed(task.job)
@@ -503,7 +530,7 @@ rule ResumeTask {
 
     ensures:
         if task.job = null:
-            if continuation_receipt_recoverable(task):
+            if accepted_receipt_recoverable(task):
                 task.job = accepted_job(task)
                 task.status = queued
                 task.error = null
@@ -558,10 +585,13 @@ rule ContinueTask {
         -- Continuing an applied task could duplicate edits already in the
         -- project.
     requires: baseline_unchanged(parent, including additions)
-        -- The whole editable manifest and carried census of the live project
-        -- must equal the parent's retained original baseline; drift, or a new
-        -- local file that could collide with a seeded addition, refuses
-        -- before anything is submitted. Nothing is written locally.
+        -- The whole editable manifest and carried census must equal the
+        -- parent's baseline, including path sets: a new local file that could
+        -- collide with a seeded addition refuses. An observed link inventory
+        -- must also match; legacy absence permits links Weft materialized
+        -- (absolute or lexically escaping targets) but refuses unrecorded
+        -- links Weft would carry, based on literal targets. Nothing is written
+        -- locally, and the child inherits inventory presence or absence.
     requires: timeout >= 1.second and timeout <= config.max_task_timeout
     requires: budget = null or valid_renewable_budget(budget, timeout)
         -- The child's time choice is fresh and explicit: a fixed --timeout
@@ -591,6 +621,11 @@ rule ContinueTask {
             budget: budget,
             account: parent.account,
             baseline: parent.baseline,
+            symlinks: parent.symlinks,
+                -- Inherit presence as well as value: an inventory-bearing
+                -- parent's links are checked strictly; a historical parent
+                -- with no inventory gives its child no inventory field, not
+                -- a fabricated observed {}.
             parent_task: parent,
             seed_changes: parent.result.changes,
             worker_source_digest: bundled_worker_digest(),
@@ -775,6 +810,13 @@ rule WorkerAcceptsTask {
     requires: payload.task_id = task.id
     requires: payload.worker_source_digest = task.worker_source_digest
     requires: snapshot_census(task.project) = task.baseline.entries
+    requires: snapshot_link_inventory(task.project) = task.symlinks
+        -- The exact carried link inventory, verified before generation: a
+        -- missing, retargeted, replaced, added, or unsafe link refuses even
+        -- when its resolved contents happen to match. The inventory is
+        -- censused again after the writer completes and after validation;
+        -- the writer may not create, replace, retarget, or delete a link,
+        -- and a check that does fails the task as a modified proposal.
     ensures: WorkerSessionStarted(task)
 }
 
@@ -785,6 +827,7 @@ rule WorkerPublishesSetupFailure {
         or payload.task_id != task.id
         or payload.worker_source_digest != task.worker_source_digest
         or snapshot_census(task.project) != task.baseline.entries
+        or snapshot_link_inventory(task.project) != task.symlinks
     ensures: ResultArtifactPublished(task)
     ensures: WorkerRefusesFurtherWork(task)
     @guidance
@@ -896,6 +939,13 @@ rule ApplyTaskResult {
         -- before-state, new files do not exist, paths are safe (inside the
         -- project, no symlinked components, no protected agent or VCS
         -- metadata), and content is text within the per-file bound.
+    requires: task.symlinks = null or snapshot_link_inventory(task.project) = task.symlinks
+        -- When present, the retained carried-link inventory is verified before any write:
+        -- a link retargeted, replaced, added, deleted, or made unsafe since
+        -- submission is local drift, and the application refuses before the
+        -- first byte changes. A change record addressing a link or a
+        -- descendant reached through a linked directory is refused at
+        -- retrieval, and the safe-path preflight refuses it again here.
 
     ensures: task.backup = ApplicationBackup.of(task.result.changes)
     ensures:

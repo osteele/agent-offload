@@ -21,24 +21,33 @@ from .task_protocol import (
     SCHEMA,
     TaskError,
     census,
+    check_symlink_collisions,
     digest,
     encode,
     file_bytes,
+    link_inventory,
     manifest,
     object_json,
     preflight_changes,
     result_path,
     safe_path,
     validate_changes,
+    validate_symlinks,
+    verify_links,
     walk_files,
     write_changes,
 )
 
 
-def source_state(root: Path, carried: dict) -> tuple[dict, dict]:
-    """Census of the editable files, paired with the stat of the carried ones."""
+def source_state(root: Path, carried: dict) -> tuple[dict, dict, dict]:
+    """Census of the editable files, the carried stats, and the symlink inventory.
+
+    The inventory is part of the source state: a check that retargets,
+    replaces, adds, or deletes a link changes the state the proposal describes
+    even when every regular file is untouched.
+    """
     editable = [name for name in walk_files(root) if name not in carried]
-    return manifest(root, editable), census(root, list(carried))
+    return manifest(root, editable), census(root, list(carried)), link_inventory(root)
 
 
 def _validation_output(value: str | bytes | None) -> str:
@@ -61,6 +70,13 @@ def execute(request: dict, root: Path) -> dict:
         raise TaskError("task timeout must be a finite number from 1 to 7200 seconds")
     policy = renewable_policy(request["budget"], timeout=timeout) if "budget" in request else None
     baseline, carried = request["baseline"], request["carried"]
+    links = validate_symlinks(request.get("symlinks", {}))
+    check_symlink_collisions(links, [*baseline, *carried])
+    # Census the exact symlink inventory before anything reads or writes the
+    # snapshot. A missing, retargeted, replaced, added, or unsafe link refuses
+    # even when its resolved contents would match: the link object, with its
+    # literal target, is read-only evidence.
+    verify_links(root, links)
     if (manifest(root, list(baseline)), census(root, list(carried))) != (baseline, carried):
         raise TaskError("remote snapshot differs from the submitted baseline")
     # Record all materialized ordinary files, including files outside the edit
@@ -135,6 +151,9 @@ def execute(request: dict, root: Path) -> dict:
     if observed != carried:
         altered = sorted(name for name in carried if observed[name] != carried[name])
         raise TaskError(f"worker changed a file over the task file limit: {', '.join(altered)}")
+    # The writer may not create, replace, retarget, or delete a symlink: the
+    # inventory leaves generation exactly as it entered it.
+    verify_links(root, links)
     after_names = set(walk_files(root)) - set(carried)
     changes = []
     for name in sorted(set(origin) | after_names):
@@ -187,7 +206,9 @@ def execute(request: dict, root: Path) -> dict:
         # Validation must test the exact source state represented by the
         # proposal. A census that cannot even be taken, such as one finding a
         # new oversized file or losing a carried one, also means the check
-        # changed the tree.
+        # changed the tree. The third symlink census happens here, after
+        # validation: a check that retargeted, replaced, added, or deleted a
+        # link fails the task even if it exits successfully.
         try:
             preserved = source_state(root, carried) == proposed_state
         except TaskError:

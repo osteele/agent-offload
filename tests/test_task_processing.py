@@ -34,13 +34,25 @@ class FakeWeft:
         self.broken = False
         self.before_mark: Callable[[str], None] | None = None
 
-    def __call__(self, argv: list[str], *, cwd: Path | None = None, timeout: float = 60) -> str:
+    def __call__(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path | None = None,
+        timeout: float = 60,
+        accept: tuple[int, ...] = (),
+    ) -> str:
+        if argv[0] == "rg":
+            assert cwd is not None and accept == (1,)
+            return "hello.py\n"
         assert argv[0] == "weft"
         argv = argv[1:]
         self.calls.append(list(argv))
         if self.broken:
             raise TaskError("weft: the ledger is unreadable")
         head, rest = argv[0], argv[1:]
+        if argv[:2] == ["sync", "inspect"]:
+            return json.dumps({"local_dir": rest[1], "excludes": [".cache", "ambient"]})
         if head == "job":
             return self.job(rest)
         if head == "cancel":

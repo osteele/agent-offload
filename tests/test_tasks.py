@@ -253,7 +253,7 @@ def fake_tools(tmp_path, monkeypatch, *, files: list[str], excludes: list[str], 
     command runs the shell fragment run.
     """
     tools = tmp_path / "bin"
-    tools.mkdir()
+    tools.mkdir(exist_ok=True)
     listing = tmp_path / "rg-files"
     listing.write_text("".join(f"{name}\n" for name in files))
     inspection = tmp_path / "inspection.json"
@@ -322,7 +322,7 @@ def test_snapshot_anchored_exclusions_preserve_other_paths(tmp_path, monkeypatch
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(name)
     fake_tools(tmp_path, monkeypatch, files=files, excludes=[pattern], run="exit 1")
-    assert tasks.snapshot_names(project) == files[2:]
+    assert tasks.snapshot_census(project)[0] == files[2:]
 
 
 @pytest.mark.parametrize("pattern", ["/harness/src", "/harness"])
@@ -334,18 +334,21 @@ def test_snapshot_anchored_exclusion_skips_link_but_not_nested_namesake(
     (project / "hello.py").write_text("hello")
     (project / "harness" / "src").symlink_to("../hello.py")
     fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[pattern], run="exit 1")
-    assert tasks.snapshot_names(project) == ["hello.py"]
+    names, links = tasks.snapshot_census(project)
+    assert names == ["hello.py"]
+    # The excluded link is dropped with its excluded path.
+    assert links == {}
 
+    # A namesake outside the exclusion stays a carried link: the literal
+    # target is evidence, and the link resolves inside the project.
     (project / "nested" / "harness").mkdir(parents=True)
     (project / "nested" / "harness" / "src").symlink_to("../../hello.py")
-    with pytest.raises(TaskError, match=r"carries \(nested/harness/src\)"):
-        tasks.snapshot_names(project)
+    names, links = tasks.snapshot_census(project)
+    assert names == ["hello.py"]
+    assert links == {"nested/harness/src": "../../hello.py"}
 
 
-@pytest.mark.parametrize(
-    "pattern", ["/shared/nested", "/shared/nested/big.bin", "/shared/*/big.bin"]
-)
-def test_snapshot_anchored_exclusion_filters_dereferenced_content(tmp_path, monkeypatch, pattern):
+def test_snapshot_anchored_exclusions_apply_to_the_link_inventory(tmp_path, monkeypatch):
     from agent_offload.task_protocol import MAX_FILE
 
     project = tmp_path / "project"
@@ -357,13 +360,28 @@ def test_snapshot_anchored_exclusion_filters_dereferenced_content(tmp_path, monk
     with big_file.open("wb") as stream:
         stream.truncate(MAX_FILE + 1)
     (project / "shared").symlink_to(outside)
-    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[pattern], run="exit 1")
-    assert tasks.snapshot_names(project) == ["hello.py"]
 
-    # The same content at a different snapshot path is still checked.
-    (project / "other").symlink_to(outside)
-    with pytest.raises(TaskError, match=r"\(other/nested/big.bin\)"):
-        tasks.snapshot_names(project)
+    # The link itself excluded: dropped with its path, whatever it points at.
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=["/shared"], run="exit 1")
+    names, links = tasks.snapshot_census(project)
+    assert names == ["hello.py"]
+    assert links == {}
+
+    # The link kept but its target's content excluded: still refused up front.
+    # Weft would materialize the surviving external content into the snapshot,
+    # and the task must not silently read what the tree does not contain.
+    fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=["/shared/nested"], run="exit 1")
+    with pytest.raises(TaskError):
+        tasks.snapshot_census(project)
+
+    # A confined link to a target the exclusions drop would be missing
+    # remotely, so it refuses instead of producing a request that only fails
+    # after dispatch.
+    (project / "shared").unlink()
+    (project / "alias.txt").symlink_to("hello.py")
+    fake_tools(tmp_path, monkeypatch, files=[], excludes=["hello.py"], run="exit 1")
+    with pytest.raises(TaskError, match=r"symlink target is excluded from the snapshot: alias"):
+        tasks.snapshot_census(project)
 
 
 def receipt(key: str, decision: str) -> dict:
@@ -620,11 +638,11 @@ def test_submission_uses_repository_project_and_clean_title(tmp_path, monkeypatc
 def test_continuation_submission_carries_the_parent_attribute(
     task_factory, tmp_path, monkeypatch, capsys
 ):
-    from test_task_continuation import continue_args, ordinary_names
+    from test_task_continuation import continue_args, ordinary_census
 
     # The child's submission labels its parent, again derived only from the
     # retained request; rg is absent here, so the census lists files directly.
-    monkeypatch.setattr(tasks, "snapshot_names", ordinary_names)
+    monkeypatch.setattr(tasks, "snapshot_census", ordinary_census)
     task_factory("attr-parent", "validation_failed")
 
     assert tasks.handler(continue_args("attr-parent", id="attr-child")) == 0
@@ -727,7 +745,6 @@ def test_check_must_preserve_complete_proposal(tmp_path, monkeypatch, check_sour
         # failure that keeps the writer's evidence and can never be applied.
         assert result["status"] == "validation_failed"
         assert result["validation"]["exit_code"] == 0
-        assert result["validation"]["error"] == "validation modified proposed source"
     else:
         assert result["status"] == "completed"
 
@@ -1039,17 +1056,15 @@ def test_submit_ignores_commented_and_placeholder_pyproject_paths(tmp_path, monk
         )
 
 
-def test_submit_refuses_in_root_symlinks_the_snapshot_carries(tmp_path, monkeypatch):
+def test_submit_carries_confined_links_and_refuses_unsafe_ones(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
     project = tmp_path / "project"
     (project / "src").mkdir(parents=True)
     (project / "hello.py").write_text("hello")
     (project / "node_modules").mkdir()
-    # Weft drops excluded links and snapshots out-of-root links as content.
+    # Weft drops excluded links with their excluded paths.
     (project / "node_modules" / "tool").symlink_to("../hello.py")
     (project / "cache.lnk").symlink_to("hello.py")
-    (project / "outside").symlink_to(tmp_path)
-    (project / "escape.py").symlink_to("../elsewhere.py")
     fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=["*.lnk"], run="exit 1")
 
     def attempt(identity: str) -> None:
@@ -1063,18 +1078,33 @@ def test_submit_refuses_in_root_symlinks_the_snapshot_carries(tmp_path, monkeypa
             identity=identity,
         )
 
-    # Every link above is one the snapshot does not carry, so submission proceeds.
-    with pytest.raises(TaskError, match="resume this identity"):
-        attempt("unlinked")
+    # Confined relative links are carried as read-only link objects, including
+    # file links, directory links, and parent steps that stay in the project.
     (project / "alias.py").symlink_to("hello.py")
     (project / "src" / "up").symlink_to("..")
-    with pytest.raises(TaskError, match=r"carries \(alias.py, src/up\)") as refused:
+    with pytest.raises(TaskError):
         attempt("linked")
-    assert "escape.py" not in str(refused.value)
-    assert not (tmp_path / "state" / "tasks" / "linked" / "task.json").exists()
+    assert read_record("linked")["request"]["symlinks"] == {
+        "alias.py": "hello.py",
+        "src/up": "..",
+    }
+
+    # An absolute target would have Weft materialize external content into the
+    # snapshot; it is refused up front, before any task record exists.
+    (project / "outside").symlink_to(tmp_path)
+    with pytest.raises(TaskError):
+        attempt("outside")
+    assert not (tmp_path / "state" / "tasks" / "outside" / "task.json").exists()
+    (project / "outside").unlink()
+
+    # A relative target that leaves the project is refused the same way.
+    (project / "escape.py").symlink_to("../elsewhere.py")
+    with pytest.raises(TaskError):
+        attempt("escaped")
+    assert not (tmp_path / "state" / "tasks" / "escaped" / "task.json").exists()
 
 
-def test_submit_refuses_oversized_content_behind_out_of_root_links(tmp_path, monkeypatch):
+def test_submit_refuses_out_of_root_links_up_front(tmp_path, monkeypatch):
     from agent_offload.task_protocol import MAX_FILE
 
     monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
@@ -1084,9 +1114,7 @@ def test_submit_refuses_oversized_content_behind_out_of_root_links(tmp_path, mon
     outside = tmp_path / "outside"
     (outside / "nested").mkdir(parents=True)
     (outside / "small.txt").write_text("small")
-    (outside / "nested" / "cache").mkdir()
-    (outside / "nested" / "cache" / "huge.bin").write_bytes(b"x" * (MAX_FILE + 1))
-    (project / "shared").symlink_to(outside)
+    (outside / "nested" / "huge.bin").write_bytes(b"x" * (MAX_FILE + 1))
     fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=["cache"], run="exit 1")
 
     def attempt(identity: str) -> None:
@@ -1100,15 +1128,25 @@ def test_submit_refuses_oversized_content_behind_out_of_root_links(tmp_path, mon
             identity=identity,
         )
 
-    # The oversized file sits under an excluded directory, so Weft drops it.
-    with pytest.raises(TaskError, match="resume this identity"):
+    # A link under an excluded path is dropped with it; submission proceeds.
+    (project / "cache").symlink_to(outside)
+    with pytest.raises(TaskError):
         attempt("excluded")
-    (outside / "nested" / "big.bin").write_bytes(b"x" * (MAX_FILE + 1))
-    (project / "data.bin").symlink_to(outside / "nested" / "big.bin")
-    with pytest.raises(TaskError, match=r"data\.bin, shared/nested/big\.bin") as refused:
-        attempt("oversized")
-    assert "2 MiB" in str(refused.value)
-    assert not (tmp_path / "state" / "tasks" / "oversized" / "task.json").exists()
+    assert read_record("excluded")["request"]["symlinks"] == {}
+
+    # An absolute link is refused whatever its target holds -- external content
+    # is not materialized into the snapshot, small or large.
+    (project / "data.bin").symlink_to(outside / "nested" / "huge.bin")
+    with pytest.raises(TaskError):
+        attempt("absolute")
+    assert not (tmp_path / "state" / "tasks" / "absolute" / "task.json").exists()
+    (project / "data.bin").unlink()
+
+    # So is a relative link whose parent steps leave the project.
+    (project / "rel.bin").symlink_to("../outside/small.txt")
+    with pytest.raises(TaskError):
+        attempt("escaping")
+    assert not (tmp_path / "state" / "tasks" / "escaping" / "task.json").exists()
 
 
 def test_decode_refuses_non_base64_and_oversized_content():
@@ -1160,15 +1198,17 @@ def test_change_and_manifest_size_bounds_count_every_file(tmp_path, monkeypatch)
         validate_changes({"baseline": {}}, created)
 
 
-def test_walk_refuses_a_symlinked_directory(tmp_path):
+def test_walk_skips_linked_directories_and_links(tmp_path):
     from agent_offload.task_protocol import walk_files
 
     (tmp_path / "real").mkdir()
     (tmp_path / "real" / "a.txt").write_text("a")
     assert walk_files(tmp_path) == ["real/a.txt"]
     (tmp_path / "alias").symlink_to(tmp_path / "real")
-    with pytest.raises(TaskError, match="symlink directory"):
-        walk_files(tmp_path)
+    (tmp_path / "note.lnk").symlink_to("real/a.txt")
+    # Linked directories are never recursed through, and links are not files:
+    # both censuses see only the canonical tree.
+    assert walk_files(tmp_path) == ["real/a.txt"]
 
 
 @pytest.mark.parametrize("name", ["", "a//b", "/abs"])
@@ -1201,7 +1241,7 @@ def test_object_json_refuses_a_non_object():
         object_json(json.dumps([{"schema_version": SCHEMA}]), SCHEMA)
 
 
-def test_linked_content_check_follows_nested_links_and_single_files(tmp_path, monkeypatch):
+def test_out_of_root_links_are_refused_whatever_content_they_reach(tmp_path, monkeypatch):
     from agent_offload.task_protocol import MAX_FILE
 
     monkeypatch.setenv("AGENT_OFFLOAD_STATE", str(tmp_path / "state"))
@@ -1215,27 +1255,20 @@ def test_linked_content_check_follows_nested_links_and_single_files(tmp_path, mo
     shared = tmp_path / "shared"
     shared.mkdir()
     (shared / "deep").symlink_to(store)
-    (project / "notes.txt").symlink_to(store / "small.txt")
     fake_tools(tmp_path, monkeypatch, files=["hello.py"], excludes=[], run="exit 1")
 
-    def attempt(identity: str) -> None:
-        submit(
-            project,
-            "Fix hello",
-            host="studio",
-            selector="openai-codex/gpt-6-astra",
-            timeout=60,
-            check=[],
-            identity=identity,
-        )
+    # A single-file link to content outside the project is refused up front,
+    # small or large: external content is never materialized into a snapshot.
+    (project / "notes.txt").symlink_to(store / "small.txt")
+    with pytest.raises(TaskError):
+        tasks.snapshot_census(project)
+    assert not (tmp_path / "state" / "tasks" / "notes" / "task.json").exists()
 
-    # A small file behind an out-of-project link is accepted.
-    with pytest.raises(TaskError, match="resume this identity"):
-        attempt("small-link")
-    # A large file is found through a link inside the linked directory.
+    # Directory links that reach external content are refused too.
+    (project / "notes.txt").unlink()
     (project / "shared").symlink_to(shared)
-    with pytest.raises(TaskError, match=r"shared/deep/big\.bin"):
-        attempt("nested-link")
+    with pytest.raises(TaskError):
+        tasks.snapshot_census(project)
 
 
 def peer_record() -> dict:

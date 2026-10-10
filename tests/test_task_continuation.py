@@ -43,17 +43,33 @@ def continue_args(parent, *, timeout=120, prompt=None, brief=None, id=None):
 
 
 def ordinary_names(root: Path) -> list[str]:
-    """The snapshot listing the real census would take, without rg/weft on PATH."""
+    """The snapshot listing the real census would take, without rg/weft on PATH.
+
+    rg neither lists symlinks nor descends into linked directories, so the
+    local stand-in skips them the same way; carried links are censused
+    separately by `ordinary_census`.
+    """
     return [
         path.relative_to(root).as_posix()
         for path in sorted(root.rglob("*"))
-        if path.is_file() and ".git" not in path.relative_to(root).parts
+        if path.is_file() and not path.is_symlink() and ".git" not in path.relative_to(root).parts
     ]
 
 
+def ordinary_census(root: Path, *, legacy: bool = False) -> tuple[list[str], dict[str, str]]:
+    """Serve the ordinary snapshot census locally; the drift check stays real.
+
+    The link half is the real inventory walk: it needs no external tools, so
+    retained-symlink drift is checked against the live tree, not assumed empty.
+    """
+    from agent_offload.task_protocol import link_inventory
+
+    return ordinary_names(root), link_inventory(root)
+
+
 def capture_project(tmp_path, monkeypatch):
-    """Serve the ordinary snapshot listing locally; the drift check stays real."""
-    monkeypatch.setattr(tasks, "snapshot_names", ordinary_names)
+    """Serve the ordinary snapshot census locally; the drift check stays real."""
+    monkeypatch.setattr(tasks, "snapshot_census", ordinary_census)
 
 
 def serve(tmp_path, record, result):
@@ -403,6 +419,67 @@ def test_continue_seeds_a_child_from_the_retained_parent_edits(
     ]
 
 
+@pytest.mark.parametrize("target", ["absolute", "relative"])
+def test_legacy_external_link_lineage_can_continue_again_and_apply(
+    task_factory, tmp_path, monkeypatch, target
+):
+    from test_task_symlinks import external_link, serve_rg
+
+    parent, result = task_factory(f"lineage-parent-{target}", "validation_failed")
+    project = Path(parent["project"])
+    external_link(project, target)
+    serve_rg(tmp_path)
+    # The parent's check failed, but the child's completed edit passes it.
+    rewrite_request(
+        tmp_path,
+        parent,
+        result,
+        check=[
+            sys.executable,
+            "-c",
+            "from pathlib import Path; assert Path('hello.py').read_text() == 'final\\n'",
+        ],
+    )
+    assert tasks.handler(continue_args(parent["id"], id=f"lineage-child-{target}")) == 0
+    child = tasks.read_record(f"lineage-child-{target}")
+    assert "symlinks" not in child["request"]
+    child_result = run_child_worker(
+        tmp_path,
+        monkeypatch,
+        child,
+        edit=lambda root: (root / "hello.py").write_text("final\n"),
+        expect_status="completed",
+    )
+    assert child_result["validation"]["exit_code"] == 0
+    assert tasks.handler(argparse.Namespace(action="apply", id=child["id"])) == 0
+    assert (project / "hello.py").read_text() == "final\n"
+    assert (project / "external.txt").is_symlink()
+
+
+@pytest.mark.parametrize("target", ["absolute", "relative"])
+def test_legacy_child_continues_without_fabricating_a_link_inventory(
+    task_factory, tmp_path, monkeypatch, target
+):
+    from test_task_symlinks import external_link, serve_rg
+
+    parent, _ = task_factory(f"chain-parent-{target}", "validation_failed")
+    external_link(Path(parent["project"]), target)
+    serve_rg(tmp_path)
+    assert tasks.handler(continue_args(parent["id"], id=f"chain-child-{target}")) == 0
+    child = tasks.read_record(f"chain-child-{target}")
+    run_child_worker(
+        tmp_path,
+        monkeypatch,
+        child,
+        edit=lambda root: (root / "hello.py").write_text("final\n"),
+        expect_status="validation_failed",
+    )
+    assert tasks.handler(continue_args(child["id"], id=f"chain-grand-{target}")) == 0
+    grand = tasks.read_record(f"chain-grand-{target}")
+    assert "symlinks" not in grand["request"]
+    tasks.check_baseline_unchanged(grand)
+
+
 def test_continue_prints_a_generated_child_identity_like_submit(
     task_factory, tmp_path, monkeypatch, capsys
 ):
@@ -581,7 +658,7 @@ def test_continue_pins_the_child_to_the_current_build_not_the_parent_pins(
     monkeypatch.setattr(worker_build, "run_provider", run_provider)
     monkeypatch.setattr(tasks, "run", fake)
     monkeypatch.setattr(tasks, "ensure_worker", REAL_ENSURE_WORKER)
-    monkeypatch.setattr(tasks, "snapshot_names", ordinary_names)
+    monkeypatch.setattr(tasks, "snapshot_census", ordinary_census)
     exit_code = tasks.handler(continue_args("old-pin", id="pin-child"))
     capsys.readouterr()
     if answers_with_current_build:
@@ -623,7 +700,7 @@ def test_an_interrupted_continuation_keeps_custody_and_resume_binds_one_job(
         return fake(argv, **kwargs)
 
     monkeypatch.setattr(tasks, "run", lose_receipt)
-    monkeypatch.setattr(tasks, "snapshot_names", ordinary_names)
+    monkeypatch.setattr(tasks, "snapshot_census", ordinary_census)
     assert tasks.handler(continue_args("int-parent", id="int-child")) == 1
     capsys.readouterr()
     retained = tasks.read_record("int-child")

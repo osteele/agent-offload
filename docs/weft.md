@@ -38,7 +38,12 @@ exclude_dirs = ["data", "/harness/src"]
 
 A leading `/` anchors a path at the project root; otherwise the name matches
 at any depth. Files outside the project directory never travel, so a `--check`
-is refused when the project depends on a path outside itself.
+is refused when the project depends on a path outside itself. The same
+exclusions govern relative symlinks: a confined relative link is carried as a
+read-only link object with its literal target recorded in the task request,
+while a link whose own path is excluded is omitted with that path. An included
+link that points outside the project or crosses an excluded or protected target
+refuses the submission instead of being silently rewritten or left dangling.
 
 **A job submitted without waiting.** `task submit` calls `weft run --no-sync`,
 which records the job and returns; Weft's daemon then sends it to the host on

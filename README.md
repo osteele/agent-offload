@@ -85,6 +85,11 @@ Other subcommands are `list`, `retrieve`, `resume`, `continue`, `cancel`, and
   waiting for the agent.
 - The agent reads and edits the snapshot through confined tools and cannot run
   shell commands. Files over 2 MiB can be read but not edited.
+- Confined relative symlinks are carried read-only: the request records the
+  exact inventory with each link's literal target, the agent can read through
+  a link but cannot change one or edit through a linked directory, and a link
+  that escapes the project, dangles, or resolves into excluded or protected
+  content refuses the submission.
 - `--check` runs a command on the result after the agent finishes. If the check
   fails, or changes source files, the result is marked `validation_failed` and
   cannot be applied.
